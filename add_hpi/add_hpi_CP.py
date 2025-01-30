@@ -1,5 +1,12 @@
-# Author: T Cheung
-# Last Modified September 6, 2024
+# Author: C Pfeiffer (adapted from script by T Cheung)
+# Last Modified Jan 28, 2025
+# Function for adding dev_to_head_trans to an OPM-MEG recording
+# When executing the user will be prompted to select the following inputs:
+# - data file : OPM-MEG recording that the transform should be applied to
+# - hpi file : OPM recording where hpi coils were activated sequentially
+# - polhemus file : TRIUX recording containing a polhemus headshape with the 
+#                   hpi locations in head coordinates
+# - hpi frequency : frequency the coils were driven at
 
 import sys, getopt
 import argparse
@@ -257,7 +264,7 @@ polfile = get_file("Select polhemusfile")
 
 # Get frequency and order
 hpifreq = float(get_input("Enter frequency (Hz):", "33"))
-hpiorder = np.array([int(x) for x in get_input("Enter order (comma-separated):", "2, 3, 1, 4").split(',')], dtype=int)
+hpiorder = np.array([int(x) for x in get_input("Enter order (comma-separated):", "1, 4, 2, 3").split(',')], dtype=int) #2, 3, 1, 4
 
 # Get boolean input for plot
 plotResult = get_boolean("Do you want to plot the data?")
@@ -619,8 +626,9 @@ assert len(coil_amplitudes["times"]) == 1
 coil_amplitudes['slopes'][0]= slope
 coil_locs = compute_chpi_locs(raw.info, coil_amplitudes)
 hpi_dev = np.array(coil_locs['rrs'][0])
+hpi_gofs = np.array(coil_locs['gofs'][0])
 
-print('*******************************************************************************************************')
+print('**** Apply trans to recording file ***********************************')
 
 
 fname=datfile#args.dataset
@@ -653,6 +661,10 @@ for bad_chan in bads:
 #add the cardinals 
 trans = _quat_to_affine(_fit_matched_points(hpi_dev, hpi_orig)[0])
 dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
+
+hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
+dist = np.linalg.norm(hpi_orig-hpi_head, axis=1)
+
 print(dev_to_head_trans)
 raw.info.update(dev_head_t=dev_to_head_trans)
 
@@ -665,18 +677,7 @@ n=int(digpts.shape[0]/3)
 digpts=digpts.reshape((n,3))
 
 with raw.info._unlock(): 
-    hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
-
     raw.info['dig']=_make_dig_points(nasion, lpa, rpa, hpi_orig, digpts)
-
-dist = np.linalg.norm(hpi_orig-hpi_head, axis=1)
-print('---------------------------------------------')
-print(f"hpi_orig: {hpi_orig}")
-print(f"hpi_deev: {hpi_dev}")
-for index, value in enumerate(dist):
-        status = 'ok' if value < dist_limit else 'not ok'
-        print(f"Coil: {hpi_names[index]}, Distance: {value*1e3}, Status: {status}")
-print('---------------------------------------------')
 
 path ='/Users/teresa/data/windowshare/20240719/sub-HX'
 savename='test'
@@ -691,6 +692,14 @@ savename=os.path.splitext(savename)[0]
 savename=savename.replace('_raw','')
 
 raw.save(('%s/%s_CP_hpi_raw.fif' % (path, savename)),overwrite=True)
+
+print('---------------------------------------------')
+print(f"hpi_orig: {hpi_orig}\n")
+print(f"hpi_dev: {hpi_dev}\n")
+for index, value in enumerate(dist):
+        status = 'ok' if hpi_gofs[index]<0.9 else 'not ok'
+        print(f"Coil: {hpi_names[index][-3:]}, Distance: {(value*1e3):.2f} mm, GOF: {hpi_gofs[index]:.4f}, Status: {status}")
+print('---------------------------------------------')
 
 if plotResult:
     senspos=np.array([],dtype=float)

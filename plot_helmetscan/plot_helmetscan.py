@@ -1,15 +1,28 @@
+# Author: C Pfeiffer (adapted from script by T Cheung)
+# Last Modified Jan 28, 2025
+# Function for diplaying OPM-MEG helmetscan in 2D
+# When executing the user will be prompted to select a csv file containing the 
+# results from the helmet scan. Empty slots are marked red, occupied slots are 
+# marked green and labled with the name of the channel the sensor is connected 
+# to. 
+
 import tkinter as tk
 from tkinter import filedialog
 import pandas as pd
 import scipy.io as sio
 import matplotlib.pyplot as plt
 import os
+import sys
 
 # Function to open a file dialog and select the CSV file
 def select_file():
     root = tk.Tk()
     root.withdraw()
-    file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+    default_path = "/home/administrator/.local/share/HEDscan"
+    file_path = filedialog.askopenfilename(initialdir=default_path, filetypes=[("CSV files", "*.csv")])
+    if not file_path.endswith('_helmetscan_locations.csv'):
+        print("ERROR: Wrong file type. The file should end with '_helmetscan_locations.csv'.")
+        sys.exit()
     return file_path
 
 # Load the CSV file containing sensor definitions
@@ -20,7 +33,7 @@ sensor_df = pd.read_csv(csv_path)
 datestring = os.path.basename(csv_path).split('_')[0:2]
 
 # Hard-wired path to the .mat file containing 2D MEG sensor layout
-mat_file_path = '/Users/christophpfeiffer/src/plot_helmetscan/hedscan_layout.mat'
+mat_file_path = 'hedscan_layout.mat'
 
 # Load the .mat file
 mat_data = sio.loadmat(mat_file_path)

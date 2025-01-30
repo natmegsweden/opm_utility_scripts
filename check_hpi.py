@@ -193,7 +193,7 @@ ax.scatter3D(rrs[:,0], rrs[:,1], rrs[:,2], color = "red", marker=".", linewidths
 for i in range(len(rrs)):
     s = raw.info['chs'][np.squeeze(hpi_channels[i])]['ch_name']
     ax.text(rrs[i,0]+0.01,rrs[i,1],rrs[i,2],  s[0:3]+s[-3:], size=10, zorder=1, color='k') 
-    ax.text(rrs[i,0]+0.01,rrs[i,1]-0.0125,rrs[i,2],  "gof=%.3f"%(gofs[i]), size=10, zorder=1, color='k') 
+    #ax.text(rrs[i,0]+0.01,rrs[i,1]-0.0125,rrs[i,2],  "gof=%.3f"%(gofs[i]), size=10, zorder=1, color='k') 
 ax.scatter3D(meg_coils[0][:,0], meg_coils[0][:,1], meg_coils[0][:,2], color = "green", alpha = 0.1, marker=".", linewidths=0.5)
 ax.view_init(elev=90, azim=-90, roll=0)
 ax.set_title('top')
