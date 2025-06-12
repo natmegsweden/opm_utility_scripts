@@ -1,0 +1,65 @@
+project:
+  name: OPM-benchmarking
+  InstitutionName: 'Karolinska Institutet'
+  InstitutionAddress: 'Nobels vag 9, 171 77, Stockholm, Sweden'
+  InstitutionDepartmentName: 'Department of Clinical Neuroscience (CNS)'
+  description: "OPM benchmarking project for MEG data"
+  tasks:
+    - Noise
+    - RSEO
+    - RSEC
+    - AudOdd
+    - Phalanges
+  squidMEG: neuro/data/local/OPM-benchmarking/raw
+  opmMEG: neuro/data/local/OPM-benchmarking/raw
+  BIDS: neuro/data/local/OPM-benchmarking/bids
+  Calibration: neuro/databases/sss/sss_cal.dat
+  Crosstalk: neuro/databases/ctc/ct_sparse.fif
+
+opm:
+  data_file: <path_to_opm_data>
+  hpi_file: <path_to_hpi_data>
+  polhemus_file: <path_to_polhemus_data>
+  frequency: 33
+  hpi_order: [1, 2, 3, 4] #
+  downsample_to_hz: 1000
+  plot: true
+
+bids:
+  Dataset_description: dataset_description.json
+  Participants: participants.tsv
+  Participants_mapping_file: participant_mapping_example.csv
+  Original_subjID_name: old_subject_id
+  New_subjID_name: new_subject_id
+  Original_session_name: old_session_id
+  New_session_name: new_session_id
+  Overwrite: off
+
+maxfilter:
+  standard_settings:
+    trans_conditions:
+      - AudOdd
+      - Phalanges
+      - RSEO
+      - RSEC
+    trans_option: continous
+    merge_runs: on
+    empty_room_files:
+      - empty_room_before.fif
+      - empty_room_after.fif
+    sss_files: ""
+    autobad: on
+    badlimit: "7"
+    bad_channels: ""
+    tsss_default: on
+    correlation: "0.98"
+    movecomp_default: on
+    subjects_to_skip: ""
+  advanced_settings:
+    force: off
+    downsample: off
+    downsample_factor: "4"
+    apply_linefreq: off
+    linefreq_Hz: "50"
+    maxfilter_version: /neuro/bin/util/maxfilter
+    MaxFilter_commands: ""
