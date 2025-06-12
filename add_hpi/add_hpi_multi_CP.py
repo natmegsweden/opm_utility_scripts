@@ -707,7 +707,7 @@ for i in range(len(datafiles)):
     savename=os.path.splitext(savename)[0]
     savename=savename.replace('_raw','')
     
-    raw.save(('%s/%s_CP_hpi_raw.fif' % (path, savename)),overwrite=True)
+    raw.save(('%s/%s_proc-hpi+ds_raw.fif' % (path, savename)),overwrite=True)
 
 print('---------------------------------------------')
 print(f"hpi_orig: {hpi_orig}\n")

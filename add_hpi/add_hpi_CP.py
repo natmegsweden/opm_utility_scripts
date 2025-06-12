@@ -269,6 +269,8 @@ hpiorder = np.array([int(x) for x in get_input("Enter order (comma-separated):",
 # Get boolean input for plot
 plotResult = get_boolean("Do you want to plot the data?")
 
+root.quit()
+
 # Print the results
 print(f"Datafile: {datfile}")
 print(f"HPIfile: {hpifile}")
@@ -411,9 +413,6 @@ for index in range(len(hpi_indices)):
     print(f'{chan_name} first point = {peaks[0]} and last point = {peaks[-1]}, time window = {window} s')
 
     #we use this window to extract the portion of data out for the magnetic dipole fit
-    if 0:
-        raw.filter(l_freq=3, h_freq=55)
-        raw = raw.notch_filter(freqs=freqs)
 
     minT=peaks[0]/raw.info['sfreq']
     maxT=peaks[-1]/raw.info['sfreq']
@@ -656,10 +655,10 @@ bads=TC_findzerochans(raw.info)
 for bad_chan in bads:
     raw.drop_channels(bad_chan)
 
-
-
 #add the cardinals 
-trans = _quat_to_affine(_fit_matched_points(hpi_dev, hpi_orig)[0])
+include_hpis = hpi_gofs>0.9
+
+trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig[include_hpis])[0])
 dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
 
 hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
@@ -691,13 +690,13 @@ savename=os.path.basename(fname)
 savename=os.path.splitext(savename)[0]
 savename=savename.replace('_raw','')
 
-raw.save(('%s/%s_CP_hpi_raw.fif' % (path, savename)),overwrite=True)
+raw.save(('%s/%s_proc-hpi+ds_meg.fif' % (path, savename)),overwrite=True)
 
 print('---------------------------------------------')
 print(f"hpi_orig: {hpi_orig}\n")
 print(f"hpi_dev: {hpi_dev}\n")
 for index, value in enumerate(dist):
-        status = 'ok' if hpi_gofs[index]<0.9 else 'not ok'
+        status = 'ok' if hpi_gofs[index]>0.9 else 'not ok'
         print(f"Coil: {hpi_names[index][-3:]}, Distance: {(value*1e3):.2f} mm, GOF: {hpi_gofs[index]:.4f}, Status: {status}")
 print('---------------------------------------------')
 
