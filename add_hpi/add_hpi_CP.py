@@ -4,7 +4,7 @@
 # When executing the user will be prompted to select the following inputs:
 # - data file : OPM-MEG recording that the transform should be applied to
 # - hpi file : OPM recording where hpi coils were activated sequentially
-# - polhemus file : TRIUX recording containing a polhemus headshape with the 
+# - polhemus file : TRIUX recording containing a polhemus headshape with the
 #                   hpi locations in head coordinates
 # - hpi frequency : frequency the coils were driven at
 
@@ -33,8 +33,8 @@ from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
 
 from mne.transforms import (
     get_ras_to_neuromag_trans,
-    Transform, 
-    _quat_to_affine, 
+    Transform,
+    _quat_to_affine,
     _fit_matched_points
     )
 
@@ -86,7 +86,7 @@ def write_bw_marker_file(dsName, events, chanName, fs):
 
 
 def TC_findzerochans(info, tolerance=0.02):
-    #tolerance default 2 cm. 
+    #tolerance default 2 cm.
     #remove channels that are inside a 2 cm sphere of the origin
 
     bads_fl=np.array([])
@@ -131,7 +131,7 @@ def tc_plot_psd(raw):
 
 def TC_get_hpiout_names(raw):
     hpi_names=list()
-    
+
     #get the names of the  HPI out channels
 
     hpi_raw = raw.compute_psd(picks="misc")
@@ -140,7 +140,7 @@ def TC_get_hpiout_names(raw):
         if 'out' in name:
             #print(name)
             hpi_names+=[name]
-    
+
     hpi_indices=np.zeros(len(hpi_names),dtype=np.int64)
     i=0
     j=0
@@ -150,7 +150,7 @@ def TC_get_hpiout_names(raw):
                 hpi_indices[j]=i
                 j=j+1
         i=i+1
-        
+
 
     return(hpi_names,hpi_indices)
 
@@ -160,7 +160,7 @@ def plot_3d(senspos, senslabel, hpipos, hpilabel, hpipos2, hpilabel2, digpos):
     senslabel = np.array(senslabel)
     hpipos = np.array(hpipos)
     hpilabel = np.array(hpilabel)
-    
+
     # Convert senspos to polar coordinates (origin = center of mass)
     center_of_mass = np.mean(senspos, axis=0)
     senspos_centered = senspos - center_of_mass
@@ -170,37 +170,37 @@ def plot_3d(senspos, senslabel, hpipos, hpilabel, hpipos2, hpilabel2, digpos):
     x_proj = theta * np.cos(phi)
     y_proj = theta * np.sin(phi)
     polar_proj = np.vstack((x_proj, y_proj)).T
-    
+
     # Triangulated in 2D polar space
     tri = Delaunay(polar_proj)
-    
+
     # Create a 3D plot
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
-    
+
     # Plot the mesh
-    ax.plot_trisurf(senspos[:, 0], senspos[:, 1], senspos[:, 2], 
-                    triangles=tri.simplices, cmap='viridis', alpha=0.6, 
+    ax.plot_trisurf(senspos[:, 0], senspos[:, 1], senspos[:, 2],
+                    triangles=tri.simplices, cmap='viridis', alpha=0.6,
                     edgecolor='k', linewidth=0.2)
-    
+
     # Plot the sensor positions with labels
     ax.scatter(senspos[:, 0], senspos[:, 1], senspos[:, 2], color='r', s=50)
     for i in range(len(senslabel)):
         ax.text(senspos[i, 0], senspos[i, 1], senspos[i, 2], senslabel[i], color='black', fontsize=9)
-    
+
     # Plot the hpi positions with labels
     ax.scatter(hpipos[:, 0], hpipos[:, 1], hpipos[:, 2], color='b', s=100)
     for i in range(len(hpilabel)):
         ax.text(hpipos[i, 0], hpipos[i, 1], hpipos[i, 2], hpilabel[i], color='blue')
-        
+
     # Plot the hpi positions with labels
     ax.scatter(hpipos2[:, 0], hpipos2[:, 1], hpipos2[:, 2], color='g', s=100)
     for i in range(len(hpilabel)):
         ax.text(hpipos2[i, 0], hpipos2[i, 1], hpipos2[i, 2], hpilabel2[i], color='green')
-        
+
     # Plot the hpi positions with labels
     ax.scatter(digpos[:, 0], digpos[:, 1], digpos[:, 2], color='k', s=10)
-    
+
     plt.show()
 
 '''
@@ -210,8 +210,8 @@ parser.add_argument("-d","--dataset",help="the raw HEDscan dataset you want to u
 parser.add_argument("--hpi", help="the hpi dataset")
 parser.add_argument("--pol", help="the dataset containing polhemus locations")
 parser.add_argument("--gof", type = float, help="goodness of fit")
-parser.add_argument("--plot", action='store_true') 
-parser.add_argument("port_freq", metavar='N freq', type=int, nargs='+', help="nasionport nasionfreq lpaport lpafreq lpaport lpafreq ... up to 6 can be specified") #1 is the first port, 2 is second port, 
+parser.add_argument("--plot", action='store_true')
+parser.add_argument("port_freq", metavar='N freq', type=int, nargs='+', help="nasionport nasionfreq lpaport lpafreq lpaport lpafreq ... up to 6 can be specified") #1 is the first port, 2 is second port,
 
 
 args=parser.parse_args()
@@ -229,13 +229,13 @@ else:
    print (f'invalid dataset')
    exit()
 
-if '.fif' in args.hpi: 
+if '.fif' in args.hpi:
    print (f'using hpi dataset {args.hpi}')
 else:
    print (f'invalid hpi dataset')
    exit()
    '''
-   
+
 import tkinter as tk
 from tkinter import simpledialog, filedialog
 
@@ -265,6 +265,9 @@ polfile = get_file("Select polhemusfile")
 # Get frequency and order
 hpifreq = float(get_input("Enter frequency (Hz):", "33"))
 hpiorder = np.array([int(x) for x in get_input("Enter order (comma-separated):", "1, 4, 2, 3").split(',')], dtype=int) #2, 3, 1, 4
+
+# Get downsampling frequency
+new_sfreq = float(get_input("Enter downsampling frequency (Hz):", "1000"))
 
 # Get boolean input for plot
 plotResult = get_boolean("Do you want to plot the data?")
@@ -327,9 +330,8 @@ print(hpi_freqs)
 #resample
 
 if 1:
-    new_sfreq=1000
-    raw.load_data().resample(new_sfreq)
-    
+    raw.load_data().resample(1000)
+
 
 #Add default cardinals and 3 hpi's with the same locations as the cardinals
 #Add any additional hpi's attached with default locations
@@ -350,7 +352,7 @@ n=int(hpi.shape[0]/3)
 hpi=hpi.reshape((n,3))
 hpi_orig = hpi
 
-dev_head_t = Transform("meg", "head", trans=None) 
+dev_head_t = Transform("meg", "head", trans=None)
 dev_head_t['trans']=get_ras_to_neuromag_trans(nasion, lpa, rpa) #should remain identity with the above geometry
 raw.info.update(dev_head_t=dev_head_t)
 
@@ -362,7 +364,7 @@ for j in pol_info['dig']:
 n=int(digpts.shape[0]/3)
 digpts=digpts.reshape((n,3))
 
-with raw.info._unlock(): 
+with raw.info._unlock():
     raw.info['dig'], ctf_head_t=_call_make_dig_points(nasion, lpa, rpa, hpi[0:len(hpi_indices)], digpts, convert=True)
 
 sampling_freq = raw.info["sfreq"]
@@ -384,20 +386,20 @@ for index in range(len(hpi_indices)):
     print(index)
     print(channel_index)
     chan_name=raw.info['ch_names'][channel_index]
-    
+
     print(f'*********HPI channel we want to localize {chan_name}**********')
     print(f'channel_index = {channel_index}')
     print(f'hpi_indices[index] = {hpi_indices[index]}')
 
     do_plot=False
-    
+
     raw_selection = raw[channel_index, start_sample:stop_sample]
     x = raw_selection[1]
     y = raw_selection[0].T
     b = y.ravel()
     dist=round(raw.info['sfreq']/hpi_freq)-2
     peaks, _ = find_peaks(b, distance=dist,height=0.0001)
-    
+
     if do_plot:
         plt.plot(b)
         plt.plot(peaks, b[peaks], "x")
@@ -424,9 +426,9 @@ for index in range(len(hpi_indices)):
 
     print(f'tmin window = {tmin}, t max window = {tmax}')
 
-    raw.crop(tmin=tmin,tmax=tmax) 
+    raw.crop(tmin=tmin,tmax=tmax)
 
-   
+
 
     if do_plot:
 
@@ -445,11 +447,11 @@ for index in range(len(hpi_indices)):
         print(f'cropped time window length = {len(raw)}')
         x1 = raw_selection2[1]
         y1 = raw_selection2[0].T
-   
+
         plt.plot(x1,y1)
         plt.show()
-    
-    
+
+
     print('************* add hpi struct to info ***********')
 
     hpi_sub = dict()
@@ -492,8 +494,8 @@ for index in range(len(hpi_indices)):
 
         #info._unlocked = False
         #info._update_redundant()
-    
-    with raw.info._unlock():  
+
+    with raw.info._unlock():
         raw.info["hpi_subsystem"] = hpi_sub
         raw.info["hpi_meas"] = [{"hpi_coils": hpi_coils}]
 
@@ -530,19 +532,19 @@ for index in range(len(hpi_indices)):
         raw.info["line_freq"]=None
         coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2)
         slope[index,:] = coil_amplitudes['slopes'][0][index]
-        
+
         '''
         assert len(coil_amplitudes["times"]) == 1
         coil_locs = compute_chpi_locs(raw.info, coil_amplitudes)
-    
+
         with info._unlock():
             info["hpi_results"] = None
-        
+
         hpi_g = coil_locs["gofs"][0]
         hpi_dev = coil_locs["rrs"][0]
 
         hpi_locs.append(hpi_dev)
-        
+
         # fill in hpi_results
         hpi_result = dict()
 
@@ -583,7 +585,7 @@ for index in range(len(hpi_indices)):
         # store it
         with raw.info._unlock():
             raw.info["hpi_results"] = [hpi_result]
-    
+
     if index==0:
         nasion_dev=raw.info['hpi_results'][0]['dig_points'][0]['r']
         na_raw=raw.copy()
@@ -614,7 +616,7 @@ for index in range(len(hpi_indices)):
         if index==4:
             cz_dev=raw.info['hpi_results'][0]['dig_points'][4]['r']
             cz_raw=raw.copy()
-            print('generated cz_raw ') 
+            print('generated cz_raw ')
             hpi=[in_dev,cz_dev] #meters
             hpi=[nasion_dev,lpa_dev,rpa_dev,in_dev,cz_dev]
             gof_cz=hpi_g
@@ -634,18 +636,15 @@ fname=datfile#args.dataset
 raw = mne.io.read_raw_fif(fname)
 raw.load_data()
 
-new_sfreq = raw.info['sfreq']
-
-#resample 
+#resample
 #Note for brainwave, it seems 5000Hz sample rate seems to produce unstable results
 #it is not related to filtering - tested and does not change the results
 #For now always resample to 1000Hz
 #I think it is specific to the beamformer and not other parts of the program
 
-if 1:
-    new_sfreq=1000
+if new_sfreq != raw.info['sfreq']:
     raw.load_data().resample(new_sfreq)
-    
+
 #remove bad channels
 for bad_chan in raw.info["bads"]:
     raw.drop_channels(bad_chan)
@@ -655,7 +654,7 @@ bads=TC_findzerochans(raw.info)
 for bad_chan in bads:
     raw.drop_channels(bad_chan)
 
-#add the cardinals 
+#add the cardinals
 include_hpis = hpi_gofs>0.9
 
 trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig[include_hpis])[0])
@@ -671,11 +670,11 @@ raw.info.update(dev_head_t=dev_to_head_trans)
 info=raw.info
 digpts=np.array([],dtype=float)
 for j in pol_info['dig']:
-    digpts=np.append(digpts,j['r']) 
+    digpts=np.append(digpts,j['r'])
 n=int(digpts.shape[0]/3)
 digpts=digpts.reshape((n,3))
 
-with raw.info._unlock(): 
+with raw.info._unlock():
     raw.info['dig']=_make_dig_points(nasion, lpa, rpa, hpi_orig, digpts)
 
 path ='/Users/teresa/data/windowshare/20240719/sub-HX'
@@ -704,10 +703,10 @@ if plotResult:
     senspos=np.array([],dtype=float)
     picks = pick_types(raw.info, meg='mag')
     for j in picks:
-        senspos=np.append(senspos, apply_trans(dev_to_head_trans, (raw.info['chs'][j]['loc'][0:3]))) 
+        senspos=np.append(senspos, apply_trans(dev_to_head_trans, (raw.info['chs'][j]['loc'][0:3])))
     n=int(senspos.shape[0]/3)
     senspos=senspos.reshape((n,3))
-    
+
     senslabel=list()
     picks = pick_types(raw.info, meg='mag')
     for j in picks:
@@ -716,7 +715,7 @@ if plotResult:
             senslabel.append(raw.info['chs'][j]['ch_name'][index:])
         else:
             senslabel.append('')
-    
+
     digpts=np.array([],dtype=float)
     for j in raw.info['dig']:
         digpts=np.append(digpts,j['r']) # to account for the gap between sensor surface and cell centre
@@ -725,5 +724,5 @@ if plotResult:
     hpilabel=list()
     for j in range(len(hpi_names)):
         hpilabel+=[str(j+1)]
-    
+
     plot_3d(senspos, senslabel, hpi_orig, hpilabel, hpi_head, hpi_names, digpts)
