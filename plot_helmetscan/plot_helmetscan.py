@@ -19,7 +19,7 @@ def select_file():
     root = tk.Tk()
     root.withdraw()
     default_path = "/home/administrator/.local/share/HEDscan"
-    file_path = filedialog.askopenfilename(initialdir=default_path, filetypes=[("CSV files", "*.csv")])
+    file_path = filedialog.askopenfilename(initialdir=default_path, filetypes=[("CSV files", "*locations.csv")])
     if not file_path.endswith('_helmetscan_locations.csv'):
         print("ERROR: Wrong file type. The file should end with '_helmetscan_locations.csv'.")
         sys.exit()
@@ -55,9 +55,9 @@ for outline in outlines:
 # Plot green filled circles for matching sensors and red filled circles for non-matching sensors
 for i, label in enumerate(labels):
     x, y = positions[i]
-    match = sensor_df.iloc[1:, 2].str.contains(label[:4])
+    match = sensor_df.iloc[0:, 2].str.contains(label[:4])
     if match.any():
-        sensor_name = sensor_df.iloc[1:, :][match].iloc[0, 0]
+        sensor_name = sensor_df.iloc[0:, :][match].iloc[0, 0]
         sensor_name_disp = sensor_name.split('_')[0]
         plt.plot(x, y, 'go', markersize=10)  # Green filled circle
         plt.text(x, y+0.08, sensor_name_disp, fontsize=9, ha='center')
