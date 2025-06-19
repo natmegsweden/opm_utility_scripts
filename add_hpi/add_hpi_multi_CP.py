@@ -19,7 +19,7 @@ import mne
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, cKDTree
 
 
 
@@ -267,7 +267,6 @@ polfile = get_file("Select polhemusfile")
 
 # Get frequency and order
 hpifreq = float(get_input("Enter frequency (Hz):", "33"))
-hpiorder = np.array([int(x) for x in get_input("Enter order (comma-separated):", "1, 4, 2, 3").split(',')], dtype=int)
 
 # Get downsampling frequency
 new_sfreq = float(get_input("Enter downsampling frequency (Hz):", "1000"))
@@ -280,7 +279,6 @@ print(f"Datafile: {datafiles}")
 print(f"HPIfile: {hpifile}")
 print(f"Polhemusfile: {polfile}")
 print(f"Frequency: {hpifreq} Hz")
-print(f"Order: {hpiorder}")
 print(f"Plot: {plotResult}")
 
 fname=hpifile#args.hpi
@@ -291,54 +289,23 @@ raw.load_data()
 for bad_chan in raw.info["bads"]:
     raw.drop_channels(bad_chan)
 
-
 #remove zero channels
 bads=TC_findzerochans(raw.info)
 for bad_chan in bads:
     raw.drop_channels(bad_chan)
 
-hpi_names_orig,hpi_indices_orig=TC_get_hpiout_names(raw)
+hpi_names,hpi_indices=TC_get_hpiout_names(raw)
 
-hpi_freq=33.0
-hpi_freqs_orig=np.zeros(len(hpi_indices_orig))
-for i in range(len(hpi_indices_orig)):
-    hpi_freqs_orig[i]=hpi_freq
-
-n=len(hpiorder)
-print(hpiorder)
-print(len(hpiorder))
-
-print(f'n={n}')
-
-if n == len(hpi_indices_orig):
-    hpi_freqs=hpi_freqs_orig
-else:
-    hpi_freqs=np.zeros(n)
-
-hpi_indices=np.zeros(n,dtype=np.int64)
-hpi_names=list()
-
-j=0
-for i in range(n):
-    hpi_indices[i]=hpi_indices_orig[hpiorder[i]-1]
-    hpi_names+=[hpi_names_orig[hpiorder[i]-1]]
+hpi_freqs=np.zeros(len(hpi_indices))
+for i in range(len(hpi_indices)):
     hpi_freqs[i]=hpifreq
 
-print(hpi_indices)
-print(hpi_names)
-print(hpi_freqs)
-
 #resample
-
 if 1:
     raw.load_data().resample(1000)
 
-
-#Add default cardinals and 3 hpi's with the same locations as the cardinals
-#Add any additional hpi's attached with default locations
 fname=polfile#args.pol
 pol_info = mne.io.read_info(fname)
-
 
 digpts=np.array([],dtype=float)
 lpa=pol_info['dig'][0]['r']
@@ -398,7 +365,7 @@ for index in range(len(hpi_indices)):
     x = raw_selection[1]
     y = raw_selection[0].T
     b = y.ravel()
-    dist=round(raw.info['sfreq']/hpi_freq)-2
+    dist=round(raw.info['sfreq']/hpifreq)-2
     peaks, _ = find_peaks(b, distance=dist,height=0.0001)
 
     if do_plot:
@@ -415,11 +382,6 @@ for index in range(len(hpi_indices)):
 
     print(f'{chan_name} first point = {peaks[0]} and last point = {peaks[-1]}, time window = {window} s')
 
-    #we use this window to extract the portion of data out for the magnetic dipole fit
-    if 0:
-        raw.filter(l_freq=3, h_freq=55)
-        raw = raw.notch_filter(freqs=freqs)
-
     minT=peaks[0]/raw.info['sfreq']
     maxT=peaks[-1]/raw.info['sfreq']
 
@@ -431,8 +393,6 @@ for index in range(len(hpi_indices)):
     print(f'tmin window = {tmin}, t max window = {tmax}')
 
     raw.crop(tmin=tmin,tmax=tmax)
-
-
 
     if do_plot:
 
@@ -457,7 +417,6 @@ for index in range(len(hpi_indices)):
 
 
     print('************* add hpi struct to info ***********')
-
     hpi_sub = dict()
 
     # Don't know what event_channel is don't think we have it HPIs are either
@@ -646,13 +605,22 @@ coil_locs = compute_chpi_locs(raw.info, coil_amplitudes)
 hpi_dev = np.array(coil_locs['rrs'][0])
 hpi_gofs = np.array(coil_locs['gofs'][0])
 
+#only use good fits
+include_hpis = hpi_gofs>0.9
+
+tree = cKDTree(hpi_orig)
+distances, indices = tree.query(hpi_dev[include_hpis])
+
+print(f"hpi_orig: {hpi_dev[include_hpis]}\n")
+print(f"hpi_dev: {hpi_orig[indices]}\n")
+
 # Calculate transform
-trans = _quat_to_affine(_fit_matched_points(hpi_dev, hpi_orig)[0])
+trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig[indices])[0])
 dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
 
 # Apply trans to hpi_dev
 hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
-dist = np.linalg.norm(hpi_orig-hpi_head, axis=1)
+dist = np.linalg.norm(hpi_orig[indices]-hpi_head[include_hpis], axis=1)
 
 print('***** Apply trans to files *******************************************')
 
@@ -667,8 +635,8 @@ for i in range(len(datafiles)):
     #For now always resample to 1000Hz
     #I think it is specific to the beamformer and not other parts of the program
 
-if new_sfreq != raw.info['sfreq']:
-    raw.load_data().resample(new_sfreq)
+    if new_sfreq != raw.info['sfreq']:
+        raw.load_data().resample(new_sfreq)
 
     #remove bad channels
     for bad_chan in raw.info["bads"]:
@@ -711,9 +679,10 @@ if new_sfreq != raw.info['sfreq']:
 print('---------------------------------------------')
 print(f"hpi_orig: {hpi_orig}\n")
 print(f"hpi_dev: {hpi_dev}\n")
-for index, value in enumerate(dist):
-        status = 'ok' if hpi_gofs[index]<0.9 else 'not ok'
-        print(f"Coil: {hpi_names[index][-3:]}, Distance: {(value*1e3):.2f} mm, GOF: {hpi_gofs[index]:.4f}, Status: {status}")
+print(f"mean distance = {np.mean(dist)*1000:.1f} mm\n")
+for index, value in enumerate(hpi_gofs):
+        status = 'ok' if hpi_gofs[index]>0.9 else 'not ok'
+        print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Status: {status}")
 print('---------------------------------------------')
 
 if plotResult:

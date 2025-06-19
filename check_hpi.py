@@ -114,7 +114,7 @@ data = epochs.get_data(copy=False)
 
 mag_channels = mne.pick_types(epochs.info, meg=True)
 misc_channels = mne.pick_types(epochs.info, misc=True)
-hpi_channels = np.zeros((5,1),dtype=int)
+hpi_channels = np.zeros((6,1),dtype=int)
 n_hpi = 0
 for i in misc_channels:
     if 'hpiin' in raw.info['chs'][i]['ch_name']:
