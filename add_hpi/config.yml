@@ -10,16 +10,18 @@ project:
     - RSEC
     - AudOdd
     - Phalanges
-  squidMEG: neuro/data/local/OPM-benchmarking/raw
-  opmMEG: neuro/data/local/OPM-benchmarking/raw
-  BIDS: neuro/data/local/OPM-benchmarking/bids
-  Calibration: neuro/databases/sss/sss_cal.dat
-  Crosstalk: neuro/databases/ctc/ct_sparse.fif
+  squidMEG: ../../NatMEG-utils/neuro/data/local/OPM-benchmarking/raw
+  opmMEG: ../../NatMEG-utils/neuro/data/local/OPM-benchmarking/raw
+  BIDS: ../../NatMEG-utils/neuro/data/local/OPM-benchmarking/bids
+  Calibration: ../../NatMEG-utils/neuro/databases/sss/sss_cal.dat
+  Crosstalk: ../../NatMEG-utils/neuro/databases/ctc/ct_sparse.fif
 
 opm:
-  data_file: <path_to_opm_data>
-  hpi_file: <path_to_hpi_data>
-  polhemus_file: <path_to_polhemus_data>
+  hpi_file: 
+    - HPIpre
+    - HPIpost
+    - HPIbefore
+    - HPIafter
   frequency: 33
   hpi_order: [1, 2, 3, 4] #
   downsample_to_hz: 1000
