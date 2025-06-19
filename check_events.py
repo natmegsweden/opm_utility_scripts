@@ -2,16 +2,64 @@
 import mne
 import numpy as np
 from collections import defaultdict
+import re
+
+def extract_events_from_raw(raw):
+    if 'di38' in raw.ch_names:
+        print("Channel 'di38' found. Extracting events...")
+        events = mne.find_events(raw, stim_channel='di38')
+    else:
+        print("Channel 'di38' not found. Searching for 'ai' channels...")
+        print(raw.ch_names)
+        ai_channels = [ch for ch in raw.ch_names if ch.startswith('ai')]
+        print(ai_channels)
+        if not ai_channels:
+            raise ValueError("No trigger channels found in the data.")
+
+        print(f"Found 'ai' channels: {ai_channels}")
+        
+        ai_data = raw.copy().pick_channels(ai_channels).get_data()
+        ai_values = ai_data > 2.5
+
+        suffixes = [int(ch[2:]) for ch in ai_channels]
+        sorted_indices = np.argsort(suffixes)
+        ai_values_sorted = ai_values[sorted_indices]
+
+        bit_values = 2 ** np.arange(len(ai_values))
+        combined_values = np.dot(ai_values_sorted.T, bit_values)
+
+        changes = np.diff(combined_values, prepend=combined_values[0])
+        event_onsets = np.where(changes > 0)[0]
+
+        valid_onsets = []
+        valid_codes = []
+        for onset in event_onsets:
+            current_code = combined_values[onset]
+            duration = 1
+            for i in range(onset + 1, len(combined_values)):
+                if combined_values[i] == current_code:
+                    duration += 1
+                else:
+                    break
+            if duration >= 10:
+                valid_onsets.append(onset)
+                valid_codes.append(current_code)
+
+        events = np.column_stack((valid_onsets, np.zeros(len(valid_onsets), dtype=int), valid_codes))
+
+    return events
+
 
 def check_events(fif_path):
     # Load the raw data
     raw = mne.io.read_raw_fif(fif_path, preload=False)
     
     # Pick only the trigger channel 'di38'
-    raw.pick_channels(['di38'])
-
+    #raw.pick_channels(['di38'])
     # Find events from the trigger channel
-    events = mne.find_events(raw, stim_channel='di38', shortest_event=1, verbose=False)
+    #events = mne.find_events(raw, stim_channel='di38', shortest_event=1, verbose=False)
+
+    events = extract_events_from_raw(raw)
 
     # Extract event codes and times
     event_codes = events[:, 2]
@@ -52,8 +100,7 @@ def check_events(fif_path):
 
         #print(f"Event Code: {code}")
         #print(f"  Count: {stats['count']}")
-        #print(f"  To Previous - Median: {median_prev:.3f}s, Max: {max_prev:.3f}s, Min: {np.nanmin(to_prev):.3f}s")
-        print(f"Code {code}: n={stats['count']}; ITI = {median_next:.3f}s ({np.nanmin(to_next):.3f}-{max_next:.3f}s)")
+        print(f"Code {code}: n={stats['count']}; ITI_post = {median_next:.3f}s ({np.nanmin(to_next):.3f}-{max_next:.3f}s); ITI_pre = {median_prev:.3f}s ({np.nanmin(to_prev):.3f}-{max_prev:.3f}s)")
 
     # Combined summary for all events
     all_to_prev = durations_to_prev[1:]  # exclude first NaN
@@ -71,6 +118,6 @@ def check_events(fif_path):
     print(f"All Events: n={len(event_codes)}; ITI = {median_all_next:.3f}s ({np.nanmin(all_to_next):.3f} - {max_all_next:.3f}s)")
     
 # Example usage:
-check_events('/Volumes/dataarchvie/21099_opm/MEG/NatMEG_0953/241104/osmeg/PhalangesOPM_raw.fif')
+#check_events('/Volumes/dataarchvie/21099_opm/MEG/NatMEG_0953/241104/osmeg/PhalangesOPM_raw.fif')
 
-#check_events('/Volumes/dataarchvie/CHOP/MEG/SBIRA27/241127/20241127_135607_sub-SBIRA27_file-VarITINoWire_raw.fif')
+check_events('/Volumes/dataarchvie/CHOP/MEG/SBIRA27/241127/20241127_135607_sub-SBIRA27_file-VarITINoWire_raw.fif')
