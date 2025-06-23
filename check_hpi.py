@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Fri Aug 16 14:38:51 2024
 
-@author: christophpfeiffer
-"""
+# Author: C Pfeiffer
 
 import tkinter as tk
 from tkinter import filedialog

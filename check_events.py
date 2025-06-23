@@ -1,3 +1,4 @@
+# Author: C Pfeiffer
 
 import mne
 import numpy as np
@@ -25,7 +26,7 @@ def extract_events_from_raw(raw):
         sorted_indices = np.argsort(suffixes)
         ai_values_sorted = ai_values[sorted_indices]
 
-        bit_values = 2 ** np.arange(len(ai_values))
+        bit_values = 2 ** np.arange(len(ai_values_sorted))
         combined_values = np.dot(ai_values_sorted.T, bit_values)
 
         changes = np.diff(combined_values, prepend=combined_values[0])
@@ -95,12 +96,12 @@ def check_events(fif_path):
         median_next = np.nanmedian(to_next) if len(to_next) > 0 else np.nan
 
         # Filter out durations > 2 * median for max calculation
-        max_prev = np.nanmax(to_prev[to_prev <= 2 * median_prev]) if len(to_prev) > 0 else np.nan
-        max_next = np.nanmax(to_next[to_next <= 2 * median_next]) if len(to_next) > 0 else np.nan
+        max_prev = np.percentile(to_prev[to_prev <= 2 * median_prev],95) if len(to_prev) > 0 else np.nan
+        max_next = np.percentile(to_next[to_next <= 2 * median_next],95) if len(to_next) > 0 else np.nan
 
         #print(f"Event Code: {code}")
         #print(f"  Count: {stats['count']}")
-        print(f"Code {code}: n={stats['count']}; ITI_post = {median_next:.3f}s ({np.nanmin(to_next):.3f}-{max_next:.3f}s); ITI_pre = {median_prev:.3f}s ({np.nanmin(to_prev):.3f}-{max_prev:.3f}s)")
+        print(f"Code {code}: n={stats['count']}; ITI_post = {median_next:.3f}s ({np.percentile(to_next,5):.3f}-{np.percentile(to_next,95):.3f}s); ITI_pre = {median_prev:.3f}s ({np.percentile(to_prev,5):.3f}-{np.percentile(to_prev,95):.3f}s)")
 
     # Combined summary for all events
     all_to_prev = durations_to_prev[1:]  # exclude first NaN
@@ -120,4 +121,4 @@ def check_events(fif_path):
 # Example usage:
 #check_events('/Volumes/dataarchvie/21099_opm/MEG/NatMEG_0953/241104/osmeg/PhalangesOPM_raw.fif')
 
-check_events('/Volumes/dataarchvie/CHOP/MEG/SBIRA27/241127/20241127_135607_sub-SBIRA27_file-VarITINoWire_raw.fif')
+check_events('/Volumes/dataarchvie/CHOP/MEG/SBIRA27/241122/HEDSCAN/20241122_110431_sub-SBIRA27_file-RTTapper_raw.fif')
