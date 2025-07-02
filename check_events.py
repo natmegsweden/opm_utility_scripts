@@ -4,13 +4,16 @@ import mne
 import numpy as np
 from collections import defaultdict
 import re
+from tkinter.filedialog import askopenfilename
+from os.path import isfile
 
-def extract_events_from_raw(raw):
-    if 'di38' in raw.ch_names:
-        print("Channel 'di38' found. Extracting events...")
-        events = mne.find_events(raw, stim_channel='di38')
+def extract_events_from_raw(raw, stim_channel='di38'):
+
+    if stim_channel in raw.ch_names:
+        print("Channel 'stim' found. Extracting events...")
+        events = mne.find_events(raw, stim_channel=stim_channel)
     else:
-        print("Channel 'di38' not found. Searching for 'ai' channels...")
+        print("Channel not found. Searching for 'ai' channels...")
         print(raw.ch_names)
         ai_channels = [ch for ch in raw.ch_names if ch.startswith('ai')]
         print(ai_channels)
@@ -50,17 +53,24 @@ def extract_events_from_raw(raw):
 
     return events
 
+def get_file():
+    # Use a file dialog to select the .fif file
+    filename = askopenfilename(filetypes=[("FIF files", "*.fif")],
+                               initialdir='/neuro/data')
+    if not filename:
+        raise ValueError("No file selected.")
+    return filename
 
-def check_events(fif_path):
+def check_events(fif_path, stim_channel):
     # Load the raw data
-    raw = mne.io.read_raw_fif(fif_path, preload=False)
+    raw = mne.io.read_raw_fif(fif_path, preload=False, allow_maxshield=True)
     
     # Pick only the trigger channel 'di38'
     #raw.pick_channels(['di38'])
     # Find events from the trigger channel
     #events = mne.find_events(raw, stim_channel='di38', shortest_event=1, verbose=False)
 
-    events = extract_events_from_raw(raw)
+    events = extract_events_from_raw(raw, stim_channel=stim_channel)
 
     # Extract event codes and times
     event_codes = events[:, 2]
@@ -120,5 +130,25 @@ def check_events(fif_path):
     
 # Example usage:
 #check_events('/Volumes/dataarchvie/21099_opm/MEG/NatMEG_0953/241104/osmeg/PhalangesOPM_raw.fif')
+#check_events('/Volumes/dataarchvie/CHOP/MEG/SBIRA27/241122/HEDSCAN/20241122_110431_sub-SBIRA27_file-RTTapper_raw.fif')
 
-check_events('/Volumes/dataarchvie/CHOP/MEG/SBIRA27/241122/HEDSCAN/20241122_110431_sub-SBIRA27_file-RTTapper_raw.fif')
+def args_parser():
+    import argparse
+    parser = argparse.ArgumentParser(description="Check events in a FIF file.")
+    parser.add_argument('--file', type=str, help="Path to the .fif file")
+    parser.add_argument('--stim', type=str, help="Select stim channel")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = args_parser()
+    if args.file:
+        fif_path = args.file
+    else:
+        fif_path = get_file()
+    if not fif_path or not isfile(fif_path):
+        print("Invalid file path. Please provide a valid .fif file.")
+    if not args.stim:
+        args.stim = 'di38'
+    else:
+        print(args.stim)
+        check_events(fif_path, stim_channel=args.stim if args.stim else None)
