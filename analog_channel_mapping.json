@@ -1,0 +1,114 @@
+{
+    "ai1": {
+        "newname": "Acc2X",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai2": {
+        "newname": "Acc2Y",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai3": {
+        "newname": "Acc2Z",
+        "tptypeye": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai5": {
+        "newname": "ECG",
+        "type": {
+            "kind": 402,
+            "unit": 107
+        }
+    },
+    "ai6": {
+        "newname": "EOG1",
+        "type": {
+            "kind": 202,
+            "unit": 107
+        }
+    },
+    "ai7": {
+        "newname": "EOG2",
+        "type": {
+            "kind": 202,
+            "unit": 107
+        }
+    },
+    "ai8": {
+        "newname": "RESP",
+        "type": {
+            "kind": 602,
+            "unit": 107
+        }
+    },
+    "ai9": {
+        "newname": "Acc1X",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai10": {
+        "newname": "Acc1Y",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai11": {
+        "newname": "Acc1Z",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai15": {
+        "newname": "EyeLX",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai16": {
+        "newname": "EyeLY",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai17": {
+        "newname": "EyeLP",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai18": {
+        "newname": "EyeRX",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai19": {
+        "newname": "EyeRY",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    },
+    "ai20": {
+        "newname": "EyeRP",
+        "type": {
+            "kind": 502,
+            "unit": 107
+        }
+    }
+}
