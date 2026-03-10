@@ -11,7 +11,7 @@ def extract_events_from_raw(raw, stim_channel='di38'):
 
     if stim_channel in raw.ch_names:
         print("Channel 'stim' found. Extracting events...")
-        events = mne.find_events(raw, stim_channel=stim_channel)
+fubas         events = mne.find_events(raw, stim_channel=stim_channel)
     else:
         print("Channel not found. Searching for 'ai' channels...")
         print(raw.ch_names)
