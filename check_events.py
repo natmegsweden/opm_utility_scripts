@@ -7,11 +7,11 @@ import re
 from tkinter.filedialog import askopenfilename
 from os.path import isfile
 
-def extract_events_from_raw(raw, stim_channel='di38'):
+def extract_events_from_raw(raw, stim_channel='di1'):
 
     if stim_channel in raw.ch_names:
         print("Channel 'stim' found. Extracting events...")
-        events = mne.find_events(raw, stim_channel=stim_channel)
+        events = mne.find_events(raw, stim_channel=stim_channel, shortest_event=1)
     else:
         print("Channel not found. Searching for 'ai' channels...")
         print(raw.ch_names)
@@ -78,7 +78,7 @@ def check_events(fif_path, stim_channel):
 
     # Print the sequence of event codes
     print("Sequence of event codes:")
-    print(event_codes.tolist())
+    #print(event_codes.tolist())
 
     # Initialize summary dictionary
     summary = defaultdict(lambda: {'count': 0, 'to_prev': [], 'to_next': []})
@@ -106,12 +106,14 @@ def check_events(fif_path, stim_channel):
         median_next = np.nanmedian(to_next) if len(to_next) > 0 else np.nan
 
         # Filter out durations > 2 * median for max calculation
-        max_prev = np.percentile(to_prev[to_prev <= 2 * median_prev],95) if len(to_prev) > 0 else np.nan
-        max_next = np.percentile(to_next[to_next <= 2 * median_next],95) if len(to_next) > 0 else np.nan
+        max_prev = np.percentile(to_prev[to_prev <= 2 * median_prev],95) if len(to_prev) > 0 else 0
+        max_next = np.percentile(to_next[to_next <= 2 * median_next],95) if len(to_next) > 0 else 0
+        min_prev = np.percentile(to_prev[to_prev <= 2 * median_prev],5) if len(to_prev) > 0 else 0
+        min_next = np.percentile(to_next[to_next <= 2 * median_next],5) if len(to_next) > 0 else 0
 
         #print(f"Event Code: {code}")
         #print(f"  Count: {stats['count']}")
-        print(f"Code {code}: n={stats['count']}; ITI_post = {median_next:.3f}s ({np.percentile(to_next,5):.3f}-{np.percentile(to_next,95):.3f}s); ITI_pre = {median_prev:.3f}s ({np.percentile(to_prev,5):.3f}-{np.percentile(to_prev,95):.3f}s)")
+        print(f"Code {hex(code)}: n={stats['count']}; ITI_post = {median_next:.3f}s ({min_next:.3f}-{max_next:.3f}s); ITI_pre = {median_prev:.3f}s ({min_prev:.3f}-{max_prev:.3f}s)")
 
     # Combined summary for all events
     all_to_prev = durations_to_prev[1:]  # exclude first NaN
