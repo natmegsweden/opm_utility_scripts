@@ -8,14 +8,20 @@ Created on Tue Mar 10 13:21:07 2026
 import mne
 import json
 from os.path import isfile
+from pyparsing import Union
 
-def rename_channels(path, mapping_file, newpath):
+def rename_channels(fif: Union[str, mne.io.fiff.raw.Raw], mapping, newpath):
     # Read data
-    raw = mne.io.read_raw(path,preload=False)
-    
-    # Read mapping file
-    with open(mapping_file) as json_file:
-        mapping = json.load(json_file)
+    if isinstance(fif, str):
+        raw = mne.io.read_raw(fif,preload=False, verbose='error')
+    elif isinstance(fif, mne.io.fiff.raw.Raw):
+        raw = fif.copy()
+        fif = str(raw.filenames[0])
+
+    if isinstance(mapping, str):
+        # Read mapping file
+        with open(mapping) as json_file:
+            mapping = json.load(json_file)
         
     # Rename 
     for oldname,new in mapping.items():
@@ -45,8 +51,8 @@ def args_parser():
 if __name__ == "__main__":
     args = args_parser()
     if args.file:
-        fif_path = args.file
-    if not fif_path or not isfile(fif_path):
+        fif = args.file
+    if not fif or not isfile(fif):
         print("Invalid or missing file path. Please provide a valid raw (fif) file.")
     if not args.map:
         args.map = 'analog_channel_mapping.json'
@@ -55,7 +61,7 @@ if __name__ == "__main__":
     if args.newfile:
         newfile = args.newfile
     else:
-        newfile = fif_path
+        newfile = fif
         print('Overwriting raw file')
         
-    rename_channels(fif_path, args.map, newfile)
+    rename_channels(fif, args.map, newfile)
