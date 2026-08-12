@@ -1,0 +1,338 @@
+"""
+Core HPI pipeline shared by the single-file and multi-file entry points.
+
+Two public functions are provided:
+
+* ``fit_hpi`` — loads an HPI recording and a Polhemus file, runs the
+  sequential per-coil amplitude estimation, and returns all fit results.
+* ``apply_transform`` — loads a data recording, applies the
+  device-to-head transform produced by ``fit_hpi``, embeds digitisation
+  points, optionally resamples, and saves.
+
+Both functions import from ``opm_utility_scripts.channels`` and
+``opm_utility_scripts.viz`` so they never carry private copies of those
+utilities.
+"""
+
+import os
+
+import matplotlib.pyplot as plt
+import mne
+import numpy as np
+from scipy.signal import find_peaks
+from scipy.spatial import cKDTree
+
+from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
+from mne._fiff.pick import pick_types
+from mne.chpi import compute_chpi_amplitudes, compute_chpi_locs
+from mne.io.constants import FIFF
+from mne.transforms import (
+    Transform,
+    _fit_matched_points,
+    _quat_to_affine,
+    apply_trans,
+    get_ras_to_neuromag_trans,
+)
+from mne.utils import warn
+
+from opm_utility_scripts.channels import find_zero_location_channels, get_hpi_output_channels
+
+# Sampling frequency used internally for HPI fitting (always resample to
+# this before running the amplitude estimation loop).
+_HPI_FIT_SFREQ = 1000
+
+
+def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
+    """
+    Load HPI and Polhemus recordings, fit dipoles per coil, and compute
+    the device-to-head transform.
+
+    Parameters
+    ----------
+    hpifile : str | mne.io.Raw
+        Path to the OPM recording in which the HPI coils were activated
+        sequentially, or a pre-loaded Raw object.
+    polfile : str | dict
+        Path to the TRIUX/JSON Polhemus recording, or a pre-loaded
+        Polhemus dict returned by ``load_polhemus``.
+    hpifreq : float
+        Drive frequency shared by all HPI coils (Hz).
+
+    Returns
+    -------
+    dict
+        Keys:
+
+        ``dev_to_head_trans`` : mne.transforms.Transform
+            Device-to-head coordinate transform.
+        ``hpi_dev`` : np.ndarray, shape (n_coils, 3)
+            HPI coil positions in device coordinates.
+        ``hpi_gofs`` : np.ndarray, shape (n_coils,)
+            Goodness-of-fit values for each coil (0–1).
+        ``hpi_orig`` : np.ndarray, shape (n_coils, 3)
+            HPI coil positions in head coordinates (from Polhemus).
+        ``hpi_names`` : list[str]
+            HPI output channel names.
+        ``nasion`` : np.ndarray, shape (3,)
+        ``lpa`` : np.ndarray, shape (3,)
+        ``rpa`` : np.ndarray, shape (3,)
+        ``pol_info`` : dict
+            Full Polhemus digitisation info returned by ``load_polhemus``.
+        ``extra_pts`` : np.ndarray, shape (n_extra, 3)
+            Headshape points only (``kind == 4``).
+        ``eeg_pts`` : np.ndarray, shape (n_eeg, 3)
+            EEG digitisation points only (``kind == 3``).
+        ``slope`` : np.ndarray, shape (n_coils, n_meg_channels)
+            Accumulated slope matrix (used for the topomap plot in
+            ``coregister.py``).
+        ``raw_for_topomap`` : mne.io.Raw
+            Copy of the HPI raw (MEG channels only, bad channels dropped)
+            suitable for constructing EvokedArray topomaps.
+        ``dist`` : np.ndarray
+            Per-coil residual distances (head-coord space, metres).
+        ``include_hpis`` : np.ndarray of bool
+            Mask of coils whose GOF exceeded 0.9.
+        ``tree_indices`` : np.ndarray
+            KDTree query indices mapping included HPI device positions to
+            their nearest Polhemus counterparts.
+    """
+    # ------------------------------------------------------------------
+    # Load HPI recording
+    # ------------------------------------------------------------------
+    if isinstance(hpifile, str):
+        raw = mne.io.read_raw_fif(hpifile, preload=True)
+        for bad_chan in list(raw.info['bads']):
+            raw.drop_channels(bad_chan)
+    else:
+        raw = hpifile
+
+    bads = find_zero_location_channels(raw.info)
+    for bad_chan in bads:
+        raw.drop_channels(bad_chan)
+
+    hpi_names, hpi_indices = get_hpi_output_channels(raw)
+
+    hpi_freqs = np.full(len(hpi_indices), hpifreq)
+
+    # Always resample to the internal fitting frequency.
+    raw.load_data().resample(_HPI_FIT_SFREQ)
+
+    # ------------------------------------------------------------------
+    # Load Polhemus digitisation
+    # ------------------------------------------------------------------
+    if isinstance(polfile, str):
+        from opm_utility_scripts.io import load_polhemus
+
+        pol = load_polhemus(polfile)
+    else:
+        pol = polfile
+
+    lpa = pol['lpa']
+    nasion = pol['nasion']
+    rpa = pol['rpa']
+    hpi_orig = pol['hpi_orig']
+
+    # Set an initial device-to-head transform from the Polhemus fiducials.
+    dev_head_t = Transform("meg", "head", trans=None)
+    dev_head_t['trans'] = get_ras_to_neuromag_trans(nasion, lpa, rpa)
+    raw.info.update(dev_head_t=dev_head_t)
+
+    with raw.info._unlock():
+        raw.info['dig'], _ = _call_make_dig_points(
+            nasion,
+            lpa,
+            rpa,
+            pol['hpi_orig'][0:len(hpi_indices)],
+            pol['extra_pts'],
+            convert=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Per-coil amplitude estimation loop
+    # ------------------------------------------------------------------
+    start_sample = 0
+    stop_sample = len(raw)
+    dist_limit = 0.005
+
+    raw_orig = raw.copy()
+    slope = np.zeros((len(hpi_indices), len(pick_types(raw.info, meg='mag'))), dtype=float)
+
+    for index in range(len(hpi_indices)):
+        raw = raw_orig.copy()
+        channel_index = hpi_indices[index]
+        chan_name = raw.info['ch_names'][channel_index]
+
+        print(f'**** HPI coil {chan_name} (index {channel_index}) ****')
+
+        raw_selection = raw[channel_index, start_sample:stop_sample]
+        b = raw_selection[0].ravel()
+        peak_dist = round(raw.info['sfreq'] / hpifreq) - 2
+        peaks, _ = find_peaks(b, distance=peak_dist, height=0.0001)
+
+        if len(peaks) < 1:
+            print('ERROR: no peaks found for this coil — skipping')
+            continue
+
+        minT = peaks[0] / raw.info['sfreq']
+        maxT = peaks[-1] / raw.info['sfreq']
+        tmin = (maxT - minT) / 2.0 - 1 + minT
+        tmax = (maxT - minT) / 2.0 + 1 + minT
+        raw.crop(tmin=tmin, tmax=tmax)
+
+        # Build HPI subsystem info so compute_chpi_amplitudes can run.
+        hpi_sub = {"hpi_coils": [{} for _ in range(len(hpi_indices))]}
+        hpi_coils = [
+            {
+                "number": i + 1,
+                "drive_chan": hpi_names[i],
+                "coil_freq": hpi_freqs[i],
+            }
+            for i in range(len(hpi_indices))
+        ]
+        for i in range(len(hpi_indices)):
+            hpi_sub["hpi_coils"][i]["event_bits"] = [256]
+
+        with raw.info._unlock():
+            raw.info["hpi_subsystem"] = hpi_sub
+            raw.info["hpi_meas"] = [{"hpi_coils": hpi_coils}]
+
+        # Count active HPIs.
+        n_hpis = sum(
+            1 for d in raw.info["hpi_subsystem"]["hpi_coils"]
+            if d.get("event_bits") == [256]
+        )
+
+        if n_hpis < 3:
+            # NOTE: coil_amplitudes is only assigned inside this else branch.
+            # If n_hpis < 3 for every iteration the assert below will raise
+            # UnboundLocalError — this is a pre-existing bug preserved here.
+            warn(
+                f"{n_hpis:d} HPIs active. At least 3 needed to perform"
+                " head localization\n *NO* head localization performed"
+            )
+        else:
+            with raw.info._unlock():
+                raw.info["hpi_results"] = [
+                    dict(
+                        dig_points=[
+                            dict(
+                                r=np.zeros(3),
+                                coord_frame=FIFF.FIFFV_COORD_DEVICE,
+                                ident=ii + 1,
+                            )
+                            for ii in range(n_hpis)
+                        ],
+                        coord_trans=Transform("meg", "head"),
+                    )
+                ]
+            raw.info["line_freq"] = None
+            coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2)
+            slope[index, :] = coil_amplitudes['slopes'][0][index]
+
+    # ------------------------------------------------------------------
+    # Build final coil locations from accumulated slope matrix
+    # ------------------------------------------------------------------
+    assert len(coil_amplitudes["times"]) == 1  # noqa: F821 (intentional — see note above)
+    coil_amplitudes['slopes'][0] = slope
+    coil_locs = compute_chpi_locs(raw.info, coil_amplitudes)
+    hpi_dev = np.array(coil_locs['rrs'][0])
+    hpi_gofs = np.array(coil_locs['gofs'][0])
+
+    include_hpis = hpi_gofs > 0.9
+
+    tree = cKDTree(hpi_orig)
+    distances, tree_indices = tree.query(hpi_dev[include_hpis])
+
+    trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig[tree_indices])[0])
+    dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
+
+    hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
+    dist = np.linalg.norm(hpi_orig[tree_indices] - hpi_head[include_hpis], axis=1)
+
+    # Raw copy with only MEG channels for the optional topomap.
+    raw_for_topomap = raw_orig.copy()
+    raw_for_topomap.pick(picks=['meg'], exclude='bads')
+
+    return {
+        'dev_to_head_trans': dev_to_head_trans,
+        'hpi_dev': hpi_dev,
+        'hpi_gofs': hpi_gofs,
+        'hpi_orig': hpi_orig,
+        'hpi_names': hpi_names,
+        'nasion': nasion,
+        'lpa': lpa,
+        'rpa': rpa,
+        'pol_info': pol,
+        'extra_pts': pol['extra_pts'],
+        'eeg_pts': pol['eeg_pts'],
+        'slope': slope,
+        'raw_for_topomap': raw_for_topomap,
+        'dist': dist,
+        'include_hpis': include_hpis,
+        'tree_indices': tree_indices,
+    }
+
+
+def apply_transform(datfile: str, fit_result: dict, new_sfreq: float, suffix: str) -> str:
+    """
+    Apply the HPI device-to-head transform to a data file and save.
+
+    Parameters
+    ----------
+    datfile : str
+        Path to the OPM-MEG data file to transform.
+    fit_result : dict
+        Result dict from :func:`fit_hpi`.
+    new_sfreq : float
+        Target sampling frequency.  The file is resampled only when the
+        current ``sfreq`` differs from *new_sfreq*.
+    suffix : str
+        Suffix inserted before the extension in the output filename.
+        E.g. ``"_proc-hpi+ds_raw.fif"`` → ``"<stem>_proc-hpi+ds_raw.fif"``.
+
+    Returns
+    -------
+    str
+        Path to the saved output file.
+    """
+    dev_to_head_trans = fit_result['dev_to_head_trans']
+    hpi_orig = fit_result['hpi_orig']
+    nasion = fit_result['nasion']
+    lpa = fit_result['lpa']
+    rpa = fit_result['rpa']
+    extra_pts = fit_result['extra_pts']
+    eeg_pts = fit_result.get('eeg_pts', np.empty((0, 3)))
+
+    raw = mne.io.read_raw_fif(datfile, preload=True)
+
+    if new_sfreq != raw.info['sfreq']:
+        raw.load_data().resample(new_sfreq)
+
+    for bad_chan in raw.info["bads"]:
+        raw.drop_channels(bad_chan)
+
+    bads = find_zero_location_channels(raw.info)
+    for bad_chan in bads:
+        raw.drop_channels(bad_chan)
+
+    raw.info.update(dev_head_t=dev_to_head_trans)
+
+    with raw.info._unlock():
+        raw.info['dig'] = _make_dig_points(nasion, lpa, rpa, hpi_orig, extra_pts)
+        if len(eeg_pts):
+            coord_frame = raw.info['dig'][0]['coord_frame'] if raw.info['dig'] else FIFF.FIFFV_COORD_HEAD
+            for i, r in enumerate(eeg_pts):
+                raw.info['dig'].append({
+                    'r': r,
+                    'ident': i + 1,
+                    'kind': FIFF.FIFFV_POINT_EEG,
+                    'coord_frame': coord_frame,
+                })
+
+    path = os.path.dirname(datfile)
+    savename = os.path.splitext(os.path.basename(datfile))[0]
+    savename = savename.replace('_raw', '')
+    outpath = os.path.join(path, savename + suffix)
+
+    raw.save(outpath, overwrite=True)
+    return outpath
