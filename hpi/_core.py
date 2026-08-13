@@ -74,14 +74,17 @@ def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
         ``hpi_names`` : list[str]
             HPI output channel names.
         ``nasion`` : np.ndarray, shape (3,)
+            Nasion fiducial in **head** coordinates.
         ``lpa`` : np.ndarray, shape (3,)
+            Left pre-auricular fiducial in **head** coordinates.
         ``rpa`` : np.ndarray, shape (3,)
+            Right pre-auricular fiducial in **head** coordinates.
         ``pol_info`` : dict
             Full Polhemus digitisation info returned by ``load_polhemus``.
         ``extra_pts`` : np.ndarray, shape (n_extra, 3)
-            Headshape points only (``kind == 4``).
+            Headshape points only (``kind == 4``), in **head** coordinates.
         ``eeg_pts`` : np.ndarray, shape (n_eeg, 3)
-            EEG digitisation points only (``kind == 3``).
+            EEG digitisation points only (``kind == 3``), in **head** coordinates.
         ``slope`` : np.ndarray, shape (n_coils, n_meg_channels)
             Accumulated slope matrix (used for the topomap plot in
             ``coregister.py``).
@@ -132,10 +135,18 @@ def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
     rpa = pol['rpa']
     hpi_orig = pol['hpi_orig']
 
-    # Set an initial device-to-head transform from the Polhemus fiducials.
-    dev_head_t = Transform("meg", "head", trans=None)
-    dev_head_t['trans'] = get_ras_to_neuromag_trans(nasion, lpa, rpa)
-    raw.info.update(dev_head_t=dev_head_t)
+    # Build the isotrak→head transform from the Polhemus fiducials.
+    # This is used to convert all digitisation points from the Polhemus
+    # measurement frame (isotrak) to MNE head coordinates.
+    isotrak_to_head = get_ras_to_neuromag_trans(nasion, lpa, rpa)
+
+    # Seed dev_head_t with identity: at this point we don't know the
+    # device→head transform (that's what fit_hpi is computing).
+    # compute_chpi_locs inverts dev_head_t to seed its dipole search;
+    # identity means the seed is in device coordinates — correct.
+    # Using isotrak→head here was wrong: it would give compute_chpi_locs
+    # a head→isotrak seed (the inverse), sending the search to the wrong region.
+    raw.info.update(dev_head_t=Transform("meg", "head"))
 
     with raw.info._unlock():
         raw.info['dig'], _ = _call_make_dig_points(
@@ -144,7 +155,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
             rpa,
             pol['hpi_orig'][0:len(hpi_indices)],
             pol['extra_pts'],
-            convert=True,
+            convert=True,   # converts isotrak → head using the fiducials
         )
 
     # ------------------------------------------------------------------
@@ -240,14 +251,39 @@ def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
 
     include_hpis = hpi_gofs > 0.9
 
-    tree = cKDTree(hpi_orig)
+    # hpi_orig is in isotrak coordinates (the Polhemus measurement frame).
+    # hpi_dev is in device (MEG) coordinates.
+    # _fit_matched_points needs both sets in the same frame.
+    # Convert hpi_orig → head coordinates using the isotrak→head transform
+    # that was already computed from the fiducials above.
+    isotrak_to_head = get_ras_to_neuromag_trans(nasion, lpa, rpa)
+    hpi_orig_head = apply_trans(isotrak_to_head, hpi_orig)
+
+    tree = cKDTree(hpi_orig_head)
     distances, tree_indices = tree.query(hpi_dev[include_hpis])
 
-    trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig[tree_indices])[0])
+    trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig_head[tree_indices])[0])
     dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
 
     hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
-    dist = np.linalg.norm(hpi_orig[tree_indices] - hpi_head[include_hpis], axis=1)
+    dist = np.linalg.norm(hpi_orig_head[tree_indices] - hpi_head[include_hpis], axis=1)
+
+    # Convert all remaining Polhemus points from isotrak → head frame so that
+    # apply_transform can pass them directly to _make_dig_points(coord_frame="head")
+    # without a second conversion step.
+    nasion_head = apply_trans(isotrak_to_head, nasion)
+    lpa_head = apply_trans(isotrak_to_head, lpa)
+    rpa_head = apply_trans(isotrak_to_head, rpa)
+    extra_pts_head = (
+        apply_trans(isotrak_to_head, pol['extra_pts'])
+        if len(pol['extra_pts'])
+        else pol['extra_pts']
+    )
+    eeg_pts_head = (
+        apply_trans(isotrak_to_head, pol['eeg_pts'])
+        if len(pol['eeg_pts'])
+        else pol['eeg_pts']
+    )
 
     # Raw copy with only MEG channels for the optional topomap.
     raw_for_topomap = raw_orig.copy()
@@ -257,14 +293,16 @@ def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
         'dev_to_head_trans': dev_to_head_trans,
         'hpi_dev': hpi_dev,
         'hpi_gofs': hpi_gofs,
-        'hpi_orig': hpi_orig,
+        'hpi_orig': hpi_orig_head,   # head coordinates (consistent with dev_to_head_trans)
         'hpi_names': hpi_names,
-        'nasion': nasion,
-        'lpa': lpa,
-        'rpa': rpa,
+        # All dig-point arrays below are in head coordinates so apply_transform
+        # can call _make_dig_points(coord_frame="head") directly.
+        'nasion': nasion_head,
+        'lpa': lpa_head,
+        'rpa': rpa_head,
         'pol_info': pol,
-        'extra_pts': pol['extra_pts'],
-        'eeg_pts': pol['eeg_pts'],
+        'extra_pts': extra_pts_head,
+        'eeg_pts': eeg_pts_head,
         'slope': slope,
         'raw_for_topomap': raw_for_topomap,
         'dist': dist,
@@ -318,15 +356,18 @@ def apply_transform(datfile: str, fit_result: dict, new_sfreq: float, suffix: st
     raw.info.update(dev_head_t=dev_to_head_trans)
 
     with raw.info._unlock():
-        raw.info['dig'] = _make_dig_points(nasion, lpa, rpa, hpi_orig, extra_pts)
+        # All arrays from fit_result are already in head coordinates.
+        raw.info['dig'] = _make_dig_points(
+            nasion, lpa, rpa, hpi_orig, extra_pts,
+            coord_frame="head",
+        )
         if len(eeg_pts):
-            coord_frame = raw.info['dig'][0]['coord_frame'] if raw.info['dig'] else FIFF.FIFFV_COORD_HEAD
             for i, r in enumerate(eeg_pts):
                 raw.info['dig'].append({
                     'r': r,
                     'ident': i + 1,
                     'kind': FIFF.FIFFV_POINT_EEG,
-                    'coord_frame': coord_frame,
+                    'coord_frame': FIFF.FIFFV_COORD_HEAD,
                 })
 
     path = os.path.dirname(datfile)
