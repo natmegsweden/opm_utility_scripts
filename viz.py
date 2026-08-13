@@ -204,12 +204,12 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True, filename: str = N
             ax.scatter(sensor_head_mm[:, 0],
                        sensor_head_mm[:, 1],
                        sensor_head_mm[:, 2],
-                       c='lightgray', s=4, alpha=0.25, zorder=1)
+                       c='#555555', s=6, alpha=0.45, zorder=1)
 
         # Headshape
         if extra_mm is not None and len(extra_mm):
             ax.scatter(extra_mm[:, 0], extra_mm[:, 1], extra_mm[:, 2],
-                       c='gainsboro', s=3, alpha=0.3, zorder=1)
+                       c='#888888', s=5, alpha=0.5, zorder=1)
 
         # Fiducials
         fid_colors = {'LPA': 'darkorange', 'Nasion': 'limegreen', 'RPA': 'darkorange'}
