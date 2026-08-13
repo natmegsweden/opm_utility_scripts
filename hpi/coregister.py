@@ -21,11 +21,10 @@ import matplotlib.pyplot as plt
 import mne
 import numpy as np
 
-from mne._fiff.pick import pick_types
 from mne.transforms import apply_trans
 
 from opm_utility_scripts.io import get_boolean, get_file, get_files, get_input
-from opm_utility_scripts.viz import plot_3d
+from opm_utility_scripts.viz import plot_3d, plot_hpi_alignment
 from ._core import fit_hpi, apply_transform
 
 _OUTPUT_SUFFIX = '_proc-hpi+ds_raw.fif'
@@ -102,47 +101,25 @@ def main():
         last_outpath = outpath
 
     # ----------------------------------------------------------------
-    # Optional 3-D plot (uses the last processed file)
+    # Optional alignment plot
     # ----------------------------------------------------------------
-    if plotResult and last_outpath is not None:
-        import mne as _mne
-        raw_plot = _mne.io.read_raw_fif(last_outpath, preload=False)
-
-        senspos = np.array([], dtype=float)
-        picks = pick_types(raw_plot.info, meg='mag')
-        for j in picks:
-            senspos = np.append(
-                senspos,
-                apply_trans(dev_to_head_trans, raw_plot.info['chs'][j]['loc'][0:3])
-            )
-        n = int(senspos.shape[0] / 3)
-        senspos = senspos.reshape((n, 3))
-
-        senslabel = []
-        for j in picks:
-            idx = raw_plot.info['chs'][j]['ch_name'].find('s')
-            senslabel.append(raw_plot.info['chs'][j]['ch_name'][idx:] if idx != -1 else '')
-
-        digpts = np.array([], dtype=float)
-        for j in raw_plot.info['dig']:
-            digpts = np.append(digpts, j['r'])
-        n = int(digpts.shape[0] / 3)
-        digpts = digpts.reshape((n, 3))
-
-        hpilabel = [str(j + 1) for j in range(len(hpi_names))]
-
-        plot_params = {
-            'senspos': senspos,
-            'senslabel': senslabel,
-            'hpipos': hpi_orig,
-            'hpilabel': hpilabel,
-            'hpipos2': hpi_head,
-            'hpilabel2': hpi_names,
-            'digpos': digpts,
-        }
+    if plotResult:
         import os
-        plot_stem = os.path.splitext(last_outpath)[0]
-        plot_3d(plot_params, f"{plot_stem}_hpi_plot.png")
+        # Load the HPI raw for the sensor cloud.  Use the original hpifile
+        # (device-space sensor positions) rather than the processed output.
+        raw_hpi_for_plot = mne.io.read_raw_fif(hpifile, preload=False, verbose='error')
+
+        plot_stem = (
+            os.path.splitext(last_outpath)[0]
+            if last_outpath is not None
+            else os.path.splitext(hpifile)[0]
+        )
+        plot_hpi_alignment(
+            fit,
+            raw=raw_hpi_for_plot,
+            show=True,
+            filename=f"{plot_stem}_hpi_alignment.png",
+        )
 
 
 if __name__ == '__main__':

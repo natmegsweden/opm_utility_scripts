@@ -7,7 +7,7 @@ From ``channels``:
     find_zero_location_channels, get_hpi_output_channels, pick_low_noise_meg_chs
 
 From ``viz``:
-    create_aligned_grid, plot_3d, rotate_points, plot_psd
+    create_aligned_grid, plot_3d, plot_hpi_alignment, rotate_points, plot_psd
 
 From ``io``:
     get_boolean, get_file, get_files, get_input, write_bw_marker_file,
@@ -21,7 +21,7 @@ From ``analog.rename``:
 """
 
 from .channels import find_zero_location_channels, get_hpi_output_channels, pick_low_noise_meg_chs
-from .viz import create_aligned_grid, plot_3d, rotate_points, plot_psd
+from .viz import create_aligned_grid, plot_3d, plot_hpi_alignment, rotate_points, plot_psd
 from .io import (
     get_boolean,
     get_file,
@@ -44,6 +44,7 @@ __all__ = [
     # viz
     'create_aligned_grid',
     'plot_3d',
+    'plot_hpi_alignment',
     'rotate_points',
     'plot_psd',
     # io
