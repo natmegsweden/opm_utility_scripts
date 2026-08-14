@@ -30,7 +30,13 @@ from opm_utility_scripts.io import get_boolean, get_file, get_files, get_input
 from opm_utility_scripts.viz import plot_3d, plot_hpi_alignment
 from ._core import fit_hpi, apply_transform, save_raw
 
-_OUTPUT_SUFFIX = '_proc-hpi+ds_raw.fif'
+def _output_suffix(datfile: str, new_sfreq: float) -> str:
+    """Return the output suffix, including '+ds' only when the file is resampled."""
+    info = mne.io.read_info(datfile, verbose='error')
+    suffix = '_proc-hpi'
+    if int(new_sfreq) != int(info['sfreq']):
+        suffix += '+ds'
+    return suffix + '_raw.fif'
 
 
 def main():
@@ -104,17 +110,16 @@ def main():
     last_datfile = None
 
     for datfile in datafiles:
+        suffix = _output_suffix(datfile, new_sfreq)
         raw_out = apply_transform(datfile, fit, new_sfreq)
 
         if doSave:
             stem = os.path.splitext(os.path.basename(datfile))[0].replace('_raw', '')
-            outpath = os.path.join(os.path.dirname(datfile),
-                                   stem + _OUTPUT_SUFFIX)
+            outpath = os.path.join(os.path.dirname(datfile), stem + suffix)
             if not overwrite and os.path.exists(outpath):
                 print(f"Skipped (already exists): {outpath}")
             else:
-                outpath = save_raw(raw_out, datfile, _OUTPUT_SUFFIX,
-                                   overwrite=overwrite)
+                outpath = save_raw(raw_out, datfile, suffix, overwrite=overwrite)
                 print(f"Saved: {outpath}")
                 last_outpath = outpath
 
