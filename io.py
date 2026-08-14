@@ -7,6 +7,8 @@ import warnings
 import numpy as np
 
 
+INITIAL_DIR = '/data'
+
 def _get_tk_modules():
     import tkinter as tk
     from tkinter import filedialog, simpledialog
@@ -73,13 +75,13 @@ def write_bw_marker_file(dsName, events, chanName, fs):
 def get_file(title):
     """Open a single-file dialog and return the selected path."""
     _, filedialog, _ = _get_tk_modules()
-    return filedialog.askopenfilename(title=title)
+    return filedialog.askopenfilename(title=title, initialdir=INITIAL_DIR)
 
 
 def get_files(title):
     """Open a multi-file dialog and return the selected paths as a tuple."""
     _, filedialog, _ = _get_tk_modules()
-    return filedialog.askopenfilenames(title=title)
+    return filedialog.askopenfilenames(title=title, initialdir=INITIAL_DIR)
 
 
 def get_input(prompt, default):

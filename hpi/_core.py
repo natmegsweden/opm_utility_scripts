@@ -15,6 +15,7 @@ utilities.
 """
 
 import os
+import warnings
 
 import matplotlib.pyplot as plt
 import mne
@@ -245,7 +246,18 @@ def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
     # ------------------------------------------------------------------
     assert len(coil_amplitudes["times"]) == 1  # noqa: F821 (intentional — see note above)
     coil_amplitudes['slopes'][0] = slope
-    coil_locs = compute_chpi_locs(raw.info, coil_amplitudes)
+    # Suppress the "HPI consistency of isotrak and hpifit is poor" RuntimeWarning.
+    # It fires because hpi_results[-1]['dig_points'] is intentionally zero-initialised
+    # (a seed placeholder); compute_chpi_locs compares those zeros against the real
+    # head-frame dig points and flags the discrepancy.  The warning is a false alarm:
+    # the actual dipole search uses the dig points directly and is unaffected.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='HPI consistency of isotrak and hpifit is poor',
+            category=RuntimeWarning,
+        )
+        coil_locs = compute_chpi_locs(raw.info, coil_amplitudes)
     hpi_dev = np.array(coil_locs['rrs'][0])
     hpi_gofs = np.array(coil_locs['gofs'][0])
 
