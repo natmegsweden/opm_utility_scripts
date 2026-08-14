@@ -8,6 +8,8 @@ Handles both single-file and multi-file cases through one script:
 * ``fit_hpi`` is called once to localise the coils.
 * If more than one data file is selected a topomap figure is shown.
 * ``apply_transform`` is called in a loop over all selected data files.
+* Saving is optional (not the default); overwrite behaviour is asked
+  separately when saving is enabled.
 * All output files use the suffix ``_proc-hpi+ds_raw.fif``.
 
 Usage::
@@ -15,6 +17,7 @@ Usage::
     python -m opm_utility_scripts.hpi.coregister
 """
 
+import os
 import tkinter as tk
 
 import matplotlib.pyplot as plt
@@ -40,7 +43,9 @@ def main():
 
     hpifreq = float(get_input("Enter HPI frequency (Hz):", "33"))
     new_sfreq = float(get_input("Enter downsampling frequency (Hz):", "1000"))
-    plotResult = get_boolean("Do you want to plot the result?")
+    doSave = get_boolean("Save result to disk? (default: no)")
+    overwrite = get_boolean("Overwrite existing files? (default: no)") if doSave else False
+    plotResult = get_boolean("Plot alignment? (default: no)")
 
     root.quit()
 
@@ -48,6 +53,7 @@ def main():
     print(f"HPI file:     {hpifile}")
     print(f"Polhemus file:{polfile}")
     print(f"Frequency:    {hpifreq} Hz")
+    print(f"Save:         {doSave}{'  (overwrite)' if overwrite else ''}")
     print(f"Plot:         {plotResult}")
 
     # ----------------------------------------------------------------
@@ -63,7 +69,6 @@ def main():
     slope = fit['slope']
     raw_for_topomap = fit['raw_for_topomap']
     dev_to_head_trans = fit['dev_to_head_trans']
-    hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
 
     # ----------------------------------------------------------------
     # Optional topomap (only shown when multiple files were selected)
@@ -83,8 +88,8 @@ def main():
     # Print fit quality
     # ----------------------------------------------------------------
     print('---------------------------------------------')
-    print(f"hpi_orig:\n{hpi_orig}\n")
-    print(f"hpi_dev:\n{hpi_dev}\n")
+    print(f"hpi_orig (head frame, mm):\n{hpi_orig * 1000}\n")
+    print(f"hpi_dev  (device frame, mm):\n{hpi_dev * 1000}\n")
     print(f"mean distance = {np.mean(dist) * 1000:.1f} mm\n")
     for index, value in enumerate(hpi_gofs):
         status = 'ok' if value > 0.9 else 'not ok'
@@ -92,15 +97,29 @@ def main():
     print('---------------------------------------------')
 
     # ----------------------------------------------------------------
-    # Apply transform to each data file, then save
+    # Apply transform; optionally save
     # ----------------------------------------------------------------
-    import os
     last_outpath = None
+    last_raw_out = None
+    last_datfile = None
+
     for datfile in datafiles:
         raw_out = apply_transform(datfile, fit, new_sfreq)
-        outpath = save_raw(raw_out, datfile, _OUTPUT_SUFFIX)
-        print(f"Saved: {outpath}")
-        last_outpath = outpath
+
+        if doSave:
+            stem = os.path.splitext(os.path.basename(datfile))[0].replace('_raw', '')
+            outpath = os.path.join(os.path.dirname(datfile),
+                                   stem + _OUTPUT_SUFFIX)
+            if not overwrite and os.path.exists(outpath):
+                print(f"Skipped (already exists): {outpath}")
+            else:
+                outpath = save_raw(raw_out, datfile, _OUTPUT_SUFFIX,
+                                   overwrite=overwrite)
+                print(f"Saved: {outpath}")
+                last_outpath = outpath
+
+        last_raw_out = raw_out
+        last_datfile = datfile
 
     # ----------------------------------------------------------------
     # Optional alignment plot
@@ -108,17 +127,20 @@ def main():
     if plotResult:
         # Use the HPI raw for the sensor cloud (device-space positions).
         raw_hpi_for_plot = mne.io.read_raw_fif(hpifile, preload=False, verbose='error')
-        plot_stem = (
-            os.path.splitext(last_outpath)[0]
-            if last_outpath is not None
-            else os.path.splitext(hpifile)[0]
-        )
+
+        # Derive plot filename from saved output if available, else from
+        # the last data file (so the PNG lands next to the source data).
+        ref_path = last_outpath if last_outpath is not None else last_datfile
+        plot_stem = os.path.splitext(ref_path)[0] if ref_path else 'hpi_alignment'
+        plot_filename = f"{plot_stem}_hpi_alignment.png"
+
         plot_hpi_alignment(
             fit,
             raw=raw_hpi_for_plot,
             show=True,
-            filename=f"{plot_stem}_hpi_alignment.png",
+            filename=plot_filename,
         )
+        print(f"Alignment plot saved: {plot_filename}")
 
 
 if __name__ == '__main__':
