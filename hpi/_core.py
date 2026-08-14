@@ -323,27 +323,30 @@ def fit_hpi(hpifile, polfile, hpifreq: float) -> dict:
     }
 
 
-def apply_transform(datfile: str, fit_result: dict, new_sfreq: float, suffix: str) -> str:
+def apply_transform(datfile: str, fit_result: dict, new_sfreq: float) -> mne.io.Raw:
     """
-    Apply the HPI device-to-head transform to a data file and save.
+    Apply the HPI device-to-head transform to a data file.
+
+    Loads *datfile*, drops bad/zero-location channels, optionally resamples,
+    embeds the digitisation points and ``dev_head_t`` from *fit_result*, and
+    returns the modified :class:`mne.io.Raw` object.  The caller is responsible
+    for saving — use :func:`save_raw` for the standard filename convention.
 
     Parameters
     ----------
     datfile : str
         Path to the OPM-MEG data file to transform.
     fit_result : dict
-        Result dict from :func:`fit_hpi`.
+        Result dict from :func:`fit_hpi`.  All position arrays must already
+        be in head coordinates (guaranteed when produced by ``fit_hpi``).
     new_sfreq : float
-        Target sampling frequency.  The file is resampled only when the
+        Target sampling frequency.  The data is resampled only when the
         current ``sfreq`` differs from *new_sfreq*.
-    suffix : str
-        Suffix inserted before the extension in the output filename.
-        E.g. ``"_proc-hpi+ds_raw.fif"`` → ``"<stem>_proc-hpi+ds_raw.fif"``.
 
     Returns
     -------
-    str
-        Path to the saved output file.
+    mne.io.Raw
+        The transformed raw object (preloaded, not yet saved).
     """
     dev_to_head_trans = fit_result['dev_to_head_trans']
     hpi_orig = fit_result['hpi_orig']
@@ -382,10 +385,37 @@ def apply_transform(datfile: str, fit_result: dict, new_sfreq: float, suffix: st
                     'coord_frame': FIFF.FIFFV_COORD_HEAD,
                 })
 
-    path = os.path.dirname(datfile)
-    savename = os.path.splitext(os.path.basename(datfile))[0]
-    savename = savename.replace('_raw', '')
-    outpath = os.path.join(path, savename + suffix)
+    return raw
 
-    raw.save(outpath, overwrite=True)
+
+def save_raw(raw: mne.io.Raw, datfile: str, suffix: str, overwrite: bool = True) -> str:
+    """
+    Save *raw* to disk using the standard HPI output filename convention.
+
+    The output path is derived from *datfile* by stripping ``_raw`` from the
+    stem and appending *suffix*::
+
+        /path/to/AudOdd_raw.fif  +  '_proc-hpi+ds_raw.fif'
+        →  /path/to/AudOdd_proc-hpi+ds_raw.fif
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        The raw object to save (typically produced by :func:`apply_transform`).
+    datfile : str
+        Original source file path — used only to derive the output directory
+        and stem; the data is taken from *raw*, not re-read from disk.
+    suffix : str
+        Suffix appended to the stripped stem, e.g. ``'_proc-hpi+ds_raw.fif'``.
+    overwrite : bool
+        Passed to :meth:`mne.io.Raw.save`.  Defaults to ``True``.
+
+    Returns
+    -------
+    str
+        Absolute path of the saved file.
+    """
+    stem = os.path.splitext(os.path.basename(datfile))[0].replace('_raw', '')
+    outpath = os.path.join(os.path.dirname(datfile), stem + suffix)
+    raw.save(outpath, overwrite=overwrite)
     return outpath

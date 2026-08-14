@@ -25,7 +25,7 @@ from mne.transforms import apply_trans
 
 from opm_utility_scripts.io import get_boolean, get_file, get_files, get_input
 from opm_utility_scripts.viz import plot_3d, plot_hpi_alignment
-from ._core import fit_hpi, apply_transform
+from ._core import fit_hpi, apply_transform, save_raw
 
 _OUTPUT_SUFFIX = '_proc-hpi+ds_raw.fif'
 
@@ -92,11 +92,13 @@ def main():
     print('---------------------------------------------')
 
     # ----------------------------------------------------------------
-    # Apply transform to each data file
+    # Apply transform to each data file, then save
     # ----------------------------------------------------------------
+    import os
     last_outpath = None
     for datfile in datafiles:
-        outpath = apply_transform(datfile, fit, new_sfreq, _OUTPUT_SUFFIX)
+        raw_out = apply_transform(datfile, fit, new_sfreq)
+        outpath = save_raw(raw_out, datfile, _OUTPUT_SUFFIX)
         print(f"Saved: {outpath}")
         last_outpath = outpath
 
@@ -104,11 +106,8 @@ def main():
     # Optional alignment plot
     # ----------------------------------------------------------------
     if plotResult:
-        import os
-        # Load the HPI raw for the sensor cloud.  Use the original hpifile
-        # (device-space sensor positions) rather than the processed output.
+        # Use the HPI raw for the sensor cloud (device-space positions).
         raw_hpi_for_plot = mne.io.read_raw_fif(hpifile, preload=False, verbose='error')
-
         plot_stem = (
             os.path.splitext(last_outpath)[0]
             if last_outpath is not None
