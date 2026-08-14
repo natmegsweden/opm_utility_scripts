@@ -214,8 +214,8 @@ def main():
         plot_path = f"{plot_stem}_hpi_alignment.png"
 
         fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=True)
-        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
-        print(f"Alignment plot saved: {plot_path}")
+        #fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        #print(f"Alignment plot saved: {plot_path}")
 
 
 if __name__ == '__main__':
