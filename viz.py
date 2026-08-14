@@ -122,7 +122,7 @@ def plot_3d(plot_params: dict, filename: str):
     fig.savefig(filename, dpi=300, bbox_inches='tight')
 
 
-def plot_hpi_alignment(fit: dict, raw=None, show: bool = True, filename: str = None):
+def plot_hpi_alignment(fit: dict, raw=None, show: bool = True):
     """
     Plot the alignment between fitted HPI coil positions and Polhemus positions.
 
@@ -130,6 +130,11 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True, filename: str = N
     (top / right / front).  Connecting lines between matched pairs are labelled
     with the residual distance in mm so it is immediately obvious which coil
     is off and by how much.
+
+    Saving is the caller's responsibility::
+
+        fig = plot_hpi_alignment(fit, raw=raw)
+        fig.savefig('alignment.png', dpi=150, bbox_inches='tight')
 
     Args:
         fit (dict):
@@ -146,9 +151,6 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True, filename: str = N
             head space and plotted as a grey reference cloud.
         show (bool):
             Call ``plt.show()`` after building the figure (default True).
-        filename (str | None):
-            When given, save the figure to this path (PNG recommended)
-            in addition to showing it.
 
     Returns:
         matplotlib.figure.Figure
@@ -294,9 +296,6 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True, filename: str = N
     )
 
     plt.tight_layout()
-
-    if filename:
-        fig.savefig(filename, dpi=150, bbox_inches='tight')
 
     if show:
         plt.show()

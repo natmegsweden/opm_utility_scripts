@@ -139,12 +139,8 @@ def main():
         plot_stem = os.path.splitext(ref_path)[0] if ref_path else 'hpi_alignment'
         plot_filename = f"{plot_stem}_hpi_alignment.png"
 
-        plot_hpi_alignment(
-            fit,
-            raw=raw_hpi_for_plot,
-            show=True,
-            filename=plot_filename,
-        )
+        fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=True)
+        fig.savefig(plot_filename, dpi=150, bbox_inches='tight')
         print(f"Alignment plot saved: {plot_filename}")
 
 
