@@ -10,8 +10,9 @@ def find_zero_location_channels(info, tolerance=0.02):
     """
     Identify MEG channels with zero or invalid locations.
 
-    Finds magnetometer channels positioned at the origin (0,0,0) which
-    typically indicates faulty sensor positioning or missing location data.
+    Finds magnetometer channels whose position is at the origin (0,0,0) or
+    contains NaN / Inf values, either of which causes MNE's external-basis SVD
+    (``_setup_ext_proj``) to fail with a ``ValueError``.
 
     Args:
         info (mne.Info): MNE info object containing channel information
@@ -23,15 +24,16 @@ def find_zero_location_channels(info, tolerance=0.02):
     Note:
         Default tolerance of 2 cm removes channels within a sphere of the origin.
     """
-    bads_fl = np.array([])
     picks = pick_types(info, meg='mag')
-    lst = list(bads_fl)
+    lst = []
     for j in picks:
         ch = info['chs'][j]
-        if np.isclose(sum(ch['loc'][0:3]), 0.0, atol=1e-3).all():
+        loc = ch['loc'][0:3]
+        if not np.all(np.isfinite(loc)):          # NaN or Inf position
             lst.append(ch['ch_name'])
-    bads_fl = np.asarray(lst)
-    return bads_fl
+        elif np.isclose(sum(loc), 0.0, atol=1e-3).all():  # zero position
+            lst.append(ch['ch_name'])
+    return np.asarray(lst)
 
 
 def get_hpi_output_channels(raw):

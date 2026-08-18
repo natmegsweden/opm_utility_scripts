@@ -31,6 +31,7 @@ from mne.io.constants import FIFF
 from mne.transforms import apply_trans, Transform
 
 from opm_utility_scripts.hpi._core import fit_hpi_amplitudes, fit_hpi
+from opm_utility_scripts.viz import plot_hpi_raw_channels
 
 
 # ---------------------------------------------------------------------------
@@ -680,18 +681,27 @@ def main():
             filetypes=[('JSON files', '*.json'), ('FIF files', '*.fif'), ('All files', '*')],
         ) or None
 
-    if pol_file:
-        # Full coregistration — fit_hpi() (same engine as coregister)
-        print(f'Full coregistration mode — polhemus: {pol_file}')
-        fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof)
-        _print_diagnostics_full(fit)
-        _build_figure_full(fit)
-    else:
-        # HPI-only — fit_hpi_amplitudes() + resolve coil locations
-        amp = fit_hpi_amplitudes(hpi_file, args.freq)
-        amp = _resolve_hpi_only(amp)
-        _print_diagnostics_hpi_only(amp)
-        _build_figure_hpi_only(amp)
+    try:
+        if pol_file:
+            # Full coregistration — fit_hpi() (same engine as coregister)
+            print(f'Full coregistration mode — polhemus: {pol_file}')
+            fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof)
+            _print_diagnostics_full(fit)
+            _build_figure_full(fit)
+        else:
+            # HPI-only — fit_hpi_amplitudes() + resolve coil locations
+            amp = fit_hpi_amplitudes(hpi_file, args.freq)
+            amp = _resolve_hpi_only(amp)
+            _print_diagnostics_hpi_only(amp)
+            _build_figure_hpi_only(amp)
+    except ValueError as exc:
+        print(
+            f'\n[ERROR] HPI fitting failed: {exc}\n'
+            '  → Falling back to raw channel plot — check for missing or '
+            'corrupted drive signal.\n',
+            file=sys.stderr,
+        )
+        plot_hpi_raw_channels(hpi_file, hpifreq=args.freq, show=False)
 
     plt.show()
 

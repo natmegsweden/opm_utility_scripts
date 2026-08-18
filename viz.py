@@ -362,3 +362,83 @@ def create_aligned_grid(loc, step_size, distXY, distZ):
     grid_points = grid_points[np.linalg.norm(grid_points[:, :2], axis=1) < distXY, :]
 
     return rotate_points(grid_points, orientation_z) + position
+
+
+def plot_hpi_raw_channels(hpifile, hpifreq: float = 33.0, show: bool = True):
+    """
+    Plot the raw HPI output channels from an HPI recording.
+
+    Useful as a diagnostic fallback when amplitude fitting fails (e.g. due to
+    missing or corrupted data).  Each hpiout channel is shown in its own subplot
+    so you can visually confirm whether the drive signal is present, truncated,
+    or absent.
+
+    Parameters
+    ----------
+    hpifile : str | mne.io.Raw
+        Path to the raw HPI .fif file, or a pre-loaded Raw object.
+    hpifreq : float
+        Expected HPI drive frequency (Hz).  Used only to annotate the figure.
+    show : bool
+        Call ``plt.show()`` at the end.  Set False when the caller manages the
+        display loop.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    from opm_utility_scripts.channels import get_hpi_output_channels
+
+    if isinstance(hpifile, str):
+        raw = mne.io.read_raw_fif(hpifile, preload=True, verbose=False)
+        title_stem = os.path.basename(hpifile)
+    else:
+        raw = hpifile
+        title_stem = getattr(raw, 'filenames', ['<raw>'])[0]
+        title_stem = os.path.basename(title_stem)
+
+    hpi_names, hpi_indices = get_hpi_output_channels(raw)
+    n = len(hpi_names)
+
+    if n == 0:
+        fig, ax = plt.subplots()
+        ax.text(0.5, 0.5, 'No hpiout channels found', ha='center', va='center',
+                transform=ax.transAxes, fontsize=12)
+        ax.set_title(title_stem)
+        if show:
+            plt.show()
+        return fig
+
+    times = raw.times
+    fig, axes = plt.subplots(n, 1, figsize=(12, 2.2 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    fig.suptitle(f'HPI output channels — {title_stem}\n(expected drive frequency: {hpifreq:.0f} Hz)',
+                 fontsize=11)
+
+    for ax, name, idx in zip(axes, hpi_names, hpi_indices):
+        data = raw[idx, :][0].ravel()
+        active = data > data.max() * 0.1 if data.max() > 0 else np.zeros(len(data), dtype=bool)
+        n_peaks = int(np.sum(np.diff(active.astype(int)) > 0))
+        active_s = active.sum() / raw.info['sfreq']
+
+        ax.plot(times, data * 1e6, lw=0.6, color='steelblue')
+        ax.set_ylabel('µV', fontsize=8)
+        ax.set_title(
+            f'{name}   max={data.max()*1e6:.1f} µV   '
+            f'active={active_s:.1f} s   cycles≈{n_peaks}',
+            fontsize=9, loc='left',
+        )
+        ax.tick_params(labelsize=8)
+        if data.max() == 0:
+            ax.text(0.5, 0.5, 'NO SIGNAL', color='red', fontsize=14,
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontweight='bold')
+
+    axes[-1].set_xlabel('Time (s)', fontsize=9)
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+    return fig
