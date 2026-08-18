@@ -5,8 +5,8 @@ Run HPI scripts from inside the opm_utility_scripts directory.
 Usage (from inside opm_utility_scripts/):
 
     python run_hpi.py coregister          # GUI coregistration
-    python run_hpi.py check               # HPI quality check
-    python run_hpi.py diagnose --hpi ...  # step-by-step diagnostic
+    python run_hpi.py check               # HPI quality check (HPI-only mode)
+    python run_hpi.py check --pol ...     # full coregistration
 
 This wrapper ensures the parent directory (NatMEG-utils/) is on sys.path
 before importing any opm_utility_scripts modules, so that absolute imports
@@ -26,7 +26,6 @@ if _pkg_root not in sys.path:
 _SCRIPTS = {
     'coregister': 'opm_utility_scripts.hpi.coregister',
     'check':      'opm_utility_scripts.hpi.check',
-    'diagnose':   'opm_utility_scripts.hpi.diagnose',
 }
 
 if len(sys.argv) < 2 or sys.argv[1] not in _SCRIPTS:

@@ -59,10 +59,21 @@ python -m opm_utility_scripts.hpi.coregister
 ### `hpi/check.py`
 
 Checks an HPI recording by fitting magnetic dipoles to the detected coil
-fields.  Shows goodness-of-fit values and 3-D sensor/coil plots.
+fields.  Two modes:
+
+- **HPI-only** (no `--pol`): fits dipoles and reports per-coil GOF.
+- **Full coregistration** (`--pol`): also matches fitted coil positions to
+  Polhemus digitisation and reports residuals and the device-to-head transform.
 
 ```bash
-python -m opm_utility_scripts.hpi.check
+# HPI-only (GOF check, no polhemus required)
+python -m opm_utility_scripts.hpi.check --hpi HPIbefore_raw.fif
+
+# Full coregistration
+python -m opm_utility_scripts.hpi.check --hpi HPIbefore_raw.fif --pol digitisation.json
+
+# Override drive frequency (default 33 Hz) and GOF threshold (default: auto)
+python -m opm_utility_scripts.hpi.check --hpi HPIbefore_raw.fif --pol digitisation.json --freq 33 --gof 0.95
 ```
 
 ### `tools/check_events.py`
@@ -101,7 +112,3 @@ python -m opm_utility_scripts.analog.rename --file my_raw.fif --newfile my_renam
 
 - `hpi/check.py`: uses `raw.info` (not `epochs.info`) for the channel lookup
   inside `main()`.  Behaviour is preserved from the original script.
-- `hpi/_core.py`: `coil_amplitudes` is only assigned inside the `n_hpis >= 3`
-  branch of the per-coil loop.  If no coil ever meets that condition,
-  `UnboundLocalError` is raised at the assertion after the loop.  This
-  pre-existing bug is preserved with an explanatory comment.

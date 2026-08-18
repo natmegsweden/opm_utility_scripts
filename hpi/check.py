@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Check an HPI recording by fitting magnetic dipoles to the detected coil
-fields.
-
-Shows goodness-of-fit values and plots the dipole locations alongside the
-sensor array — helps verify quickly whether an HPI recording was successful.
+Check an HPI recording.
 
 Usage::
 
-    python -m opm_utility_scripts.hpi.check
-    python -m opm_utility_scripts.hpi.check --file /path/to/HPIbefore_raw.fif
-    python -m opm_utility_scripts.hpi.check --freq 33
+    python -m opm_utility_scripts.hpi.check [--hpi HPIbefore_raw.fif] [--pol digitisation.json] [--freq 33]
 
-The script expects a *raw* HPI recording (e.g. ``HPIbefore_raw.fif``), not a
-processed output file.  Processed files (``proc-hpi``) do not contain the
-``hpiin`` drive-signal channels required for coil detection.
+- Without ``--pol``: HPI-only mode — calls ``fit_hpi_amplitudes()`` from
+  ``_core.py``, shows GOF and dipole positions in device space.
+- With ``--pol``: Full coregistration mode — calls ``fit_hpi()`` from
+  ``_core.py`` (same pipeline as ``coregister``), shows polhemus targets,
+  residuals, inter-coil distances, and transform summary in head space.
+
+Both modes use the same calculation engine in ``_core.py``.
 """
 
 import argparse
@@ -23,47 +21,643 @@ import sys
 import tkinter as tk
 from tkinter import filedialog
 
-import math
+import warnings
 
 import matplotlib.pyplot as plt
 import mne
 import numpy as np
+from mne.chpi import compute_chpi_locs
+from mne.io.constants import FIFF
+from mne.transforms import apply_trans, Transform
 
-from mne._fiff.pick import pick_info  # used for dipole-fit sensor info
-from mne.chpi import _fit_magnetic_dipole
-from mne.dipole import _make_guesses
-from mne.bem import ConductorModel
-from mne.forward import _concatenate_coils, _create_meg_coils, _magnetic_dipole_field_vec
+from opm_utility_scripts.hpi._core import fit_hpi_amplitudes, fit_hpi
 
-from opm_utility_scripts.channels import pick_low_noise_meg_chs
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Thresholds from MNE-Python defaults (mne/chpi.py: compute_head_pos,
+# _get_hpi_initial_fit) and MEGIN/Elekta MaxFilter convention, consistent
+# with Zetter et al. 2019 (doi:10.1038/s41598-019-41763-4) and Tierney et
+# al. 2021 (doi:10.1016/j.neuroimage.2021.118091).
+_GOF_ACCEPT     = 0.98  # per-coil fit GOF — MNE default gof_limit / good_limit
+_POL_GOF_ACCEPT = 0.90  # polhemus-position GOF threshold — lower than _GOF_ACCEPT
+                        # because _gof_at_fixed_pos uses raw slopes without the
+                        # SSS-like external interference projection, so values
+                        # naturally run ~0.05 below the floating-dipole GOF
+_DIST_ACCEPT    = 5.0   # per-coil residual (mm) — MNE default dist_limit 0.005 m
+_MIN_COILS      = 3     # minimum coils passing both criteria
+
+
+def _gof_color(g):
+    if g >= _GOF_ACCEPT:
+        return 'green'
+    elif g >= 0.8:
+        return 'darkorange'
+    return 'red'
+
+
+def _is_nasion_coil(ch_name):
+    """Return True if a channel name identifies it as a nasion landmark coil.
+
+    The FieldLine system lets operators name HPI coil slots freely.  A coil
+    placed at the nasion is sometimes labelled 'Nasion' (e.g. 'hpiout_Nasion').
+    These coils sit on a bony landmark rather than on scalp, which affects
+    the dipole fit geometry and polhemus GOF; they should not trigger a REDO
+    recommendation on their own.
+    """
+    return 'nasion' in ch_name.lower()
+
+
+def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
+                    pol_gofs=None, hpi_names=None):
+    """Evaluate HPI fit quality and return separate verdicts for each failure mode.
+
+    There are two independent causes of a poor HPI result:
+
+    * **HPI recording quality** — measured by ``hpi_gofs`` (goodness-of-fit of
+      the single-dipole model to MEG sensor data).  A poor GOF means the coil
+      signal was not cleanly captured; the remedy is to **redo the HPI
+      recording** (subject may have moved, coil placement or drive issue).
+
+    * **Polhemus registration quality** — measured by ``dists_mm`` (distance
+      between the fitted coil position in device space, transformed to head
+      space, and the digitised coil position).  A large residual means the
+      polhemus digitisation does not match the fitted positions; the remedy is
+      to **redo the polhemus digitisation**.
+
+    Thresholds follow MNE-Python ``compute_head_pos`` defaults
+    (``gof_limit=0.98``, ``dist_limit=0.005`` m), which originate from the
+    MEGIN/Elekta MaxFilter convention and are consistent with Zetter et al.
+    2019 (doi:10.1038/s41598-019-41763-4) and Tierney et al. 2021
+    (doi:10.1016/j.neuroimage.2021.118091).
+
+    Parameters
+    ----------
+    hpi_gofs : array-like
+        Per-coil GOF from ``compute_chpi_locs`` (0–1).
+    dists_mm : array-like or None
+        Per-coil residuals in mm for coils in ``include_hpis``.
+        ``None`` in HPI-only mode.
+    include_hpis : array-like of bool or None
+        Mask of coils whose GOF ≥ ``_GOF_ACCEPT``. ``None`` in HPI-only mode.
+    pol_gofs : array-like or None
+        GOF of the polhemus-digitised position against MEG sensor data for
+        each included coil (from ``_gof_at_fixed_pos`` in ``_core.py``).
+        ``None`` in HPI-only mode.
+    hpi_names : list[str] or None
+        Channel names for all coils (same length as ``hpi_gofs``).
+        When provided, coils identified as nasion-landmark coils (via
+        ``_is_nasion_coil``) are excluded from the verdict logic — they
+        are reported in the GOF table but do not trigger REDO recommendations.
+
+    Returns
+    -------
+    hpi_verdict  : str   — 'OK', 'REDO HPI', or 'POOR'
+    hpi_color    : str
+    hpi_reasons  : list[str]
+    pol_verdict  : str   — 'OK', 'REDO POLHEMUS', or 'POOR' (or None in HPI-only)
+    pol_color    : str   (or None)
+    pol_reasons  : list[str] (or None)
+    """
+    hpi_gofs = np.asarray(hpi_gofs)
+    n_coils  = len(hpi_gofs)
+
+    # Build nasion mask — coils on bony landmarks are excluded from verdicts.
+    if hpi_names is not None and len(hpi_names) == n_coils:
+        nasion_mask = np.array([_is_nasion_coil(n) for n in hpi_names])
+    else:
+        nasion_mask = np.zeros(n_coils, dtype=bool)
+
+    # ------------------------------------------------------------------ #
+    # Part 1 — HPI recording quality (GOF from MEG sensor data)          #
+    # Nasion-labelled coils are noted but excluded from the verdict.      #
+    # ------------------------------------------------------------------ #
+    hpi_reasons = []
+
+    # Evaluate only non-nasion coils for the verdict.
+    scoreable    = ~nasion_mask
+    poor_gof_all = hpi_gofs < _GOF_ACCEPT
+    poor_gof     = poor_gof_all & scoreable
+
+    if include_hpis is not None:
+        # n_good = coils that passed GOF and are not nasion
+        n_good = int(np.sum(include_hpis & scoreable))
+    else:
+        n_good = int(np.sum((hpi_gofs >= _GOF_ACCEPT) & scoreable))
+
+    if poor_gof.any():
+        hpi_reasons.append(
+            f'{poor_gof.sum()} coil(s) have GOF < {_GOF_ACCEPT} '
+            f'— dipole model does not fit the MEG data well'
+        )
+    if nasion_mask.any() and poor_gof_all[nasion_mask].any():
+        hpi_reasons.append(
+            f'Nasion coil(s) also have low GOF '
+            f'(noted but not used for verdict — landmark placement expected)'
+        )
+    if n_good < _MIN_COILS:
+        hpi_reasons.append(
+            f'Only {n_good} non-nasion coil(s) pass GOF threshold '
+            f'(need ≥ {_MIN_COILS} for a valid transform)'
+        )
+
+    if not hpi_reasons:
+        hpi_verdict, hpi_color = 'OK', 'green'
+        hpi_reasons = [f'All coils GOF ≥ {_GOF_ACCEPT} — HPI recording is good']
+    elif n_good < _MIN_COILS:
+        hpi_verdict, hpi_color = 'POOR', 'red'
+        hpi_reasons.append('→ Redo HPI recording (check coil drive and subject movement)')
+    else:
+        hpi_verdict, hpi_color = 'REDO HPI', 'darkorange'
+        hpi_reasons.append('→ Consider redoing HPI recording (subject movement or coil issue)')
+
+    # ------------------------------------------------------------------ #
+    # Part 2 — Polhemus registration quality                             #
+    # Two independent signals:                                           #
+    #   pol_gofs  — dipole GOF at the digitised position against MEG    #
+    #               data.  Low = digitised position is wrong.           #
+    #   dists_mm  — geometric distance between fitted and digitised pos. #
+    #               Large = positions don't agree.                      #
+    # ------------------------------------------------------------------ #
+    if dists_mm is None or len(dists_mm) == 0:
+        return hpi_verdict, hpi_color, hpi_reasons, None, None, None
+
+    dists_mm    = np.asarray(dists_mm)
+    pol_reasons = []
+
+    # Nasion mask for the *included* coils (subset of all coils).
+    if include_hpis is not None and hpi_names is not None:
+        incl_names    = [hpi_names[i] for i in np.where(include_hpis)[0]]
+        nasion_incl   = np.array([_is_nasion_coil(n) for n in incl_names])
+        scoreable_pol = ~nasion_incl
+    else:
+        scoreable_pol = np.ones(len(dists_mm), dtype=bool)
+
+    large_all = dists_mm >= _DIST_ACCEPT
+    large     = large_all & scoreable_pol
+    # Mean over non-nasion included coils only.
+    scored_dists = dists_mm[scoreable_pol]
+    mean_res     = float(np.mean(scored_dists)) if len(scored_dists) else float('nan')
+
+    if pol_gofs is not None and len(pol_gofs):
+        pol_gofs  = np.asarray(pol_gofs)
+        finite    = np.isfinite(pol_gofs)
+        poor_pgof = finite & scoreable_pol & (pol_gofs < _POL_GOF_ACCEPT)
+        if poor_pgof.any():
+            pol_reasons.append(
+                f'{poor_pgof.sum()} coil(s) have polhemus-position GOF < {_POL_GOF_ACCEPT} '
+                f'— digitised position does not match the MEG field pattern'
+            )
+
+    if large.any():
+        pol_reasons.append(
+            f'{large.sum()} coil(s) have residual ≥ {_DIST_ACCEPT:.0f} mm '
+            f'— fitted and digitised positions disagree'
+        )
+    if mean_res >= _DIST_ACCEPT:
+        pol_reasons.append(
+            f'Mean residual {mean_res:.1f} mm ≥ {_DIST_ACCEPT:.0f} mm'
+        )
+
+    if not pol_reasons:
+        pol_verdict, pol_color = 'OK', 'green'
+        pol_reasons = [
+            f'All polhemus-position GOFs ≥ {_POL_GOF_ACCEPT} and '
+            f'residuals < {_DIST_ACCEPT:.0f} mm — polhemus registration is good'
+        ]
+    elif mean_res >= _DIST_ACCEPT * 2 or (
+        pol_gofs is not None
+        and np.any((pol_gofs < 0.5) & scoreable_pol & np.isfinite(pol_gofs))
+    ):
+        pol_verdict, pol_color = 'POOR', 'red'
+        pol_reasons.append('→ Redo polhemus digitisation (fiducial placement or stylus error)')
+    else:
+        pol_verdict, pol_color = 'REDO POLHEMUS', 'darkorange'
+        pol_reasons.append('→ Consider redoing polhemus digitisation (coil position mismatch)')
+
+    return hpi_verdict, hpi_color, hpi_reasons, pol_verdict, pol_color, pol_reasons
+
+
+def _short_name(ch_name):
+    """Strip the 'hpiout' / 'hpiin' prefix, leaving just the coil identifier.
+
+    Examples: 'hpiout2' -> '2', 'hpiout_Nasion' -> 'Nasion', 'hpiin4' -> '4'.
+    Falls back to the full name if no recognised prefix is present.
+    """
+    for prefix in ('hpiout', 'hpiin'):
+        if ch_name.startswith(prefix):
+            suffix = ch_name[len(prefix):]
+            return suffix.lstrip('_') or ch_name
+    return ch_name
+
+
+def _sep(title=''):
+    SEP = '─' * 72
+    if title:
+        pad = max(0, 72 - len(title) - 2)
+        print(f'\n{"─" * (pad // 2)} {title} {"─" * (pad - pad // 2)}\n')
+    else:
+        print(f'\n{SEP}\n')
+
+
+def _render_text(ax, lines):
+    """Render a list of (text, color) into an axis('off') panel."""
+    y = 0.97
+    step = min(0.055, 0.97 / max(len(lines), 1))
+    for text, color in lines:
+        ax.text(0.02, y, text, transform=ax.transAxes,
+                fontsize=8, color=color, fontfamily='monospace',
+                va='top', ha='left')
+        y -= step
+
+
+def _resolve_hpi_only(amp):
+    """Call compute_chpi_locs on the amplitude result with a dummy dig.
+
+    ``fit_hpi_amplitudes`` stops before ``compute_chpi_locs`` because that
+    function requires properly set isotrak dig points to determine the number
+    of polhemus coils.  In HPI-only mode we have no polhemus, so we inject a
+    dummy dig sized to match the number of HPI output channels, which prevents
+    the shape mismatch in ``_get_hpi_initial_fit``.
+
+    Returns the amplitude dict augmented with ``hpi_dev`` and ``hpi_gofs``.
+    """
+    raw_orig        = amp['raw_orig']
+    coil_amplitudes = amp['coil_amplitudes']
+    hpi_indices     = amp['hpi_indices']
+    n_hpi           = len(hpi_indices)
+
+    # Inject a dummy dig with the correct number of coils so
+    # compute_chpi_locs does not hit a shape mismatch.
+    # _get_hpi_initial_fit requires coord_frame == FIFFV_COORD_HEAD (4) for HPI
+    # dig points — FIFFV_COORD_DEVICE raises "cHPI coordinate frame incorrect".
+    with raw_orig.info._unlock():
+        raw_orig.info['dig'] = [
+            dict(r=np.zeros(3),
+                 coord_frame=FIFF.FIFFV_COORD_HEAD,
+                 ident=ii + 1,
+                 kind=FIFF.FIFFV_POINT_HPI)
+            for ii in range(n_hpi)
+        ]
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=RuntimeWarning)
+        coil_locs = compute_chpi_locs(raw_orig.info, coil_amplitudes)
+
+    return {
+        **amp,
+        'hpi_dev':  np.array(coil_locs['rrs'][0]),
+        'hpi_gofs': np.array(coil_locs['gofs'][0]),
+    }
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(
         prog='python -m opm_utility_scripts.hpi.check',
         description=(
-            'Check an HPI recording by fitting magnetic dipoles to the detected '
-            'coil fields and plotting the result. Pass a raw HPI file '
-            '(e.g. HPIbefore_raw.fif), NOT a proc-hpi output.'
+            'Check an HPI recording. Without --pol: HPI-only mode '
+            '(fit_hpi_amplitudes). With --pol: full coregistration (fit_hpi).'
         ),
     )
-    parser.add_argument(
-        '--file', '-f', metavar='PATH',
-        help='Path to the raw HPI .fif file. Opens a GUI dialog when omitted.',
-    )
-    parser.add_argument(
-        '--freq', type=float, default=33.0, metavar='HZ',
-        help='HPI drive frequency in Hz (default: 33).',
-    )
+    parser.add_argument('--hpi', '-f', metavar='PATH',
+                        help='Path to the raw HPI .fif file. Opens a GUI dialog when omitted.')
+    parser.add_argument('--pol', '-p', metavar='PATH',
+                        help='Path to Polhemus file (.json). Enables full coregistration mode.')
+    parser.add_argument('--freq', type=float, default=33.0, metavar='HZ',
+                        help='HPI drive frequency in Hz (default: 33).')
+    parser.add_argument('--gof', type=float, default=None, metavar='THRESH',
+                        help=(
+                            'Minimum dipole GOF to include a coil in the transform '
+                            '(default: auto — 0.98 for distinct-frequency systems, '
+                            '0.90 for single-frequency OPM systems).'
+                        ))
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# HPI-only mode  (fit_hpi_amplitudes)
+# ---------------------------------------------------------------------------
+
+def _build_figure_hpi_only(amp):
+    """2-panel figure: device-space sensor scatter + dipole positions."""
+    hpi_dev   = np.array(amp['hpi_dev'])
+    hpi_gofs  = np.array(amp['hpi_gofs'])
+    hpi_names = amp['hpi_names']
+    raw       = amp['raw_orig']
+    n_hpi     = len(hpi_names)
+
+    # Sensor positions in device space for background scatter.
+    # Deduplicate by slot: keep one channel per unique location (prefer _bz).
+    meg_picks = mne.pick_types(raw.info, meg=True, exclude=[])
+    bz_mask = np.array([
+        '_bz' in raw.info['chs'][i]['ch_name'] for i in meg_picks
+    ])
+    if bz_mask.sum() == 0:
+        bz_mask = np.ones(len(meg_picks), dtype=bool)
+    bz_pos_mm = np.array([raw.info['chs'][meg_picks[i]]['loc'][:3]
+                           for i in range(len(meg_picks)) if bz_mask[i]]) * 1000
+
+    fig = plt.figure(figsize=(14, 7), constrained_layout=True, facecolor='white')
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.4, 1])
+    ax_3d = fig.add_subplot(gs[0], projection='3d')
+    ax_text = fig.add_subplot(gs[1])
+    ax_text.axis('off')
+
+    ax_3d.scatter(bz_pos_mm[:, 0], bz_pos_mm[:, 1], bz_pos_mm[:, 2],
+                  c='#e07b39', alpha=0.6, marker='.', s=18)
+
+    rrs_mm = hpi_dev * 1000
+    for i in range(n_hpi):
+        short = _short_name(hpi_names[i])
+        gof = hpi_gofs[i]
+        color = _gof_color(gof)
+        pos = rrs_mm[i]
+        if not np.allclose(pos, 0):
+            ax_3d.scatter(*pos, c=color, s=80, marker='o', zorder=7, depthshade=False)
+            ax_3d.text(pos[0], pos[1], pos[2],
+                       f' {short}\nGOF={gof:.2f}', fontsize=8, color=color, zorder=8)
+        else:
+            ax_3d.text(0, 0, 0, f'{short}\n[no fit]', fontsize=8, color='gray', zorder=8)
+
+    ax_3d.view_init(elev=70, azim=-60)
+    ax_3d.set_xlabel('x (mm)', fontsize=8)
+    ax_3d.set_ylabel('y (mm)', fontsize=8)
+    ax_3d.set_zlabel('z (mm)', fontsize=8)
+    ax_3d.grid(False)
+    ax_3d.set_facecolor('white')
+    ax_3d.xaxis.pane.fill = False
+    ax_3d.yaxis.pane.fill = False
+    ax_3d.zaxis.pane.fill = False
+    ax_3d.xaxis.pane.set_edgecolor('white')
+    ax_3d.yaxis.pane.set_edgecolor('white')
+    ax_3d.zaxis.pane.set_edgecolor('white')
+    ax_3d.set_title('HPI dipole positions vs sensors — device space', fontsize=9)
+
+    lines = []
+    def add(t, c='black'): lines.append((t, c))
+    add('HPI Check (HPI-only mode)', 'black')
+    add('─' * 40, '#888888')
+    add('Per-coil GOF:', 'black')
+    for i in range(n_hpi):
+        gof = hpi_gofs[i]
+        add(f'  {hpi_names[i]}: {gof:.3f}', _gof_color(gof))
+
+    hpi_v, hpi_c, hpi_r, *_ = _recommendation(hpi_gofs, hpi_names=hpi_names)
+    add('─' * 40, '#888888')
+    add(f'HPI recording: {hpi_v}', hpi_c)
+    for r in hpi_r:
+        add(f'  {r}', hpi_c)
+
+    _render_text(ax_text, lines)
+    return fig
+
+
+def _print_diagnostics_hpi_only(amp):
+    hpi_gofs  = np.array(amp['hpi_gofs'])
+    hpi_names = amp['hpi_names']
+
+    _sep('HPI Check — GOF Summary (HPI-only mode)')
+    for name, gof in zip(hpi_names, hpi_gofs):
+        flag = 'OK' if gof >= _GOF_ACCEPT else ('MARGINAL' if gof >= 0.8 else 'POOR')
+        print(f'  {name}: GOF = {gof:.3f}  [{flag}]')
+
+    hpi_v, _, hpi_r, *_ = _recommendation(hpi_gofs, hpi_names=hpi_names)
+    _sep(f'HPI recording: {hpi_v}')
+    for r in hpi_r:
+        print(f'  {r}')
+
+
+# ---------------------------------------------------------------------------
+# Full coregistration mode  (fit_hpi)
+# ---------------------------------------------------------------------------
+
+def _build_figure_full(fit):
+    """2-panel figure: head-space alignment matching coregister's plot_hpi_alignment."""
+    hpi_dev      = np.array(fit['hpi_dev'])
+    hpi_gofs     = np.array(fit['hpi_gofs'])
+    hpi_orig     = np.array(fit['hpi_orig'])      # head frame (Polhemus targets)
+    hpi_names    = fit['hpi_names']
+    dev_to_head  = fit['dev_to_head_trans']
+    include_hpis = np.array(fit['include_hpis'])
+    tree_indices = np.array(fit['tree_indices'])
+    raw          = fit['raw_for_topomap']
+
+    hpi_fitted_head_mm = apply_trans(dev_to_head, hpi_dev) * 1000
+    hpi_pol_mm         = hpi_orig * 1000
+
+    fig = plt.figure(figsize=(14, 7), constrained_layout=True, facecolor='white')
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.4, 1])
+    ax_3d = fig.add_subplot(gs[0], projection='3d')
+    ax_text = fig.add_subplot(gs[1])
+    ax_text.axis('off')
+
+    # Sensor cloud in head space — deduplicate by slot (prefer _bz).
+    meg_picks = mne.pick_types(raw.info, meg=True, exclude=[])
+    bz_mask = np.array(['_bz' in raw.info['chs'][i]['ch_name'] for i in meg_picks])
+    if bz_mask.sum() == 0:
+        bz_mask = np.ones(len(meg_picks), dtype=bool)
+    sensor_dev = np.array([raw.info['chs'][meg_picks[i]]['loc'][:3]
+                            for i in range(len(meg_picks)) if bz_mask[i]])
+    sensor_head_mm = apply_trans(dev_to_head, sensor_dev) * 1000
+    ax_3d.scatter(sensor_head_mm[:, 0], sensor_head_mm[:, 1], sensor_head_mm[:, 2],
+                  c='#e07b39', s=18, alpha=0.6, zorder=1)
+
+    # Headshape
+    extra_pts = fit.get('extra_pts')
+    if extra_pts is not None and len(extra_pts):
+        extra_mm = np.asarray(extra_pts) * 1000
+        ax_3d.scatter(extra_mm[:, 0], extra_mm[:, 1], extra_mm[:, 2],
+                      c='#aaaaaa', s=3, alpha=0.4, zorder=1)
+
+    # Fiducials
+    fid_colors = {'LPA': 'darkorange', 'Nasion': 'limegreen', 'RPA': 'darkorange'}
+    for label, key in [('LPA', 'lpa'), ('Nasion', 'nasion'), ('RPA', 'rpa')]:
+        fpos = np.array(fit[key]) * 1000
+        ax_3d.scatter(*fpos, c=fid_colors[label], s=60, marker='^',
+                      zorder=5, depthshade=False)
+        ax_3d.text(fpos[0], fpos[1], fpos[2], f' {label}',
+                   fontsize=7, color=fid_colors[label], zorder=6)
+
+    # Polhemus targets — blue stars
+    ax_3d.scatter(hpi_pol_mm[:, 0], hpi_pol_mm[:, 1], hpi_pol_mm[:, 2],
+                  c='royalblue', s=120, marker='*', zorder=7,
+                  depthshade=False, label='Polhemus target')
+
+    # Fitted coil positions — colour-coded by GOF
+    for i, (pos, gof) in enumerate(zip(hpi_fitted_head_mm, hpi_gofs)):
+        color = _gof_color(gof)
+        ax_3d.scatter(*pos, c=color, s=80, marker='o', zorder=7, depthshade=False)
+        short = _short_name(hpi_names[i])
+        ax_3d.text(pos[0], pos[1], pos[2],
+                   f' {short}\nGOF={gof:.2f}', fontsize=7, color=color, zorder=8)
+
+    # Connecting lines — colour-coded by residual (mirrors plot_hpi_alignment)
+    for k, (dev_i, pol_i) in enumerate(zip(np.where(include_hpis)[0], tree_indices)):
+        p_fit = hpi_fitted_head_mm[dev_i]
+        p_pol = hpi_pol_mm[pol_i]
+        dist_mm = np.linalg.norm(p_fit - p_pol)
+        mid = (p_fit + p_pol) / 2
+        lcolor = 'green' if dist_mm < 5 else ('darkorange' if dist_mm < 10 else 'red')
+        ax_3d.plot([p_fit[0], p_pol[0]], [p_fit[1], p_pol[1]], [p_fit[2], p_pol[2]],
+                   color=lcolor, lw=1.2, linestyle='--', zorder=6)
+        ax_3d.text(mid[0], mid[1], mid[2], f'{dist_mm:.1f} mm',
+                   fontsize=7, color=lcolor, zorder=9, ha='center', va='bottom')
+
+    ax_3d.view_init(elev=70, azim=-60)
+    ax_3d.set_xlabel('x (mm)', fontsize=8)
+    ax_3d.set_ylabel('y (mm)', fontsize=8)
+    ax_3d.set_zlabel('z (mm)', fontsize=8)
+    ax_3d.grid(False)
+    ax_3d.set_facecolor('white')
+    ax_3d.xaxis.pane.fill = False
+    ax_3d.yaxis.pane.fill = False
+    ax_3d.zaxis.pane.fill = False
+    ax_3d.xaxis.pane.set_edgecolor('white')
+    ax_3d.yaxis.pane.set_edgecolor('white')
+    ax_3d.zaxis.pane.set_edgecolor('white')
+    ax_3d.set_title('HPI fitted (●) vs Polhemus target (★) — head space', fontsize=9)
+
+    _fill_text_panel_full(ax_text, fit)
+    return fig
+
+
+def _fill_text_panel_full(ax, fit):
+    hpi_gofs     = np.array(fit['hpi_gofs'])
+    hpi_names    = fit['hpi_names']
+    include_hpis = np.array(fit['include_hpis'])
+    dists_mm     = np.array(fit['dist']) * 1000
+
+    lines = []
+    def add(t, c='black'): lines.append((t, c))
+
+    add('HPI Check (full coregistration)', 'black')
+    add('─' * 40, '#888888')
+    add('Per-coil GOF:', 'black')
+    for name, gof in zip(hpi_names, hpi_gofs):
+        add(f'  {name}: {gof:.3f}', _gof_color(gof))
+
+    pol_gofs_fig = np.asarray(fit.get('pol_gofs', []))
+    has_pgof_fig = len(pol_gofs_fig) == len(np.where(include_hpis)[0])
+
+    add('─' * 40, '#888888')
+    add('Residual / pol-GOF (fitted vs Polhemus):', 'black')
+    for k, dev_i in enumerate(np.where(include_hpis)[0]):
+        short = _short_name(hpi_names[dev_i])
+        d = dists_mm[k]
+        color = 'green' if d < _DIST_ACCEPT else ('darkorange' if d < 10 else 'red')
+        pgof_str = f'  pgof={pol_gofs_fig[k]:.3f}' if has_pgof_fig else ''
+        add(f'  {short}: {d:.2f} mm{pgof_str}', color)
+    for dev_i in np.where(~include_hpis)[0]:
+        short = _short_name(hpi_names[dev_i])
+        add(f'  {short}: excl. (GOF<{_GOF_ACCEPT})', 'gray')
+
+    mean_res = float(np.mean(dists_mm)) if len(dists_mm) else float('nan')
+    add('─' * 40, '#888888')
+    add(f'Mean residual: {mean_res:.2f} mm',
+        'green' if mean_res < _DIST_ACCEPT else ('darkorange' if mean_res < 10 else 'red'))
+
+    add('─' * 40, '#888888')
+    add('Inter-coil distances (mm):', 'black')
+    hpi_orig = np.array(fit['hpi_orig'])
+    n_pol = len(hpi_orig)
+    for i in range(n_pol):
+        row = []
+        for j in range(n_pol):
+            if i == j:
+                row.append('  — ')
+            else:
+                d = np.linalg.norm(hpi_orig[i] - hpi_orig[j]) * 1000
+                row.append(f'{d:5.1f}')
+        add('  ' + ' '.join(row), '#333333')
+
+    add('─' * 40, '#888888')
+    R = fit['dev_to_head_trans']['trans'][:3, :3]
+    t = fit['dev_to_head_trans']['trans'][:3, 3]
+    rot_deg  = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+    trans_mm = float(np.linalg.norm(t) * 1000)
+    add('Transform summary:', 'black')
+    add(f'  Rotation:    {rot_deg:.1f}°', 'black')
+    add(f'  Translation: {trans_mm:.1f} mm', 'black')
+
+    pol_gofs     = np.asarray(fit.get('pol_gofs', []))
+    has_pol_gofs = len(pol_gofs) == len(np.where(include_hpis)[0])
+
+    hpi_v, hpi_c, hpi_r, pol_v, pol_c, pol_r = _recommendation(
+        hpi_gofs, dists_mm, include_hpis,
+        pol_gofs if has_pol_gofs else None,
+        hpi_names=hpi_names,
+    )
+    add('─' * 40, '#888888')
+    add(f'HPI recording: {hpi_v}', hpi_c)
+    for r in hpi_r:
+        add(f'  {r}', hpi_c)
+    add(f'Polhemus: {pol_v}', pol_c)
+    for r in pol_r:
+        add(f'  {r}', pol_c)
+
+    _render_text(ax, lines)
+
+
+def _print_diagnostics_full(fit):
+    hpi_gofs     = np.array(fit['hpi_gofs'])
+    hpi_names    = fit['hpi_names']
+    include_hpis = np.array(fit['include_hpis'])
+    dists_mm     = np.array(fit['dist']) * 1000
+
+    _sep('HPI Check — GOF Summary (full coregistration)')
+    for name, gof in zip(hpi_names, hpi_gofs):
+        flag = 'OK' if gof >= _GOF_ACCEPT else ('MARGINAL' if gof >= 0.8 else 'POOR')
+        print(f'  {name}: GOF = {gof:.3f}  [{flag}]')
+
+    pol_gofs     = np.array(fit.get('pol_gofs', []))
+    has_pol_gofs = len(pol_gofs) == len(np.where(include_hpis)[0])
+
+    _sep('Residuals (fitted vs Polhemus)')
+    included_indices = np.where(include_hpis)[0]
+    for k, dev_i in enumerate(included_indices):
+        d    = dists_mm[k]
+        flag = 'OK' if d < _DIST_ACCEPT else ('LARGE' if d < 10 else 'VERY LARGE')
+        pgof_str = f'  pol_GOF={pol_gofs[k]:.3f}' if has_pol_gofs else ''
+        print(f'  {hpi_names[dev_i]}: {d:.2f} mm  [{flag}]{pgof_str}')
+    for dev_i in np.where(~include_hpis)[0]:
+        g = hpi_gofs[dev_i]
+        print(f'  {hpi_names[dev_i]}: excluded from transform (GOF = {g:.3f} < {_GOF_ACCEPT})')
+
+    mean_res = float(np.mean(dists_mm)) if len(dists_mm) else float('nan')
+    print(f'\n  Mean residual: {mean_res:.2f} mm')
+
+    R = fit['dev_to_head_trans']['trans'][:3, :3]
+    t = fit['dev_to_head_trans']['trans'][:3, 3]
+    rot_deg  = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+    trans_mm = float(np.linalg.norm(t) * 1000)
+    print(f'  Transform: rotation {rot_deg:.1f}°, translation {trans_mm:.1f} mm')
+
+    pol_gofs = np.array(fit.get('pol_gofs', []))
+    hpi_v, _, hpi_r, pol_v, _, pol_r = _recommendation(
+        hpi_gofs, dists_mm, include_hpis,
+        pol_gofs if len(pol_gofs) else None,
+        hpi_names=hpi_names,
+    )
+    _sep(f'HPI recording: {hpi_v}')
+    for r in hpi_r:
+        print(f'  {r}')
+    _sep(f'Polhemus registration: {pol_v}')
+    for r in pol_r:
+        print(f'  {r}')
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     args = _parse_args()
-    f_hpi = args.freq
 
-    if args.file:
-        hpi_file = args.file
+    # --- Select HPI file ---
+    if args.hpi:
+        hpi_file = args.hpi
     else:
         root = tk.Tk()
         root.withdraw()
@@ -71,221 +665,35 @@ def main():
             initialdir='/data', title='Select HPI file',
             filetypes=[('FIF files', '*.fif')],
         )
-
     if not hpi_file:
         print('No file selected. Exiting.')
         sys.exit(0)
 
-    raw = mne.io.read_raw_fif(hpi_file)
-    raw.info['bads'] = pick_low_noise_meg_chs(raw, n_std=2, fmax=100)
-    raw.pick(picks=['meg', 'stim', 'misc'], exclude='bads')
-    # Filter on the continuous raw so the signal is long enough for the FIR
-    # filter (avoids distortion warnings from short epoch windows).
-    raw.load_data().filter(h_freq=f_hpi + 5, l_freq=f_hpi - 5)
-    epochs = (
-        mne.make_fixed_length_epochs(raw, duration=0.25, preload=True)
-        .resample(sfreq=200)
-    )
-    data = epochs.get_data(copy=False)
+    # --- Select Polhemus file (optional) ---
+    pol_file = args.pol
+    if pol_file is None and not args.hpi:
+        root2 = tk.Tk()
+        root2.withdraw()
+        pol_file = filedialog.askopenfilename(
+            initialdir='/data',
+            title='Select Polhemus file (cancel = HPI-only mode)',
+            filetypes=[('JSON files', '*.json'), ('FIF files', '*.fif'), ('All files', '*')],
+        ) or None
 
-    mag_channels = mne.pick_types(epochs.info, meg=True)
-    misc_channels = mne.pick_types(epochs.info, misc=True)
+    if pol_file:
+        # Full coregistration — fit_hpi() (same engine as coregister)
+        print(f'Full coregistration mode — polhemus: {pol_file}')
+        fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof)
+        _print_diagnostics_full(fit)
+        _build_figure_full(fit)
+    else:
+        # HPI-only — fit_hpi_amplitudes() + resolve coil locations
+        amp = fit_hpi_amplitudes(hpi_file, args.freq)
+        amp = _resolve_hpi_only(amp)
+        _print_diagnostics_hpi_only(amp)
+        _build_figure_hpi_only(amp)
 
-    # Collect all hpiin drive channels present in the file (up to 4).
-    hpi_channels = np.array([
-        i for i in misc_channels
-        if 'hpiin' in epochs.info['chs'][i]['ch_name']
-    ])
-    n_hpi = len(hpi_channels)
-
-    if n_hpi == 0:
-        print(
-            'ERROR: No active HPI drive channels (hpiin*) found in this file.\n'
-            'This script requires a raw HPI recording, not a processed output.\n'
-            f'File: {hpi_file}'
-        )
-        sys.exit(1)
-
-    # Per-epoch, per-coil activity flag: True when the drive signal swings > 1 mV.
-    hpi_trls = (
-        np.max(data[:, hpi_channels, :], axis=2)
-        - np.min(data[:, hpi_channels, :], axis=2)
-    ) > 1e-3  # shape (n_epochs, n_hpi)
-
-    # --- Figure 1: HPI amplitude map per coil (device-space scatter) ---
-    # plot_topomap requires a head transform that doesn't exist in a raw HPI
-    # recording (the transform is what we're about to compute).  Instead,
-    # project sensor positions from device coordinates (loc[:3]) top-down
-    # (x → right, y → up when viewed from above) and colour each sensor by
-    # its signed HPI amplitude.
-    #
-    # Use only _bz channels so each sensor slot appears once.
-    bz_mask = np.array([
-        epochs.info['chs'][idx]['ch_name'].endswith('_bz')
-        for idx in mag_channels
-    ])
-    if bz_mask.sum() == 0:          # fallback for non-standard naming
-        bz_mask = np.ones(len(mag_channels), dtype=bool)
-    bz_indices = mag_channels[bz_mask]   # indices into epoch channel list
-
-    # Sensor positions in device space (metres).
-    bz_pos = np.array([
-        epochs.info['chs'][idx]['loc'][:3] for idx in bz_indices
-    ])  # shape (n_bz, 3)
-
-    fig1, axes1 = plt.subplots(1, n_hpi, figsize=(4 * n_hpi, 4),
-                                constrained_layout=True)
-    if n_hpi == 1:
-        axes1 = [axes1]
-
-    t_amp = np.zeros((n_hpi, data.shape[1]))
-    for i_coil in range(n_hpi):
-        trls = np.nonzero(hpi_trls[:, i_coil])[0][2:-2]  # trim first/last 2
-        s = epochs.info['chs'][hpi_channels[i_coil]]['ch_name']
-        print("Coil %s (%s): %d trials" % (i_coil, s, len(trls)))
-        ax = axes1[i_coil]
-
-        if trls.size == 0:
-            ax.set_facecolor('#eeeeee')
-            ax.text(0.5, 0.5, 'no trials', ha='center', va='center',
-                    transform=ax.transAxes, color='gray', fontsize=12)
-            ax.set_title(s[0:3] + s[-3:] + ' [MISSING]', fontsize=14, color='gray')
-            continue
-
-        R_mat = np.zeros((data.shape[1], trls.size))
-        Theta = np.zeros((data.shape[1], trls.size))
-        for i_trl in range(trls.size):
-            X = np.mean(np.multiply(np.cos(2 * math.pi * f_hpi * epochs.times), data[trls[i_trl], :, :]), axis=1)
-            Y = np.mean(np.multiply(np.sin(2 * math.pi * f_hpi * epochs.times), data[trls[i_trl], :, :]), axis=1)
-            tmp = X + 1j * Y
-            R_mat[:, i_trl] = abs(tmp)
-            Theta[:, i_trl] = np.angle(tmp / tmp[hpi_channels[i_coil]])
-        amp_all = np.mean(R_mat, axis=1)
-        amp_all[abs(np.mean(Theta, axis=1)) > (math.pi / 2)] = \
-            -amp_all[abs(np.mean(Theta, axis=1)) > (math.pi / 2)]
-        t_amp[i_coil, :] = amp_all
-
-        # Scatter: colour by amplitude at _bz channels, viewed from above (x/y plane).
-        amp_bz = amp_all[bz_indices]
-        clim = np.max(np.abs(amp_bz)) or 1.0
-        sc = ax.scatter(bz_pos[:, 0] * 1000, bz_pos[:, 1] * 1000,
-                        c=amp_bz, cmap='RdBu_r', s=40,
-                        vmin=-clim, vmax=clim)
-        plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_aspect('equal')
-        ax.set_xlabel('x (mm)')
-        ax.set_ylabel('y (mm)')
-        ax.set_title(s[0:3] + s[-3:], fontsize=14)
-
-    t_amp = t_amp[:, mag_channels]
-
-    # --- Dipole fit ---
-    rrs = np.zeros((n_hpi, 3))
-    gofs = np.zeros((n_hpi,))
-    moms = np.zeros((n_hpi, 3))
-
-    # Build sensor geometry once — it is the same for every coil.
-    meg_picks = mne.pick_types(raw.info, meg=True, exclude=[])
-    info_raw_meg = pick_info(raw.info, meg_picks)
-    meg_coils = _concatenate_coils(_create_meg_coils(info_raw_meg["chs"], "accurate"))
-    cov = mne.cov.make_ad_hoc_cov(raw.info)
-    whitener, _ = mne.cov.compute_whitener(cov, raw.info)
-
-    # Use the median sensor-origin distance as the sphere radius.
-    # meg_coils[0] contains coil integration points, some of which can be at
-    # the origin (giving min=0 and an empty guess space after mindist pruning).
-    # The median of sensor origin norms is a stable estimate of the helmet radius.
-    sensor_origins = np.array([ch['loc'][:3] for ch in info_raw_meg['chs']])
-    R_sphere = float(np.median(np.linalg.norm(sensor_origins, axis=1)))
-    sphere = ConductorModel(layers=[dict(rad=R_sphere)], r0=np.zeros(3), is_sphere=True)
-    MINDIST = 0.005  # metres — exclude guesses within 5 mm of the origin
-    guesses_rr = _make_guesses(sphere, 0.01, 0.0, MINDIST)[0]["rr"]
-    # _make_guesses excludes points within mindist of the sphere *surface* but
-    # can still return points near the origin.  Drop those explicitly so
-    # _magnetic_dipole_field_vec doesn't produce NaN rows that break the SVD.
-    guesses_rr = guesses_rr[np.linalg.norm(guesses_rr, axis=1) >= MINDIST]
-    fwd = _magnetic_dipole_field_vec(guesses_rr, meg_coils, 'warning')
-    fwd = np.dot(fwd, whitener.T)
-    fwd.shape = (guesses_rr.shape[0], 3, -1)
-    # Drop any remaining NaN/Inf rows (degenerate dipole positions) before SVD.
-    valid = np.isfinite(fwd).all(axis=(1, 2))
-    guesses_rr = guesses_rr[valid]
-    fwd = fwd[valid]
-    fwd = np.linalg.svd(fwd, full_matrices=False)[2]
-    guesses = dict(rr=guesses_rr, whitened_fwd_svd=fwd)
-
-    for i_coil in range(n_hpi):
-        if np.all(t_amp[i_coil, :] == 0):
-            # No active trials for this coil — leave rrs/gofs at zero.
-            continue
-        x, gof, moment = _fit_magnetic_dipole(
-            t_amp[i_coil, :], np.zeros((3,)), 'warning', whitener, meg_coils, guesses
-        )
-        rrs[i_coil, :] = x
-        gofs[i_coil] = gof
-        moms[i_coil, :] = moment
-
-    # --- Figure 2: 3-D dipole positions vs sensor array ---
-    # Convert metres → mm for readable axis labels.
-    rrs_mm = rrs * 1000
-    coil_pos_mm = meg_coils[0][:, :3] * 1000  # integration point positions only
-
-    # Shared axis limits so all three views use the same scale.
-    all_pts = np.vstack([rrs_mm, coil_pos_mm])
-    lim = np.max(np.abs(all_pts)) * 1.1
-    ax_lim = [-lim, lim]
-
-    fig2, axes2 = plt.subplots(1, 3, figsize=(13, 5),
-                                subplot_kw=dict(projection='3d'))
-    views = [
-        dict(title='top',   elev=90,  azim=-90, roll=0),
-        dict(title='right',  elev=0,   azim=0,   roll=0),
-        dict(title='front',  elev=0,   azim=90,  roll=0),
-    ]
-    offsets = [
-        np.array([0.01,  0,     0]) * lim * 0.1,
-        np.array([0,     0.01,  0]) * lim * 0.1,
-        np.array([-0.01, 0,     0]) * lim * 0.1,
-    ]
-
-    active_mask = ~np.all(t_amp[:, :] == 0, axis=1)  # coils with fitted positions
-
-    for ax, view, off in zip(axes2, views, offsets):
-        ax.scatter(coil_pos_mm[:, 0], coil_pos_mm[:, 1], coil_pos_mm[:, 2],
-                   color='green', alpha=0.15, marker='.', s=4)
-        # Active coils: red; missing coils: grey at origin (will be labelled)
-        if active_mask.any():
-            ax.scatter(rrs_mm[active_mask, 0], rrs_mm[active_mask, 1], rrs_mm[active_mask, 2],
-                       color='red', marker='o', s=60, zorder=5)
-        for i in range(n_hpi):
-            s = epochs.info['chs'][hpi_channels[i]]['ch_name']
-            label = s[0:3] + s[-3:]
-            if active_mask[i]:
-                ax.text(rrs_mm[i, 0] + off[0], rrs_mm[i, 1] + off[1], rrs_mm[i, 2] + off[2],
-                        f'{label}\n{gofs[i]:.2f}', size=9, zorder=6, color='k')
-            else:
-                ax.text(off[0], off[1], off[2],
-                        f'{label}\n[no trials]', size=9, zorder=6, color='gray')
-        ax.set_xlim(ax_lim)
-        ax.set_ylim(ax_lim)
-        ax.set_zlim(ax_lim)
-        ax.set_xlabel('x (mm)')
-        ax.set_ylabel('y (mm)')
-        ax.set_zlabel('z (mm)')
-        ax.view_init(elev=view['elev'], azim=view['azim'], roll=view['roll'])
-        ax.set_title(view['title'])
-
-    fig2.suptitle('HPI dipole positions (red) vs sensors (green)', fontsize=12)
-    plt.tight_layout()
     plt.show()
-
-    print('\nCoil GOF summary:')
-    for i_coil in range(n_hpi):
-        s = epochs.info['chs'][hpi_channels[i_coil]]['ch_name']
-        if active_mask[i_coil]:
-            print("  %s: gof = %.3f" % (s, gofs[i_coil]))
-        else:
-            print("  %s: no active trials" % s)
 
 
 if __name__ == '__main__':
