@@ -30,8 +30,8 @@ import matplotlib.pyplot as plt
 import mne
 import numpy as np
 
-from opm_utility_scripts.io import get_boolean, get_file, get_files, get_input
-from opm_utility_scripts.viz import plot_hpi_alignment
+from ..io import get_boolean, get_file, get_files, get_input
+from ..viz import plot_hpi_alignment
 from ._core import fit_hpi, apply_transform, save_raw
 
 

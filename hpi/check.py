@@ -30,8 +30,8 @@ from mne.chpi import compute_chpi_locs
 from mne.io.constants import FIFF
 from mne.transforms import apply_trans, Transform
 
-from opm_utility_scripts.hpi._core import fit_hpi_amplitudes, fit_hpi
-from opm_utility_scripts.viz import plot_hpi_raw_channels
+from ._core import fit_hpi_amplitudes, fit_hpi
+from ..viz import plot_hpi_raw_channels
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +475,7 @@ def _print_diagnostics_hpi_only(amp):
 
 def _print_diagnostics_pol_only(pol):
     """Print a summary of a polhemus digitisation file."""
-    from opm_utility_scripts.io import load_polhemus
+    from ..io import load_polhemus
 
     _sep('Polhemus digitisation summary')
 
@@ -930,7 +930,7 @@ def main():
 
     else:
         # Polhemus-only — no HPI fitting needed
-        from opm_utility_scripts.io import load_polhemus
+        from ..io import load_polhemus
         pol = load_polhemus(pol_file)
         _print_diagnostics_pol_only(pol)
         _build_figure_pol_only(pol)

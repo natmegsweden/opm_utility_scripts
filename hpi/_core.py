@@ -49,7 +49,7 @@ from mne.transforms import (
 )
 from mne.utils import warn
 
-from opm_utility_scripts.channels import find_zero_location_channels, get_hpi_output_channels
+from ..channels import find_zero_location_channels, get_hpi_output_channels
 
 # Sampling frequency used internally for HPI fitting (always resample to
 # this before running the amplitude estimation loop).
@@ -257,7 +257,8 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 
 
 def fit_hpi(hpifile, polfile, hpifreq: float,
-            gof_limit: float | None = None) -> dict:
+            gof_limit: float | None = None,
+            landmark_weight: float = 1.0) -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
     the device-to-head transform.
@@ -270,9 +271,13 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     hpifile : str | mne.io.Raw
         Path to the OPM recording in which the HPI coils were activated
         sequentially, or a pre-loaded Raw object.
-    polfile : str | dict
-        Path to the TRIUX/JSON Polhemus recording, or a pre-loaded
-        Polhemus dict returned by ``load_polhemus``.
+    polfile : str | dict | mne.channels.DigMontage
+        Path to the TRIUX/JSON Polhemus recording, a pre-loaded
+        Polhemus dict returned by ``load_polhemus``, or a
+        :class:`mne.channels.DigMontage` as returned by
+        ``mne.channels.read_dig_fif()``.  Strings and DigMontage objects
+        are passed through :func:`~opm_utility_scripts.io.load_polhemus`;
+        dicts are used directly.
     hpifreq : float
         Drive frequency shared by all HPI coils (Hz).
     gof_limit : float | None
@@ -286,6 +291,19 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
           of spatial filtering).
 
         Pass an explicit float to override the automatic selection.
+    landmark_weight : float
+        Weight for the landmark (nasion, LPA, RPA) constraint in the
+        device-to-head transform fit.  The combined score used for
+        permutation selection and the refined fit is::
+
+            score = HPI_residual + landmark_weight * landmark_residual
+
+        * ``0.0`` — landmarks ignored; reproduces the previous HPI-only
+          behaviour (useful for regression testing).
+        * ``1.0`` (default) — equal metre-scale contribution.
+        * Higher values — stronger landmark constraint, useful when coil
+          geometry is nearly symmetric and HPI residuals alone cannot
+          disambiguate the mapping.
 
     Returns
     -------
@@ -345,11 +363,11 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Stage 2: Load Polhemus and embed digitisation into raw
     # ------------------------------------------------------------------
-    if isinstance(polfile, str):
-        from opm_utility_scripts.io import load_polhemus
-        pol = load_polhemus(polfile)
-    else:
+    if isinstance(polfile, dict):
         pol = polfile
+    else:
+        from ..io import load_polhemus
+        pol = load_polhemus(polfile)
 
     lpa      = pol['lpa']
     nasion   = pol['nasion']
@@ -464,6 +482,12 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
 
     dev_pts  = hpi_dev[include_hpis]       # fitted positions, device frame
     n_inc    = len(dev_pts)
+    if n_inc < 3:
+        raise ValueError(
+            f"Only {n_inc} HPI coil(s) passed the GOF threshold "
+            f"({gof_limit:.2f}). At least 3 are required for a well-determined "
+            f"rigid transform. Redo the HPI recording."
+        )
     n_pol    = len(hpi_orig_head)
 
     # ------------------------------------------------------------------
@@ -476,31 +500,115 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # coils onto n_pol polhemus points, fit a rigid transform for each,
     # and keep the mapping that minimises the total post-transform residual.
     # With n_inc ≤ 4 and n_pol ≤ 4 this is at most 24 permutations.
+    #
+    # Two-pass algorithm:
+    #   Pass 1 (coarse, HPI only) — select the best permutation and coarse
+    #           transform using only HPI residuals (existing behaviour).
+    #   Pass 2 (refined, HPI + landmarks) — use the Pass-1 transform to
+    #           estimate device-frame landmark positions, then re-fit with
+    #           the combined point set to refine the transform.  When
+    #           landmark_weight > 0 and n_pol > n_inc, also re-score all
+    #           permutations using the landmark constraint so that a
+    #           near-symmetric coil geometry cannot produce a wrong mapping.
     # ------------------------------------------------------------------
-    best_residual  = np.inf
-    best_trans     = None
-    best_indices   = None
+
+    lm_head = np.array([nasion_head, lpa_head, rpa_head])
+    lm_dev  = None  # set after permutation selection when landmark_weight > 0
+
+    def _apply_t(T, pts):
+        return (T[:3, :3] @ pts.T).T + T[:3, 3]
+
+    # --- Permutation selection: HPI-only fit + headshape-centroid orientation prior
+    #
+    # With near-coplanar coils the HPI Procrustes is underdetermined in yaw, so
+    # two permutations can have similar HPI residuals but differ by ~180°.
+    #
+    # The disambiguating prior: when extra_pts (headshape) are available, map
+    # them into device frame via T_inv and check that their centroid z lies on
+    # the same side as the HPI coil centroid z.  Both scalp and coils sit on
+    # the head, so in ANY device frame they must share the same gross z sign.
+    # A permutation that puts the scalp centroid on the *opposite* z side from
+    # the coils is physically impossible and receives a large penalty.
+    #
+    # This is non-circular: the headshape points are independent of the HPI
+    # coils and of any landmark round-trip.  The prior acts only as a tie-
+    # breaker; when HPI residuals differ substantially (>5 mm) it has no
+    # effect.
+    #
+    # Score = HPI_residual + landmark_weight * headshape_orientation_penalty
+
+    # Expected sign: the coils (in dev frame, as given) cluster at a certain z.
+    # dev_pts are the measured device-frame coil positions — their centroid z
+    # tells us which side of the device the head is on.
+    dev_centroid_z = float(dev_pts[:, 2].mean())
+
+    # extra_pts_head is already in head frame (computed above in either branch).
+    _ep = np.asarray(extra_pts_head) if extra_pts_head is not None else np.empty((0, 3))
+    extra_head = _ep if (landmark_weight > 0.0 and _ep.shape[0] >= 3) else None
+
+    best_score  = np.inf
+    best_trans  = None
+    best_perm   = None
 
     for perm in itertools.permutations(range(n_pol), n_inc):
-        perm  = list(perm)
+        perm = list(perm)
         pol_pts = hpi_orig_head[perm]
         try:
             quat, _ = _fit_matched_points(dev_pts, pol_pts)
         except Exception:
             continue
-        t_candidate = _quat_to_affine(quat)
-        fitted_head = (t_candidate[:3, :3] @ dev_pts.T).T + t_candidate[:3, 3]
-        residual    = float(np.sum(np.linalg.norm(pol_pts - fitted_head, axis=1)))
-        if residual < best_residual:
-            best_residual = residual
-            best_trans    = t_candidate
-            best_indices  = perm
+        t_cand = _quat_to_affine(quat)
 
-    tree_indices      = np.array(best_indices)
+        # HPI residual: sum of per-coil distances after transform
+        fitted_head = _apply_t(t_cand, dev_pts)
+        hpi_res = float(np.sum(np.linalg.norm(pol_pts - fitted_head, axis=1)))
+
+        score = hpi_res
+        if extra_head is not None:
+            # Map headshape centroid to device frame via T_inv.
+            t_inv = np.linalg.inv(t_cand)
+            extra_centroid_head = extra_head.mean(axis=0)
+            extra_centroid_dev  = _apply_t(t_inv, extra_centroid_head[np.newaxis])[0]
+            # Penalty: headshape centroid must be on the SAME z-side as the
+            # HPI coils.  If it crosses to the opposite side, apply a penalty
+            # proportional to how far it is on the wrong side.
+            z_wrong = -extra_centroid_dev[2] * np.sign(dev_centroid_z)
+            orientation_penalty = float(max(0.0, z_wrong))
+            score += landmark_weight * orientation_penalty
+
+        if score < best_score:
+            best_score  = score
+            best_trans  = t_cand
+            best_perm   = perm
+
+    tree_indices      = np.array(best_perm)
     dev_to_head_trans = Transform(fro="meg", to="head", trans=best_trans)
 
+    # Diagnostic: per-coil assignment table (coil → polhemus point, post-fit distance).
+    print('  HPI coil assignment:')
+    incl_idx = np.where(include_hpis)[0]
     hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
+    for rank, pol_i in enumerate(tree_indices):
+        ch_name = hpi_names[incl_idx[rank]]
+        pol_pos = hpi_orig_head[pol_i] * 1000
+        dev_pos_head = _apply_t(best_trans, dev_pts[rank:rank+1])[0] * 1000
+        res_mm = np.linalg.norm(pol_pos - dev_pos_head)
+        print(f'    {ch_name} → pol#{pol_i+1} '
+              f'[{pol_pos[0]:.1f},{pol_pos[1]:.1f},{pol_pos[2]:.1f}] mm  '
+              f'post-fit dist={res_mm:.1f} mm')
+
     dist = np.linalg.norm(hpi_orig_head[tree_indices] - hpi_head[include_hpis], axis=1)
+
+    _DIST_WARN_MM = 15.0
+    if np.any(dist * 1000 > _DIST_WARN_MM):
+        bad = [hpi_names[incl_idx[i]]
+               for i in range(len(dist)) if dist[i] * 1000 > _DIST_WARN_MM]
+        warnings.warn(
+            f"Large HPI coil residuals for: {bad}. "
+            f"Max residual: {dist.max()*1000:.1f} mm (threshold {_DIST_WARN_MM:.0f} mm). "
+            f"Coil(s) may have moved between digitisation and recording.",
+            RuntimeWarning, stacklevel=2
+        )
 
     # ------------------------------------------------------------------
     # Stage 5: Polhemus-position GOF
@@ -552,25 +660,32 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     }
 
 
-def apply_transform(datfile: str, fit_result: dict, new_sfreq: float) -> mne.io.Raw:
+def apply_transform(
+    datfile: 'str | mne.io.Raw',
+    fit_result: dict,
+    new_sfreq: float = None,
+) -> mne.io.Raw:
     """
     Apply the HPI device-to-head transform to a data file.
 
-    Loads *datfile*, drops bad/zero-location channels, optionally resamples,
-    embeds the digitisation points and ``dev_head_t`` from *fit_result*, and
-    returns the modified :class:`mne.io.Raw` object.  The caller is responsible
-    for saving — use :func:`save_raw` for the standard filename convention.
+    Loads *datfile* (or uses it directly if already a :class:`mne.io.Raw`),
+    drops bad/zero-location channels, optionally resamples, embeds the
+    digitisation points and ``dev_head_t`` from *fit_result*, and returns the
+    modified :class:`mne.io.Raw` object.  The caller is responsible for saving
+    — use :func:`save_raw` for the standard filename convention.
 
     Parameters
     ----------
-    datfile : str
-        Path to the OPM-MEG data file to transform.
+    datfile : str or mne.io.Raw
+        Path to the OPM-MEG data file to transform, or an already-loaded
+        :class:`mne.io.Raw` object.
     fit_result : dict
         Result dict from :func:`fit_hpi`.  All position arrays must already
         be in head coordinates (guaranteed when produced by ``fit_hpi``).
-    new_sfreq : float
+    new_sfreq : float, optional
         Target sampling frequency.  The data is resampled only when the
-        current ``sfreq`` differs from *new_sfreq*.
+        current ``sfreq`` differs from *new_sfreq*.  If ``None`` (default),
+        no resampling is performed.
 
     Returns
     -------
@@ -585,9 +700,12 @@ def apply_transform(datfile: str, fit_result: dict, new_sfreq: float) -> mne.io.
     extra_pts = fit_result['extra_pts']
     eeg_pts = fit_result.get('eeg_pts', np.empty((0, 3)))
 
-    raw = mne.io.read_raw_fif(datfile, preload=True)
+    if isinstance(datfile, mne.io.BaseRaw):
+        raw = datfile if datfile.preload else datfile.load_data()
+    else:
+        raw = mne.io.read_raw_fif(datfile, preload=True)
 
-    if new_sfreq != raw.info['sfreq']:
+    if new_sfreq is not None and new_sfreq != raw.info['sfreq']:
         raw.load_data().resample(new_sfreq)
 
     for bad_chan in raw.info["bads"]:

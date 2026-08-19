@@ -387,7 +387,7 @@ def plot_hpi_raw_channels(hpifile, hpifreq: float = 33.0, show: bool = True):
     -------
     matplotlib.figure.Figure
     """
-    from opm_utility_scripts.channels import get_hpi_output_channels
+    from .channels import get_hpi_output_channels
 
     if isinstance(hpifile, str):
         raw = mne.io.read_raw_fif(hpifile, preload=True, verbose=False)

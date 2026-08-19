@@ -35,6 +35,7 @@ from .io import (
 )
 from .analog.mapping import generate_analog_channel_mapping
 from .analog.rename import rename_channels
+from . import hpi
 
 __all__ = [
     # channels
@@ -60,4 +61,6 @@ __all__ = [
     # analog
     'generate_analog_channel_mapping',
     'rename_channels',
+    # hpi
+    'hpi',
 ]

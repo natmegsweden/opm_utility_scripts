@@ -114,42 +114,86 @@ def load_datafile(path: str) -> dict:
     return {'sfreq': raw.info['sfreq'], 'path': os.path.abspath(path)}
 
 
-def load_polhemus(path: str) -> dict:
-    """Load Polhemus digitisation from JSON or FIF into a common dict."""
+def load_polhemus(path: 'str | mne.channels.DigMontage') -> dict:
+    """Load Polhemus digitisation from JSON, FIF, or a DigMontage object.
+
+    Accepts three input types:
+
+    * **str ending in** ``.json`` — pylhemus-dig/1 JSON format (isotrak frame).
+    * **str ending in** ``.fif`` — any FIF whose ``info['dig']`` carries the
+      digitisation (head frame, as produced by TRIUX/Elekta recordings).
+    * :class:`mne.channels.DigMontage` — as returned by
+      ``mne.channels.read_dig_fif()``.  Coordinates are taken directly from
+      ``montage.dig`` and treated as head-frame (``source='fif'``), consistent
+      with how MNE stores dig points in a DigMontage.
+
+    Parameters
+    ----------
+    path : str | mne.channels.DigMontage
+        Source of the digitisation data.
+
+    Returns
+    -------
+    dict
+        Common polhemus dict with keys ``lpa``, ``nasion``, ``rpa``,
+        ``hpi_orig``, ``extra_pts``, ``eeg_pts``, ``dig``, ``source``,
+        and ``path``.
+    """
     import mne
 
-    path = os.path.abspath(path)
-    ext = os.path.splitext(path)[1].lower()
-
-    if ext == '.json':
-        with open(path, 'r', encoding='utf-8') as fid:
-            pol_data = json.load(fid)
-        if pol_data.get('format') != 'pylhemus-dig/1':
-            raise ValueError("Unsupported polhemus JSON format; expected 'pylhemus-dig/1'")
+    # ------------------------------------------------------------------
+    # Branch 1: pre-loaded DigMontage
+    # ------------------------------------------------------------------
+    if isinstance(path, mne.channels.DigMontage):
+        montage = path
+        if not montage.dig:
+            raise ValueError('DigMontage contains no digitisation points')
         dig = [
             {
                 'kind': int(d['kind']),
                 'ident': int(d['ident']),
                 'r': np.array(d['r'], dtype=float),
             }
-            for d in pol_data.get('dig', [])
+            for d in montage.dig
         ]
-        source = 'json'
-    elif ext == '.fif':
-        pol_info = mne.io.read_info(path, verbose='error')
-        if not pol_info['dig']:
-            raise ValueError('No digitisation points found in FIF')
-        dig = [
-            {
-                'kind': int(d['kind']),
-                'ident': int(d['ident']),
-                'r': np.array(d['r'], dtype=float),
-            }
-            for d in pol_info['dig']
-        ]
-        source = 'fif'
+        source = 'fif'   # DigMontage stores coords in head frame
+        pol_path = '<DigMontage>'
     else:
-        raise ValueError(f'Unsupported polhemus file extension: {ext}')
+        # ------------------------------------------------------------------
+        # Branch 2: file path
+        # ------------------------------------------------------------------
+        pol_path = os.path.abspath(path)
+        ext = os.path.splitext(pol_path)[1].lower()
+
+        if ext == '.json':
+            with open(pol_path, 'r', encoding='utf-8') as fid:
+                pol_data = json.load(fid)
+            if pol_data.get('format') != 'pylhemus-dig/1':
+                raise ValueError("Unsupported polhemus JSON format; expected 'pylhemus-dig/1'")
+            dig = [
+                {
+                    'kind': int(d['kind']),
+                    'ident': int(d['ident']),
+                    'r': np.array(d['r'], dtype=float),
+                }
+                for d in pol_data.get('dig', [])
+            ]
+            source = 'json'
+        elif ext == '.fif':
+            pol_info = mne.io.read_info(pol_path, verbose='error')
+            if not pol_info['dig']:
+                raise ValueError('No digitisation points found in FIF')
+            dig = [
+                {
+                    'kind': int(d['kind']),
+                    'ident': int(d['ident']),
+                    'r': np.array(d['r'], dtype=float),
+                }
+                for d in pol_info['dig']
+            ]
+            source = 'fif'
+        else:
+            raise ValueError(f'Unsupported polhemus file extension: {ext}')
 
     cardinals = {d['ident']: np.array(d['r'], dtype=float) for d in dig if d['kind'] == 1}
     for ident in (1, 2, 3):
@@ -177,8 +221,120 @@ def load_polhemus(path: str) -> dict:
         'eeg_pts': eeg_pts,
         'dig': dig,
         'source': source,
-        'path': path,
+        'path': pol_path,
     }
+
+
+def make_debug_fif(path: str, out_path: str | None = None, keep_meg: bool | None = None) -> str:
+    """Strip a FIF recording down to an anonymised, minimal debug copy.
+
+    Suitable for both the **HPI recording** and the **polhemus FIF** inputs to
+    :func:`~opm_utility_scripts.hpi._core.fit_hpi`.  Call it once for each:
+
+    .. code-block:: python
+
+        make_debug_fif(hpi_raw_path)        # writes alongside the source file
+        make_debug_fif(polhemus_fif_path)   # same
+        # or specify an explicit destination:
+        make_debug_fif(hpi_raw_path, '/tmp/debug_hpi_raw.fif')
+
+    What is removed
+    ~~~~~~~~~~~~~~~
+    * Subject name, date of birth, recording date (zeroed to 2000-01-01).
+    * All non-MEG, non-HPI signal channels (STIM, analog/digital inputs, EEG …).
+    * MEG channels from a polhemus FIF (no ``hpiout*`` channels present) unless
+      *keep_meg* is explicitly ``True``.
+
+    What is kept
+    ~~~~~~~~~~~~
+    * Digitisation points (``info['dig']``) — fiducials, HPI coil positions,
+      headshape points — **all coordinates preserved unchanged**.
+    * HPI subsystem metadata (``hpi_meas``, ``hpi_results``, ``hpi_subsystem``).
+    * ``hpiout*`` MISC channels — the drive signals used by
+      :func:`~opm_utility_scripts.hpi._core.fit_hpi_amplitudes`.
+    * MEG channels — always kept for HPI recordings (needed for dipole fitting);
+      dropped by default for polhemus FIFs (dig-only use).  Override with
+      *keep_meg*.
+
+    Parameters
+    ----------
+    path : str
+        Source FIF recording — either the OPM HPI raw file or a polhemus
+        FIF (e.g. a TRIUX recording whose ``info['dig']`` holds the
+        digitisation).
+    out_path : str | None
+        Destination path for the anonymised copy.  When ``None`` (default)
+        the output is placed next to the source file with ``_debug``
+        inserted before the ``.fif`` suffix, e.g.
+        ``hpipre_raw.fif`` → ``hpipre_debug_raw.fif``.
+    keep_meg : bool | None
+        Whether to retain MEG sensor channels.  ``None`` (default) means
+        *auto*: MEG is kept unless the caller passes ``False``.  Pass
+        ``False`` explicitly to drop MEG (e.g. for a polhemus-only FIF
+        where you only need the dig points).
+
+    Returns
+    -------
+    str
+        Absolute path of the saved file.
+    """
+    import mne
+    from mne.io.constants import FIFF
+
+    path = os.path.abspath(path)
+
+    # --- Derive default output path ---
+    if out_path is None:
+        base = os.path.basename(path)          # e.g. hpipre_raw.fif
+        # Insert _debug before the first .fif occurrence
+        if '_raw.fif' in base:
+            base_out = base.replace('_raw.fif', '_debug_raw.fif', 1)
+        else:
+            stem, ext = os.path.splitext(base)
+            base_out = stem + '_debug' + ext
+        out_path = os.path.join(os.path.dirname(path), base_out)
+
+    raw = mne.io.read_raw_fif(path, preload=True, verbose=False, allow_maxshield=True)
+
+    # --- Anonymise: date → 2000-01-01, wipe subject fields completely ---
+    raw.anonymize(daysback=None, keep_his=False, verbose=False)
+    with raw.info._unlock():
+        raw.info['subject_info'] = None
+
+    # Auto: keep MEG unless explicitly told not to.
+    # MEG channels are required for the dipole fit in fit_hpi_amplitudes;
+    # pass keep_meg=False only when producing a dig-only polhemus copy.
+    _keep_meg = True if keep_meg is None else bool(keep_meg)
+
+    # --- Select channels to keep ---
+    keep_kinds = set()
+    if _keep_meg:
+        keep_kinds.add(FIFF.FIFFV_MEG_CH)
+
+    # Always keep HPI output channels (kind MISC, name starts with 'hpiout')
+    keep_names = [
+        ch['ch_name'] for ch in raw.info['chs']
+        if ch['kind'] in keep_kinds
+        or (ch['kind'] == FIFF.FIFFV_MISC_CH
+            and ch['ch_name'].lower().startswith('hpiout'))
+    ]
+
+    if keep_names:
+        raw.pick(keep_names)
+        raw.load_data()
+    else:
+        # Polhemus FIF with keep_meg=False: no signal channels to keep.
+        # Write a single zeroed stub channel so the file is valid while
+        # still carrying the dig metadata.
+        if raw.ch_names:
+            raw.pick([raw.ch_names[0]])
+            raw.load_data()
+            raw._data[:] = 0.0
+        # If somehow no channels exist at all, MNE still writes the dig.
+
+    out_path = os.path.abspath(out_path)  # normalise in case caller provided relative path
+    raw.save(out_path, overwrite=True, verbose=False)
+    return out_path
 
 
 def load_hpifile(path: str):
@@ -193,7 +349,7 @@ def load_hpifile(path: str):
 
 def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float) -> tuple[str, dict]:
     """Fit all HPI candidates and return the highest-scoring path and fit."""
-    from opm_utility_scripts.hpi._core import fit_hpi
+    from .hpi._core import fit_hpi
 
     best_path = None
     best_fit = None
@@ -231,3 +387,50 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float) -
         raise RuntimeError(f'Could not fit HPI from any HPI file. {error_text}')
 
     return best_path, best_fit
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            'Anonymise and strip a FIF recording to a minimal debug copy. '
+            'Works for both the OPM-HPI raw file and a polhemus FIF. '
+            'Run once for each input file.'
+        )
+    )
+    parser.add_argument(
+        'path',
+        help='Source FIF file (HPI raw or polhemus FIF).',
+    )
+    parser.add_argument(
+        'out_path',
+        nargs='?',
+        default=None,
+        help=(
+            'Destination path for the debug copy. '
+            'Defaults to the source directory with "_debug" inserted '
+            'before the .fif suffix (e.g. hpipre_raw.fif -> hpipre_debug_raw.fif).'
+        ),
+    )
+    meg_group = parser.add_mutually_exclusive_group()
+    meg_group.add_argument(
+        '--no-meg',
+        action='store_true',
+        default=False,
+        help=(
+            'Drop MEG sensor channels. Use for polhemus FIFs where only '
+            'the dig points are needed.'
+        ),
+    )
+    meg_group.add_argument(
+        '--keep-meg',
+        action='store_true',
+        default=False,
+        help='Explicitly keep MEG channels (default when not using --no-meg).',
+    )
+    args = parser.parse_args()
+
+    keep_meg = False if args.no_meg else None  # None = auto (keep MEG)
+    out = make_debug_fif(args.path, args.out_path, keep_meg=keep_meg)
+    print(out)
