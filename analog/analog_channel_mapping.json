@@ -15,7 +15,7 @@
     },
     "ai3": {
         "newname": "Acc2Z",
-        "tptypeye": {
+        "type": {
             "kind": 502,
             "unit": 107
         }
