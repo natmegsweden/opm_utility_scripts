@@ -18,20 +18,7 @@ Both modes use the same calculation engine in ``_core.py``.
 
 import argparse
 import sys
-import tkinter as tk
-from tkinter import filedialog
-
 import warnings
-
-import matplotlib.pyplot as plt
-import mne
-import numpy as np
-from mne.chpi import compute_chpi_locs
-from mne.io.constants import FIFF
-from mne.transforms import apply_trans, Transform
-
-from ._core import fit_hpi_amplitudes, fit_hpi
-from ..viz import plot_hpi_raw_channels
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +299,27 @@ def _resolve_hpi_only(amp):
         'hpi_dev':  np.array(coil_locs['rrs'][0]),
         'hpi_gofs': np.array(coil_locs['gofs'][0]),
     }
+
+
+def _load_heavy_deps():
+    """Import scientific stack lazily so --help returns without loading MNE."""
+    import matplotlib.pyplot as plt
+    import mne
+    import numpy as np
+    from mne.chpi import compute_chpi_locs
+    from mne.io.constants import FIFF
+    from mne.transforms import apply_trans, Transform
+    from ._core import fit_hpi_amplitudes, fit_hpi
+    from ..viz import plot_hpi_raw_channels
+
+    g = globals()
+    g.update(dict(
+        plt=plt, mne=mne, np=np,
+        compute_chpi_locs=compute_chpi_locs,
+        FIFF=FIFF, apply_trans=apply_trans, Transform=Transform,
+        fit_hpi_amplitudes=fit_hpi_amplitudes, fit_hpi=fit_hpi,
+        plot_hpi_raw_channels=plot_hpi_raw_channels,
+    ))
 
 
 def _parse_args():
@@ -868,6 +876,9 @@ def _print_diagnostics_full(fit, detailed=False):
 
 def main():
     args = _parse_args()
+
+    _load_heavy_deps()
+
     detailed = args.detailed
 
     hpi_file = args.hpi or None
@@ -884,6 +895,8 @@ def main():
 
     if hpi_file is None and pol_file is None:
         # GUI — ask for HPI first, then optionally polhemus
+        import tkinter as tk
+        from tkinter import filedialog
         root = tk.Tk(); root.withdraw()
         hpi_file = filedialog.askopenfilename(
             initialdir='/data', title='Select HPI file (cancel = polhemus-only)',
