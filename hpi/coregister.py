@@ -24,19 +24,35 @@ Usage (fully interactive — GUI dialogs for everything)::
 import argparse
 import os
 import sys
-import tkinter as tk
 
-import matplotlib.pyplot as plt
-import mne
-import numpy as np
 
-from ..io import get_boolean, get_file, get_files, get_input
-from ..viz import plot_hpi_alignment
-from ._core import fit_hpi, apply_transform, save_raw
+def _load_heavy_deps():
+    """Load scientific/GUI helpers lazily so --help returns quickly."""
+    import matplotlib.pyplot as plt
+    import mne
+    import numpy as np
+    from ..io import get_boolean, get_file, get_files, get_input
+    from ..viz import plot_hpi_alignment
+    from ._core import fit_hpi, apply_transform, save_raw
+
+    globals().update(dict(
+        plt=plt,
+        mne=mne,
+        np=np,
+        get_boolean=get_boolean,
+        get_file=get_file,
+        get_files=get_files,
+        get_input=get_input,
+        plot_hpi_alignment=plot_hpi_alignment,
+        fit_hpi=fit_hpi,
+        apply_transform=apply_transform,
+        save_raw=save_raw,
+    ))
 
 
 def _output_suffix(datfile: str, new_sfreq: float) -> str:
     """Return the output suffix, including '+ds' only when the file is resampled."""
+    _load_heavy_deps()
     info = mne.io.read_info(datfile, verbose='error')
     suffix = '_proc-hpi'
     if int(new_sfreq) != int(info['sfreq']):
@@ -88,6 +104,7 @@ def _parse_args():
 
 def main():
     args = _parse_args()
+    _load_heavy_deps()
 
     # ----------------------------------------------------------------
     # Resolve inputs — CLI args take priority; fall back to GUI dialogs
@@ -96,6 +113,7 @@ def main():
                         args.freq is not None, args.sfreq is not None])
     root = None
     if need_gui:
+        import tkinter as tk
         root = tk.Tk()
         root.withdraw()
 

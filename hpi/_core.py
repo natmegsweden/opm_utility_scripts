@@ -21,39 +21,71 @@ import itertools
 import os
 import warnings
 
-import matplotlib.pyplot as plt
-import mne
-import numpy as np
-from scipy.signal import find_peaks
-
-from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
-from mne._fiff.pick import pick_types
-from mne.chpi import (
-    compute_chpi_amplitudes,
-    compute_chpi_locs,
-    compute_whitener,
-    make_ad_hoc_cov,
-    _concatenate_coils,
-    _create_meg_coils,
-    _magnetic_dipole_field_vec,
-    _magnetic_dipole_delta,
-)
-from mne.io.constants import FIFF
-from mne.transforms import (
-    Transform,
-    _fit_matched_points,
-    _quat_to_affine,
-    apply_trans,
-    get_ras_to_neuromag_trans,
-    invert_transform,
-)
-from mne.utils import warn
-
-from ..channels import find_zero_location_channels, get_hpi_output_channels
-
 # Sampling frequency used internally for HPI fitting (always resample to
 # this before running the amplitude estimation loop).
 _HPI_FIT_SFREQ = 1000
+
+_HEAVY_LOADED = False
+
+
+def _load_heavy_deps():
+    """Load the scientific stack lazily on first use."""
+    global _HEAVY_LOADED
+    if _HEAVY_LOADED:
+        return
+    import matplotlib.pyplot as plt
+    import mne
+    import numpy as np
+    from scipy.signal import find_peaks
+    from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
+    from mne._fiff.pick import pick_types
+    from mne.chpi import (
+        compute_chpi_amplitudes,
+        compute_chpi_locs,
+        compute_whitener,
+        make_ad_hoc_cov,
+        _concatenate_coils,
+        _create_meg_coils,
+        _magnetic_dipole_field_vec,
+        _magnetic_dipole_delta,
+    )
+    from mne.io.constants import FIFF
+    from mne.transforms import (
+        Transform,
+        _fit_matched_points,
+        _quat_to_affine,
+        apply_trans,
+        get_ras_to_neuromag_trans,
+        invert_transform,
+    )
+    from mne.utils import warn
+    from ..channels import find_zero_location_channels, get_hpi_output_channels
+
+    globals().update(dict(
+        plt=plt, mne=mne, np=np, find_peaks=find_peaks,
+        _call_make_dig_points=_call_make_dig_points,
+        _make_dig_points=_make_dig_points,
+        pick_types=pick_types,
+        compute_chpi_amplitudes=compute_chpi_amplitudes,
+        compute_chpi_locs=compute_chpi_locs,
+        compute_whitener=compute_whitener,
+        make_ad_hoc_cov=make_ad_hoc_cov,
+        _concatenate_coils=_concatenate_coils,
+        _create_meg_coils=_create_meg_coils,
+        _magnetic_dipole_field_vec=_magnetic_dipole_field_vec,
+        _magnetic_dipole_delta=_magnetic_dipole_delta,
+        FIFF=FIFF,
+        Transform=Transform,
+        _fit_matched_points=_fit_matched_points,
+        _quat_to_affine=_quat_to_affine,
+        apply_trans=apply_trans,
+        get_ras_to_neuromag_trans=get_ras_to_neuromag_trans,
+        invert_transform=invert_transform,
+        warn=warn,
+        find_zero_location_channels=find_zero_location_channels,
+        get_hpi_output_channels=get_hpi_output_channels,
+    ))
+    _HEAVY_LOADED = True
 
 
 def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
@@ -81,6 +113,7 @@ def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
     float
         GOF in [0, 1].  Returns ``nan`` if signal power is negligible.
     """
+    _load_heavy_deps()
     B  = np.dot(whitener, slope_row)
     B2 = float(np.dot(B, B))
     if B2 < 1e-30:
@@ -124,6 +157,8 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             slope matrix injected.  Pass this to ``compute_chpi_locs``
             after embedding proper dig points into ``raw_orig.info``.
     """
+    _load_heavy_deps()
+
     # ------------------------------------------------------------------
     # Load HPI recording
     # ------------------------------------------------------------------
@@ -350,6 +385,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             digitised position does not explain the sensor data — indicating
             a polhemus digitisation error rather than an HPI recording error.
     """
+    _load_heavy_deps()
+
     # ------------------------------------------------------------------
     # Stage 1: HPI amplitude estimation (no polhemus needed)
     # ------------------------------------------------------------------
@@ -692,6 +729,8 @@ def apply_transform(
     mne.io.Raw
         The transformed raw object (preloaded, not yet saved).
     """
+    _load_heavy_deps()
+
     dev_to_head_trans = fit_result['dev_to_head_trans']
     hpi_orig = fit_result['hpi_orig']
     nasion = fit_result['nasion']
@@ -762,6 +801,8 @@ def save_raw(raw: mne.io.Raw, datfile: str, suffix: str, overwrite: bool = True)
     str
         Absolute path of the saved file.
     """
+    _load_heavy_deps()
+
     stem = os.path.splitext(os.path.basename(datfile))[0].replace('_raw', '')
     outpath = os.path.join(os.path.dirname(datfile), stem + suffix)
     raw.save(outpath, overwrite=overwrite)

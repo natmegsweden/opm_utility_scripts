@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opm-utility-scripts"
+version = "0.1.0"
+description = "Utility package for Fieldline OPM-MEG data processing"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.8",
+    "mne>=1.8",
+    "numpy>=1.26",
+    "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+tools = [
+    "pandas>=2.2",
+]
+vtk = [
+    "pandas>=2.2",
+    "PyQt5>=5.15",
+    "vtk>=9.3",
+]
+
+[project.scripts]
+opmutil = "opm_utility_scripts.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = [
+    "opm_utility_scripts",
+    "opm_utility_scripts.analog",
+    "opm_utility_scripts.hpi",
+    "opm_utility_scripts.tools",
+]
+
+[tool.setuptools.package-dir]
+opm_utility_scripts = "."
+"opm_utility_scripts.analog" = "analog"
+"opm_utility_scripts.hpi" = "hpi"
+"opm_utility_scripts.tools" = "tools"
+
+[tool.setuptools.package-data]
+opm_utility_scripts = ["config.yml"]
+"opm_utility_scripts.analog" = ["analog_channel_mapping.json"]
+"opm_utility_scripts.tools" = ["*.csv", "*.mat"]
