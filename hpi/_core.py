@@ -621,20 +621,20 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     tree_indices      = np.array(best_perm)
     dev_to_head_trans = Transform(fro="meg", to="head", trans=best_trans)
 
-    # Diagnostic: per-coil assignment table (coil → polhemus point, post-fit distance).
-    print('  HPI coil assignment:')
+    # Compute per-coil residuals (single source of truth — used for both
+    # the diagnostic print below and the stored 'dist' in the return dict).
     incl_idx = np.where(include_hpis)[0]
     hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
+    dist = np.linalg.norm(hpi_orig_head[tree_indices] - hpi_head[include_hpis], axis=1)
+
+    # Diagnostic: per-coil assignment table (coil → polhemus point, post-fit distance).
+    print('  HPI coil assignment:')
     for rank, pol_i in enumerate(tree_indices):
         ch_name = hpi_names[incl_idx[rank]]
         pol_pos = hpi_orig_head[pol_i] * 1000
-        dev_pos_head = _apply_t(best_trans, dev_pts[rank:rank+1])[0] * 1000
-        res_mm = np.linalg.norm(pol_pos - dev_pos_head)
         print(f'    {ch_name} → pol#{pol_i+1} '
               f'[{pol_pos[0]:.1f},{pol_pos[1]:.1f},{pol_pos[2]:.1f}] mm  '
-              f'post-fit dist={res_mm:.1f} mm')
-
-    dist = np.linalg.norm(hpi_orig_head[tree_indices] - hpi_head[include_hpis], axis=1)
+              f'post-fit dist={dist[rank]*1000:.1f} mm')
 
     _DIST_WARN_MM = 15.0
     if np.any(dist * 1000 > _DIST_WARN_MM):
@@ -694,6 +694,79 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'include_hpis': include_hpis,
         'tree_indices': tree_indices,
         'pol_gofs':     pol_gofs,
+    }
+
+
+def compute_fit_diagnostics(fit):
+    """Compute all derived diagnostic scalars from a :func:`fit_hpi` result.
+
+    Centralises every calculation that was previously duplicated across
+    ``check.py`` display functions (``_print_diagnostics_full`` and
+    ``_fill_text_panel_full``).  ``check.py`` should call this once and
+    consume the returned dict rather than recomputing anything itself.
+
+    Parameters
+    ----------
+    fit : dict
+        Return value of :func:`fit_hpi`.
+
+    Returns
+    -------
+    dict with keys:
+
+    ``rot_deg`` : float
+        Rotation angle of the device-to-head transform in degrees.
+    ``trans_mm`` : float
+        Translation magnitude of the device-to-head transform in mm.
+    ``mean_res_mm`` : float
+        Mean per-coil residual over included coils (mm).
+    ``intercoil_rows`` : list[tuple]
+        One entry per coil pair among *included* coils.  Each tuple is
+        ``(name_i, name_j, dev_dist_mm, pol_dist_mm, diff_mm)``
+        where distances are in mm and names are the full channel names.
+        Points are correctly matched: ``dev[k]`` and ``pol[k]`` refer to
+        the same physical coil (excluded coils and unmatched polhemus
+        points are omitted).
+    """
+    _load_heavy_deps()
+
+    R = fit['dev_to_head_trans']['trans'][:3, :3]
+    t = fit['dev_to_head_trans']['trans'][:3, 3]
+    rot_deg  = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+    trans_mm = float(np.linalg.norm(t) * 1000)
+
+    dists_mm = np.array(fit['dist']) * 1000
+    mean_res_mm = float(np.mean(dists_mm)) if len(dists_mm) else float('nan')
+
+    # Inter-coil distances — included coils only, polhemus reordered by
+    # tree_indices so that dev[k] and orig[k] are the same physical coil.
+    hpi_dev      = np.array(fit['hpi_dev'])
+    hpi_orig     = np.array(fit['hpi_orig'])
+    hpi_names    = fit['hpi_names']
+    include_hpis = np.array(fit['include_hpis'])
+    tree_indices = np.array(fit['tree_indices'])
+
+    incl_idx  = np.where(include_hpis)[0]
+    dev_incl  = hpi_dev[incl_idx]
+    orig_incl = hpi_orig[tree_indices]   # matched polhemus points
+    n = len(incl_idx)
+
+    intercoil_rows = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            da = float(np.linalg.norm(dev_incl[i]  - dev_incl[j])  * 1000)
+            db = float(np.linalg.norm(orig_incl[i] - orig_incl[j]) * 1000)
+            intercoil_rows.append((
+                hpi_names[incl_idx[i]],
+                hpi_names[incl_idx[j]],
+                da, db, abs(da - db),
+            ))
+
+    return {
+        'rot_deg':        rot_deg,
+        'trans_mm':       trans_mm,
+        'mean_res_mm':    mean_res_mm,
+        'intercoil_rows': intercoil_rows,
     }
 
 

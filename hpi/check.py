@@ -309,7 +309,7 @@ def _load_heavy_deps():
     from mne.chpi import compute_chpi_locs
     from mne.io.constants import FIFF
     from mne.transforms import apply_trans, Transform
-    from ._core import fit_hpi_amplitudes, fit_hpi
+    from ._core import fit_hpi_amplitudes, fit_hpi, compute_fit_diagnostics
     from ..viz import plot_hpi_raw_channels
 
     g = globals()
@@ -318,6 +318,7 @@ def _load_heavy_deps():
         compute_chpi_locs=compute_chpi_locs,
         FIFF=FIFF, apply_trans=apply_trans, Transform=Transform,
         fit_hpi_amplitudes=fit_hpi_amplitudes, fit_hpi=fit_hpi,
+        compute_fit_diagnostics=compute_fit_diagnostics,
         plot_hpi_raw_channels=plot_hpi_raw_channels,
     ))
 
@@ -386,7 +387,7 @@ def _build_figure_hpi_only(amp):
     ax_text.axis('off')
 
     ax_3d.scatter(bz_pos_mm[:, 0], bz_pos_mm[:, 1], bz_pos_mm[:, 2],
-                  c='#e07b39', alpha=0.6, marker='.', s=18)
+                  c='#e07b39', alpha=0.6, marker=(4, 0, 45), s=18)
 
     rrs_mm = hpi_dev * 1000
     for i in range(n_hpi):
@@ -457,11 +458,6 @@ def _print_diagnostics_hpi_only(amp):
 
     if len(hpi_dev) >= 2:
         _sep('Inter-coil distances — device frame (mm)')
-        for line in _intercoil_table(hpi_names, hpi_dev, hpi_dev,
-                                     label_a='(mm)', label_b=''):
-            # only need single-frame distances — reuse helper but suppress second col
-            pass
-        # Print a simpler single-frame table
         shorts = [_short_name(n) for n in hpi_names]
         n = len(hpi_names)
         print(f'  {"Pair":<28}  {"dist (mm)":>10}')
@@ -542,7 +538,7 @@ def _build_figure_pol_only(pol):
     if extra_pts is not None and len(extra_pts):
         ep = np.asarray(extra_pts) * 1000
         ax.scatter(ep[:, 0], ep[:, 1], ep[:, 2],
-                   c='#aaaaaa', s=4, alpha=0.4, label='Headshape')
+                   c='#666666', s=4, alpha=0.4, label='Headshape')
 
     fid_colors = {'LPA': 'darkorange', 'Nasion': 'limegreen', 'RPA': 'darkorange'}
     for label, key in [('LPA', 'lpa'), ('Nasion', 'nasion'), ('RPA', 'rpa')]:
@@ -591,7 +587,7 @@ def _build_figure_pol_only(pol):
 # Full coregistration mode  (fit_hpi)
 # ---------------------------------------------------------------------------
 
-def _build_figure_full(fit, detailed=False):
+def _build_figure_full(fit, detailed=False, diag=None):
     """2-panel figure: head-space alignment matching coregister's plot_hpi_alignment."""
     hpi_dev      = np.array(fit['hpi_dev'])
     hpi_gofs     = np.array(fit['hpi_gofs'])
@@ -620,14 +616,14 @@ def _build_figure_full(fit, detailed=False):
                             for i in range(len(meg_picks)) if bz_mask[i]])
     sensor_head_mm = apply_trans(dev_to_head, sensor_dev) * 1000
     ax_3d.scatter(sensor_head_mm[:, 0], sensor_head_mm[:, 1], sensor_head_mm[:, 2],
-                  c='#e07b39', s=18, alpha=0.6, zorder=1)
+                  c='#e07b39', s=18, alpha=0.6, marker=(4, 0, 45), zorder=1)
 
     # Headshape
     extra_pts = fit.get('extra_pts')
     if extra_pts is not None and len(extra_pts):
         extra_mm = np.asarray(extra_pts) * 1000
         ax_3d.scatter(extra_mm[:, 0], extra_mm[:, 1], extra_mm[:, 2],
-                      c='#aaaaaa', s=3, alpha=0.4, zorder=1)
+                      c='#666666', s=3, alpha=0.4, zorder=1)
 
     # Fiducials
     fid_colors = {'LPA': 'darkorange', 'Nasion': 'limegreen', 'RPA': 'darkorange'}
@@ -677,17 +673,27 @@ def _build_figure_full(fit, detailed=False):
     ax_3d.zaxis.pane.set_edgecolor('white')
     ax_3d.set_title('HPI fitted (●) vs Polhemus target (★) — head space', fontsize=9)
 
-    _fill_text_panel_full(ax_text, fit, detailed=detailed)
+    _fill_text_panel_full(ax_text, fit, detailed=detailed, diag=diag)
     return fig
 
 
-def _fill_text_panel_full(ax, fit, detailed=False):
+def _fill_text_panel_full(ax, fit, detailed=False, diag=None):
+    """Render the text panel for the full coregistration figure.
+
+    Parameters
+    ----------
+    diag : dict or None
+        Pre-computed diagnostics from ``compute_fit_diagnostics(fit)``.
+        Pass this to avoid recomputing when already available; if ``None``
+        it is computed here.
+    """
     hpi_gofs     = np.array(fit['hpi_gofs'])
     hpi_names    = fit['hpi_names']
     include_hpis = np.array(fit['include_hpis'])
     dists_mm     = np.array(fit['dist']) * 1000
-    hpi_dev      = np.array(fit['hpi_dev'])
-    hpi_orig     = np.array(fit['hpi_orig'])
+
+    if diag is None:
+        diag = compute_fit_diagnostics(fit)
 
     lines = []
     def add(t, c='black'): lines.append((t, c))
@@ -721,34 +727,25 @@ def _fill_text_panel_full(ax, fit, detailed=False):
         short = _short_name(hpi_names[dev_i])
         add(f'  {short}: excl. (GOF<{_GOF_ACCEPT})', 'gray')
 
-    mean_res = float(np.mean(dists_mm)) if len(dists_mm) else float('nan')
     add('─' * 40, '#888888')
-    add(f'Mean residual: {mean_res:.2f} mm',
-        'green' if mean_res < _DIST_ACCEPT else ('darkorange' if mean_res < 10 else 'red'))
+    add(f'Mean residual: {diag["mean_res_mm"]:.2f} mm',
+        'green' if diag['mean_res_mm'] < _DIST_ACCEPT
+        else ('darkorange' if diag['mean_res_mm'] < 10 else 'red'))
 
     add('─' * 40, '#888888')
-    R = fit['dev_to_head_trans']['trans'][:3, :3]
-    t = fit['dev_to_head_trans']['trans'][:3, 3]
-    rot_deg  = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
-    trans_mm = float(np.linalg.norm(t) * 1000)
     add('Transform summary:', 'black')
-    add(f'  Rotation:    {rot_deg:.1f}°', 'black')
-    add(f'  Translation: {trans_mm:.1f} mm', 'black')
+    add(f'  Rotation:    {diag["rot_deg"]:.1f}°', 'black')
+    add(f'  Translation: {diag["trans_mm"]:.1f} mm', 'black')
 
-    # Inter-coil distance consistency (detailed only)
-    if detailed and len(hpi_dev) >= 2 and len(hpi_orig) >= 2:
+    # Inter-coil distance consistency (detailed only) — from compute_fit_diagnostics
+    if detailed and diag['intercoil_rows']:
         add('─' * 40, '#888888')
         add('Inter-coil dist dev/pol (mm):', 'black')
         add(f'  {"pair":<14} {"dev":>7} {"pol":>7} {"diff":>7}', '#555555')
-        shorts = [_short_name(nm) for nm in hpi_names]
-        n = len(hpi_names)
-        for i in range(n):
-            for j in range(i + 1, n):
-                da = np.linalg.norm(hpi_dev[i]  - hpi_dev[j])  * 1000
-                db = np.linalg.norm(hpi_orig[i] - hpi_orig[j]) * 1000
-                diff = abs(da - db)
-                col = 'black' if diff < 5 else ('darkorange' if diff < 15 else 'red')
-                add(f'  {shorts[i]}-{shorts[j]:<10} {da:7.1f} {db:7.1f} {diff:7.1f}', col)
+        for name_i, name_j, da, db, diff in diag['intercoil_rows']:
+            col = 'black' if diff < 5 else ('darkorange' if diff < 15 else 'red')
+            si, sj = _short_name(name_i), _short_name(name_j)
+            add(f'  {si}-{sj:<10} {da:7.1f} {db:7.1f} {diff:7.1f}', col)
 
     pol_gofs     = np.asarray(fit.get('pol_gofs', []))
     has_pol_gofs = len(pol_gofs) == len(np.where(include_hpis)[0])
@@ -769,56 +766,22 @@ def _fill_text_panel_full(ax, fit, detailed=False):
     _render_text(ax, lines)
 
 
-def _intercoil_table(names, pts_a, pts_b, label_a='dev', label_b='head'):
-    """Return lines comparing pairwise inter-coil distances in two frames.
 
-    Parameters
-    ----------
-    names : list[str]
-    pts_a, pts_b : np.ndarray, shape (n, 3)  — positions in metres
-    label_a, label_b : str — frame labels for the header
-
-    Returns
-    -------
-    list[str]
-    """
-    n = len(names)
-    shorts = [_short_name(nm) for nm in names]
-    lines = []
-    lines.append(f'  {"Pair":<28}  {label_a:>8}  {label_b:>8}  {"diff":>8}')
-    lines.append('  ' + '─' * 56)
-    for i in range(n):
-        for j in range(i + 1, n):
-            da = np.linalg.norm(pts_a[i] - pts_a[j]) * 1000
-            db = np.linalg.norm(pts_b[i] - pts_b[j]) * 1000
-            diff = abs(da - db)
-            flag = '' if diff < 5 else (' *' if diff < 15 else ' **')
-            lines.append(
-                f'  {shorts[i]}-{shorts[j]:<24}  {da:8.1f}  {db:8.1f}  {diff:8.1f}{flag}'
-            )
-    return lines
-
-
-def _print_diagnostics_full(fit, detailed=False):
+def _print_diagnostics_full(fit, detailed=False, diag=None):
     hpi_gofs     = np.array(fit['hpi_gofs'])
     hpi_names    = fit['hpi_names']
     include_hpis = np.array(fit['include_hpis'])
     dists_mm     = np.array(fit['dist']) * 1000
-    hpi_dev      = np.array(fit['hpi_dev'])
-    hpi_orig     = np.array(fit['hpi_orig'])
     pol_gofs     = np.array(fit.get('pol_gofs', []))
     has_pol_gofs = len(pol_gofs) == len(np.where(include_hpis)[0])
 
-    R = fit['dev_to_head_trans']['trans'][:3, :3]
-    t = fit['dev_to_head_trans']['trans'][:3, 3]
-    rot_deg  = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
-    trans_mm = float(np.linalg.norm(t) * 1000)
-    mean_res = float(np.mean(dists_mm)) if len(dists_mm) else float('nan')
+    # All derived scalars and inter-coil data from the single authoritative source.
+    if diag is None:
+        diag = compute_fit_diagnostics(fit)
 
     _sep('HPI Check — full coregistration')
 
     if detailed:
-        # Sensor count
         raw = fit.get('raw_for_topomap')
         if raw is not None:
             n_sensors = len(mne.pick_types(raw.info, meg=True, exclude=[]))
@@ -835,8 +798,7 @@ def _print_diagnostics_full(fit, detailed=False):
 
     # Always: residuals
     _sep('Residuals (fitted vs Polhemus)')
-    included_indices = np.where(include_hpis)[0]
-    for k, dev_i in enumerate(included_indices):
+    for k, dev_i in enumerate(np.where(include_hpis)[0]):
         d    = dists_mm[k]
         flag = 'OK' if d < _DIST_ACCEPT else ('LARGE' if d < 10 else 'VERY LARGE')
         pgof_str = (f'  pol_GOF={pol_gofs[k]:.3f}' if has_pol_gofs and detailed else '')
@@ -845,16 +807,19 @@ def _print_diagnostics_full(fit, detailed=False):
         g = hpi_gofs[dev_i]
         print(f'  {hpi_names[dev_i]}: excluded (GOF = {g:.3f} < {_GOF_ACCEPT})')
 
-    print(f'\n  Mean residual: {mean_res:.2f} mm')
-    print(f'  Transform: rotation {rot_deg:.1f}°, translation {trans_mm:.1f} mm')
+    print(f'\n  Mean residual: {diag["mean_res_mm"]:.2f} mm')
+    print(f'  Transform: rotation {diag["rot_deg"]:.1f}°, translation {diag["trans_mm"]:.1f} mm')
 
-    # Detailed only: inter-coil distance consistency
-    if detailed and len(hpi_dev) >= 2 and len(hpi_orig) >= 2:
+    # Detailed only: inter-coil distance consistency — from compute_fit_diagnostics
+    if detailed and diag['intercoil_rows']:
         _sep('Inter-coil distances: device frame vs polhemus (mm)')
         print('  (* >5 mm diff, ** >15 mm diff — large diff = fit/polhemus mismatch)')
-        for line in _intercoil_table(hpi_names, hpi_dev, hpi_orig,
-                                     label_a='device', label_b='polhemus'):
-            print(line)
+        print(f'  {"Pair":<28}  {"device":>8}  {"polhemus":>8}  {"diff":>8}')
+        print('  ' + '─' * 56)
+        for name_i, name_j, da, db, diff in diag['intercoil_rows']:
+            flag = '' if diff < 5 else (' *' if diff < 15 else ' **')
+            si, sj = _short_name(name_i), _short_name(name_j)
+            print(f'  {si}-{sj:<24}  {da:8.1f}  {db:8.1f}  {diff:8.1f}{flag}')
 
     # Always: recommendations
     hpi_v, _, hpi_r, pol_v, _, pol_r = _recommendation(
@@ -916,8 +881,9 @@ def main():
         # Full coregistration
         try:
             fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof)
-            _print_diagnostics_full(fit, detailed=detailed)
-            _build_figure_full(fit, detailed=detailed)
+            diag = compute_fit_diagnostics(fit)
+            _print_diagnostics_full(fit, detailed=detailed, diag=diag)
+            _build_figure_full(fit, detailed=detailed, diag=diag)
         except ValueError as exc:
             print(
                 f'\n[ERROR] HPI fitting failed: {exc}\n'
