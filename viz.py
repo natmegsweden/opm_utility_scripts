@@ -104,7 +104,7 @@ def plot_3d(plot_params: dict, filename: str):
         edgecolor='k', linewidth=0.2,
     )
 
-    ax.scatter(senspos[:, 0], senspos[:, 1], senspos[:, 2], color='r', s=50)
+    ax.scatter(senspos[:, 0], senspos[:, 1], senspos[:, 2], c='#e07b39', s=50, marker=(4, 0, 45))
     for i in range(len(senslabel)):
         ax.text(senspos[i, 0], senspos[i, 1], senspos[i, 2], senslabel[i], color='black', fontsize=9)
 
@@ -206,12 +206,12 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True):
             ax.scatter(sensor_head_mm[:, 0],
                        sensor_head_mm[:, 1],
                        sensor_head_mm[:, 2],
-                       c='#555555', s=6, alpha=0.45, zorder=1)
+                       c='#e07b39', s=6, alpha=0.45, marker=(4, 0, 45), zorder=1)
 
         # Headshape
         if extra_mm is not None and len(extra_mm):
             ax.scatter(extra_mm[:, 0], extra_mm[:, 1], extra_mm[:, 2],
-                       c='#888888', s=5, alpha=0.5, zorder=1)
+                       c='#666666', s=5, alpha=0.5, zorder=1)
 
         # Fiducials
         fid_colors = {'LPA': 'darkorange', 'Nasion': 'limegreen', 'RPA': 'darkorange'}

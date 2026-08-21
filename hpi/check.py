@@ -387,7 +387,7 @@ def _build_figure_hpi_only(amp):
     ax_text.axis('off')
 
     ax_3d.scatter(bz_pos_mm[:, 0], bz_pos_mm[:, 1], bz_pos_mm[:, 2],
-                  c='#e07b39', alpha=0.6, marker='.', s=18)
+                  c='#e07b39', alpha=0.6, marker=(4, 0, 45), s=18)
 
     rrs_mm = hpi_dev * 1000
     for i in range(n_hpi):
@@ -538,7 +538,7 @@ def _build_figure_pol_only(pol):
     if extra_pts is not None and len(extra_pts):
         ep = np.asarray(extra_pts) * 1000
         ax.scatter(ep[:, 0], ep[:, 1], ep[:, 2],
-                   c='#aaaaaa', s=4, alpha=0.4, label='Headshape')
+                   c='#666666', s=4, alpha=0.4, label='Headshape')
 
     fid_colors = {'LPA': 'darkorange', 'Nasion': 'limegreen', 'RPA': 'darkorange'}
     for label, key in [('LPA', 'lpa'), ('Nasion', 'nasion'), ('RPA', 'rpa')]:
@@ -616,14 +616,14 @@ def _build_figure_full(fit, detailed=False, diag=None):
                             for i in range(len(meg_picks)) if bz_mask[i]])
     sensor_head_mm = apply_trans(dev_to_head, sensor_dev) * 1000
     ax_3d.scatter(sensor_head_mm[:, 0], sensor_head_mm[:, 1], sensor_head_mm[:, 2],
-                  c='#e07b39', s=18, alpha=0.6, zorder=1)
+                  c='#e07b39', s=18, alpha=0.6, marker=(4, 0, 45), zorder=1)
 
     # Headshape
     extra_pts = fit.get('extra_pts')
     if extra_pts is not None and len(extra_pts):
         extra_mm = np.asarray(extra_pts) * 1000
         ax_3d.scatter(extra_mm[:, 0], extra_mm[:, 1], extra_mm[:, 2],
-                      c='#aaaaaa', s=3, alpha=0.4, zorder=1)
+                      c='#666666', s=3, alpha=0.4, zorder=1)
 
     # Fiducials
     fid_colors = {'LPA': 'darkorange', 'Nasion': 'limegreen', 'RPA': 'darkorange'}
