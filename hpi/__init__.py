@@ -1,6 +1,7 @@
 """HPI coregistration and quality-check utilities."""
 
-__all__ = ['fit_hpi', 'apply_transform', 'save_raw']
+__all__ = ['fit_hpi', 'fit_hpi_amplitudes', 'apply_transform', 'save_raw',
+           'compute_fit_diagnostics']
 
 
 def __getattr__(name: str):
