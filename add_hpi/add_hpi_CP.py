@@ -316,7 +316,7 @@ nasion=pol_info['dig'][1]['r']
 hpi=np.array([],dtype=float)
 for j in pol_info['dig']:
     if j['kind']==2:    # FIFFV_POINT_HPI = 2
-        hpi=np.append(hpi,j['r']) # to account for the gap between sensor surface and cell centre
+        hpi=np.append(hpi,j['r']) 
 n=int(hpi.shape[0]/3)
 hpi=hpi.reshape((n,3))
 hpi_orig = hpi
@@ -329,7 +329,7 @@ info=raw.info
 
 digpts=np.array([],dtype=float)
 for j in pol_info['dig']:
-    digpts=np.append(digpts,j['r']) # to account for the gap between sensor surface and cell centre
+    digpts=np.append(digpts,j['r'])
 n=int(digpts.shape[0]/3)
 digpts=digpts.reshape((n,3))
 
