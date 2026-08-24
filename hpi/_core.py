@@ -206,8 +206,8 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 
         minT = peaks[0] / raw.info['sfreq']
         maxT = peaks[-1] / raw.info['sfreq']
-        tmin = (maxT - minT) / 2.0 - 1 + minT
-        tmax = (maxT - minT) / 2.0 + 1 + minT
+        tmin = (maxT - minT) / 2.0 - 3 + minT
+        tmax = (maxT - minT) / 2.0 + 3 + minT
         raw.crop(tmin=tmin, tmax=tmax)
 
         # Build HPI subsystem info so compute_chpi_amplitudes can run.
