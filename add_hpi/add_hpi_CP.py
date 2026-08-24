@@ -382,14 +382,13 @@ for index in range(len(hpi_indices)):
     window=(peaks[-1]-peaks[0])/raw.info['sfreq']
 
     print(f'{chan_name} first point = {peaks[0]} and last point = {peaks[-1]}, time window = {window} s')
-
     #we use this window to extract the portion of data out for the magnetic dipole fit
 
     minT=peaks[0]/raw.info['sfreq']
     maxT=peaks[-1]/raw.info['sfreq']
 
-    tmin=(maxT-minT)/2.-1+minT
-    tmax=(maxT-minT)/2.+1+minT #we extract 2 seconds worth of data
+    tmin=(maxT-minT)/2.-3 + minT
+    tmax=(maxT-minT)/2.+3 + minT #we extract 6 seconds worth of data
 
     print(f'min time = {minT}, max time = {maxT}')
 
@@ -605,7 +604,7 @@ for bad_chan in bads:
 include_hpis = hpi_gofs>0.9
 
 tree = cKDTree(hpi_orig)
-distances, indices = tree.query(hpi_dev[include_hpis])
+distances, indices = tree.query(hpi_dev[include_hpis]) # find closest points
 
 print(f"hpi_orig: {hpi_dev[include_hpis]}\n")
 print(f"hpi_dev: {hpi_orig[indices]}\n")
