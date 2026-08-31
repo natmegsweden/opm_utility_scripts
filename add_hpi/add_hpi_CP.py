@@ -21,8 +21,6 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import Delaunay, cKDTree
 
-
-
 #from mne.io.pick import pick_types #use for older version of mne
 from mne._fiff.pick import pick_types
 
@@ -42,6 +40,7 @@ from mne.chpi import (
             _fit_coil_order_dev_head_trans,
             compute_chpi_amplitudes,
             compute_chpi_locs,
+            compute_chpi_opm_locs,
         )
 from mne.io.constants import FIFF
 from mne.utils import _check_fname, logger, verbose, warn
@@ -102,14 +101,14 @@ def TC_findzerochans(info, tolerance=0.02):
     return(bads_fl)
 
 def tc_plot_psd(raw):
-    #hann window
+    #hann winw
     n_fft = 1024
     psd_ylim = [1.,10000.]
     psd_xlim = [0.,500.]
 
     projs =0
-    fig = raw.plot_psd(fmin=0,n_fft=n_fft,show=False, proj=True, dB=False ,xscale='log',window='hann',n_jobs=-1)
-    fig3 = raw.plot_psd(fmin=0,n_fft=n_fft,show=False, proj=False, dB=False ,xscale='log',window='hann',n_jobs=-1)
+    fig = raw.plot_psd(fmin=0,n_fft=n_fft,show=False, proj=True, dB=False ,xscale='log',winw='hann',n_jobs=-1)
+    fig3 = raw.plot_psd(fmin=0,n_fft=n_fft,show=False, proj=False, dB=False ,xscale='log',winw='hann',n_jobs=-1)
 
     fig.suptitle('%s %d projs on hann' % (fname, projs))
     fig3.suptitle('%s projs off hann' %fname)
@@ -260,15 +259,15 @@ hpifile = get_file("Select hpifile")
 polfile = get_file("Select polhemusfile")
 erfile = get_file("Select empty room file")
 hpifreq = float(get_input("Enter frequency (Hz):", 33))
-new_sfreq = float(get_input("Enter downsampling frequency (Hz):", 1000))
-plotResult = get_boolean("Do you want to plot the data?")
+new_sfreq = float(get_input("Enter wnsampling frequency (Hz):", 1000))
+plotResult = get_boolean(" you want to plot the data?")
 
 # Print the results
 print(f"Datafile: {datfile}")
 print(f"HPIfile: {hpifile}")
 print(f"Polhemusfile: {polfile}")
 print(f"Frequency: {hpifreq} Hz")
-print(f"Downsampling Frequency: {new_sfreq} Hz")
+print(f"wnsampling Frequency: {new_sfreq} Hz")
 print(f"Plot: {plotResult}")
 
 
@@ -365,11 +364,11 @@ for ch in bad_chs:
     print(ch)
 
 raw.drop_channels(bad_chs)
-    
+
 # --- HFC -------------
-projs = mne.preprocessing.compute_proj_hfc(raw.info,order=1, picks='meg',exclude='bads')
-raw.add_proj(projs)
-raw.apply_proj()
+#projs = mne.preprocessing.compute_proj_hfc(raw.info,order=1, picks='meg',exclude='bads')
+#raw.add_proj(projs)
+#raw.apply_proj()
 
 hpi_names,hpi_indices=TC_get_hpiout_names(raw)
 
@@ -455,10 +454,10 @@ for index in range(len(hpi_indices)):
         print('NO PEAKS FOUND')
         continue#exit()
 
-    window=(peaks[-1]-peaks[0])/raw.info['sfreq']
+    winw=(peaks[-1]-peaks[0])/raw.info['sfreq']
     
-    print(f'{chan_name} first point = {peaks[0]} and last point = {peaks[-1]}, time window = {window} s')
-    #we use this window to extract the portion of data out for the magnetic dipole fit
+    print(f'{chan_name} first point = {peaks[0]} and last point = {peaks[-1]}, time winw = {winw} s')
+    #we use this winw to extract the portion of data out for the magnetic dipole fit
 
     minT=peaks[0]/raw.info['sfreq']
     maxT=peaks[-1]/raw.info['sfreq']
@@ -468,12 +467,12 @@ for index in range(len(hpi_indices)):
 
     print(f'coil on: {minT} .. {maxT} sec')
 
-    print(f'using window: {tmin} .. {tmax} sec')
+    print(f'using winw: {tmin} .. {tmax} sec')
 
     raw.crop(tmin=tmin,tmax=tmax)
 
     if do_plot:
-        spectrum = raw.compute_psd(picks=hpi_indices[index],window='hann',proj=False, )
+        spectrum = raw.compute_psd(picks=hpi_indices[index],winw='hann',proj=False, )
         fig=spectrum.plot(picks='misc', amplitude=True,dB=False,)
 
         psd_ylim = [1.,10000.]
@@ -518,6 +517,16 @@ for index in range(len(hpi_indices)):
     print('Extracting hpi amplitudes...')
     raw.info["line_freq"]=None
     coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2)
+
+    if index == 0:
+        peak_chs = []
+
+    peak_ch = np.argmax(np.abs(coil_amplitudes['slopes'][0][0]))
+    picks = mne.pick_types(raw.info, meg=True, exclude='bads')
+    ch_names = [raw.info['ch_names'][i] for i in picks]
+    print(f"peak channel = {ch_names[peak_ch]}\n")
+    peak_chs.append(peak_ch)
+    
     slope[index,:] = coil_amplitudes['slopes'][0][0]
     i_hpis.append(index)
     n_hpis+=1
@@ -560,7 +569,6 @@ with raw.info._unlock():
             coord_trans=Transform("meg", "head"),
         )
     ]
-    
 
 assert len(coil_amplitudes["times"]) == 1
 coil_amplitudes['slopes'] = np.zeros((1,slope.shape[0],slope.shape[1]))
@@ -573,7 +581,7 @@ if n_hpis < 3:
     )  
 
 print('Fitting coils...')
-coil_locs = compute_chpi_locs(raw.info, coil_amplitudes)
+coil_locs = compute_chpi_opm_locs(raw.info, coil_amplitudes)
 hpi_dev = np.array(coil_locs['rrs'][0])
 hpi_gofs = np.array(coil_locs['gofs'][0])
 
