@@ -363,7 +363,9 @@ print("*** Bad channels: ***")
 for ch in bad_chs:
     print(ch)
 
-raw.drop_channels(bad_chs)
+for i in bad_chs:
+    if i in raw.info["ch_names"]:
+        raw.drop_channels(i)
 
 # --- HFC -------------
 #projs = mne.preprocessing.compute_proj_hfc(raw.info,order=1, picks='meg',exclude='bads')
