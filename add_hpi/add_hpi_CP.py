@@ -21,6 +21,9 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import Delaunay, cKDTree
 
+from scipy.spatial.transform import Rotation
+from scipy.optimize import minimize
+
 #from mne.io.pick import pick_types #use for older version of mne
 from mne._fiff.pick import pick_types
 
@@ -33,7 +36,10 @@ from mne.transforms import (
     get_ras_to_neuromag_trans,
     Transform,
     _quat_to_affine,
-    _fit_matched_points
+    _fit_matched_points,
+    invert_transform,
+    combine_transforms,
+    apply_trans
     )
 
 from mne.chpi import (
@@ -41,10 +47,15 @@ from mne.chpi import (
             compute_chpi_amplitudes,
             compute_chpi_locs,
             compute_chpi_opm_locs,
+            compute_whitener,
+            make_ad_hoc_cov,
+            _concatenate_coils,
+            _create_meg_coils,
+            _magnetic_dipole_field_vec,
+            _magnetic_dipole_delta,
         )
 from mne.io.constants import FIFF
 from mne.utils import _check_fname, logger, verbose, warn
-from mne.transforms import apply_trans
 
 #from mne.io._digitization import _make_dig_points #use for older version of mne
 from mne._fiff._digitization import _make_dig_points
@@ -99,6 +110,114 @@ def TC_findzerochans(info, tolerance=0.02):
     print('found the following channels with locations at 0,0,0')
     print(bads_fl)
     return(bads_fl)
+
+def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
+    """Evaluate dipole GOF at a *fixed* device-space position.
+
+    Unlike the floating-dipole fit in ``compute_chpi_locs``, this does not
+    optimise the position — it evaluates how well a dipole *at ``pos_dev``*
+    explains the measured field pattern ``slope_row``.
+
+    GOF = 1 − ||B_whitened − B_model(pos)||² / ||B_whitened||²
+
+    Parameters
+    ----------
+    slope_row : np.ndarray, shape (n_meg,)
+        One row of the slope matrix (measured field for one coil).
+    pos_dev : np.ndarray, shape (3,)
+        Fixed dipole position in device coordinates (metres).
+    whitener : np.ndarray
+        Whitening matrix from ``compute_whitener``.
+    meg_coils : object
+        Concatenated MEG coil geometry from ``_concatenate_coils``.
+
+    Returns
+    -------
+    float
+        GOF in [0, 1].  Returns ``nan`` if signal power is negligible.
+    """
+    B  = np.dot(whitener, slope_row)
+    B2 = float(np.dot(B, B))
+    if B2 < 1e-30:
+        return float('nan')
+    fwd = _magnetic_dipole_field_vec(pos_dev[np.newaxis], meg_coils, 'info')
+    residual, *_ = _magnetic_dipole_delta(fwd, whitener, B, B2)
+    return float(1.0 - residual / B2)
+
+def find_bads(reffile):
+    _load_heavy_deps()
+    
+    raw = mne.io.read_raw_fif(reffile)
+    raw.load_data()
+    
+    #remove bad-marked channels
+    for bad_chan in raw.info["bads"]:
+        raw.drop_channels(bad_chan)
+
+    #remove unlocalized channels
+    bads=find_zero_location_channels(raw.info)
+    for bad_chan in bads:
+        raw.drop_channels(bad_chan)
+          
+    # Detect outliers
+    picks = mne.pick_types(raw.info, meg=True, exclude='bads')
+    spectrum = raw.compute_psd(picks=picks, method="welch", fmin=70, fmax=80, n_fft=5000, n_per_seg=5000)
+    psds = spectrum.get_data()
+    background_power = psds.mean(axis=1)
+
+    good_idx = np.arange(len(background_power))
+
+    for _ in range(5): #iteratively remove outliers based on z-score>3
+        mean_power = np.mean(background_power[good_idx])
+        std_power = np.std(background_power[good_idx])
+        threshold = mean_power + 3 * std_power
+        new_good_idx = np.where(background_power <= threshold)[0]
+        if len(new_good_idx) == len(good_idx):
+            break
+        good_idx = new_good_idx
+
+    bad_idx = np.setdiff1d(np.arange(len(background_power)), good_idx)
+    ch_names = [raw.ch_names[p] for p in picks]
+    bad_chs = [ch_names[idx] for idx in bad_idx]
+
+    x = np.arange(len(background_power))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(x, background_power, 'ko', label='Background power')
+    ax.axhline( # Threshold
+        threshold,
+        color='r',
+        linestyle='--',
+        linewidth=2,
+        label=f'Threshold ({threshold:.2e})'
+    )
+    ax.plot( # Outliers
+        bad_idx,
+        background_power[bad_idx],
+        'r+',
+        markersize=10,
+        label='Bad channels'
+    )
+
+    for idx in bad_idx:
+        ax.text(
+            idx,
+            background_power[idx],
+            ch_names[idx],
+            rotation=45,
+            fontsize=8,
+            color='red'
+        )
+
+    ax.set_xlabel('Channel')
+    ax.set_ylabel('Background PSD')
+    ax.set_title(f'Bad Channel Detection Around HPI Frequency ({hpifreq} Hz)')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+    
+    return bad_chs
 
 def tc_plot_psd(raw):
     #hann winw
@@ -201,6 +320,37 @@ def plot_3d(senspos, senslabel, hpipos, hpilabel, hpipos2, hpilabel2, digpos):
     ax.scatter(digpos[:, 0], digpos[:, 1], digpos[:, 2], color='k', s=10)
 
     plt.show()
+    
+def perturb_transform(T0, params):
+    rvec = params[:3]
+    tvec = params[3:]
+    R = Rotation.from_rotvec(rvec).as_matrix()
+    delta = np.eye(4)
+    delta[:3, :3] = R
+    delta[:3, 3] = tvec
+    T = delta @ T0["trans"]
+    return Transform(
+        fro=T0["from"],
+        to=T0["to"],
+        trans=T,
+    )
+
+def mean_gof(params):
+    trans = perturb_transform(dev_to_head_trans, params)
+    head2dev = invert_transform(trans)
+    gofs = np.array([
+        _gof_at_fixed_pos(
+            slope[ch_i],
+            apply_trans(head2dev, hpi_dig[pol_i]),
+            whitener,
+            meg_coils,
+        )
+        for ch_i, pol_i in zip(incl_idx, indices)
+    ])
+    return gofs.mean()
+
+def objective(params):
+    return -mean_gof(params)
 
 
 from PySide6.QtWidgets import (
@@ -260,7 +410,8 @@ polfile = get_file("Select polhemusfile")
 erfile = get_file("Select empty room file")
 hpifreq = float(get_input("Enter frequency (Hz):", 33))
 new_sfreq = float(get_input("Enter wnsampling frequency (Hz):", 1000))
-plotResult = get_boolean(" you want to plot the data?")
+plotResult = get_boolean("Do you want to plot the data?")
+use_opt = get_boolean("Use rigid transform to optimize fit?")
 
 # Print the results
 print(f"Datafile: {datfile}")
@@ -401,7 +552,7 @@ for j in pol_info['dig']:
         hpi=np.append(hpi,j['r']) 
 n=int(hpi.shape[0]/3)
 hpi=hpi.reshape((n,3))
-hpi_orig = hpi
+hpi_dig = hpi
 
 dev_head_t = Transform("meg", "head", trans=None)
 dev_head_t['trans']=get_ras_to_neuromag_trans(nasion, lpa, rpa) #should remain identity with the above geometry
@@ -425,8 +576,6 @@ stop_sample = len(raw)
 print(f'start_sample={start_sample}, stop_sample={stop_sample}')
 
 hpi_locs = []
-
-dist_limit = 0.005
 
 raw_orig = raw.copy()
 n_hpis = 0
@@ -519,15 +668,6 @@ for index in range(len(hpi_indices)):
     print('Extracting hpi amplitudes...')
     raw.info["line_freq"]=None
     coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2)
-
-    if index == 0:
-        peak_chs = []
-
-    peak_ch = np.argmax(np.abs(coil_amplitudes['slopes'][0][0]))
-    picks = mne.pick_types(raw.info, meg=True, exclude='bads')
-    ch_names = [raw.info['ch_names'][i] for i in picks]
-    print(f"peak channel = {ch_names[peak_ch]}\n")
-    peak_chs.append(peak_ch)
     
     slope[index,:] = coil_amplitudes['slopes'][0][0]
     i_hpis.append(index)
@@ -605,22 +745,99 @@ for bad_chan in bads:
     raw.drop_channels(bad_chan)
 
 #only use good fits
-include_hpis = hpi_gofs>0.9
+include_hpis = hpi_gofs>0.96
 
-tree = cKDTree(hpi_orig)
-distances, indices = tree.query(hpi_dev[include_hpis]) # find closest points
+tree = cKDTree(hpi_dig-hpi_dig.mean(axis=0)) # shift points to centroid to avoid problems with bad coil placement
+distances, indices = tree.query(hpi_dev[include_hpis]-hpi_dev[include_hpis].mean(axis=0)) # find closest points
 
 print('Calculating transform...')
-trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig[indices])[0])
+trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_dig[indices])[0])
 dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
 
-print(f"hpi_orig: {hpi_dev[include_hpis]}\n")
-print(f"hpi_dev: {hpi_orig[indices]}\n")
+print(f"hpi_dig: {hpi_dev[include_hpis]}\n")
+print(f"hpi_dev: {hpi_dig[indices]}\n")
 print(f"trans: {dev_to_head_trans}\n")
 
 hpi_head = apply_trans(dev_to_head_trans, hpi_dev)
-dist = np.linalg.norm(hpi_orig[indices]-hpi_head[include_hpis], axis=1)
+dist = np.linalg.norm(hpi_dig[indices]-hpi_head[include_hpis], axis=1)
 
+# Evaluate fits at transformed polhemus locations
+raw_for_topomap = raw_orig.copy()
+raw_for_topomap.pick(picks=['meg'], exclude='bads')
+
+cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
+whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
+meg_coils   = _concatenate_coils(
+    _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
+)
+head2dev    = invert_transform(dev_to_head_trans)
+incl_idx    = np.where(include_hpis)[0]
+pol_gofs1    = np.array([
+    _gof_at_fixed_pos(
+        slope[ch_i],
+        apply_trans(head2dev, hpi_dig[pol_i]),
+        whitener,
+        meg_coils,
+    )
+    for ch_i, pol_i in zip(incl_idx, indices)
+])
+print('Fixed location GOFs:')
+for i in range(len(incl_idx)):
+    print(f"Coil {incl_idx[i]}: {pol_gofs1[i]}")
+
+
+# Optimize transform
+bounds = [
+    (-np.deg2rad(5), np.deg2rad(10)),   # rx
+    (-np.deg2rad(5), np.deg2rad(10)),   # ry
+    (-np.deg2rad(5), np.deg2rad(10)),   # rz
+    (-0.005, 0.005),                   # tx 5 mm
+    (-0.005, 0.005),                   # ty
+    (-0.005, 0.005),                   # tz
+]
+result = minimize(
+    objective,
+    x0=np.zeros(6),
+    method="L-BFGS-B",
+    bounds=bounds,
+)
+
+print(result)
+opt_trans = perturb_transform(
+    dev_to_head_trans,
+    result.x,
+)
+print('*** Optimized transform ***')
+print(opt_trans)
+raw_for_topomap = raw_orig.copy()
+raw_for_topomap.pick(picks=['meg'], exclude='bads')
+cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
+whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
+meg_coils   = _concatenate_coils(
+    _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
+)
+head2dev    = invert_transform(opt_trans)
+incl_idx    = np.where(include_hpis)[0]
+pol_gofs2    = np.array([
+    _gof_at_fixed_pos(
+        slope[ch_i],
+        apply_trans(head2dev, hpi_dig[pol_i]),
+        whitener,
+        meg_coils,
+    )
+    for ch_i, pol_i in zip(incl_idx, indices)
+])
+print('Fixed location GOFs (optimized):')
+for i in range(len(incl_idx)):
+    print(f"Coil {incl_idx[i]}: {pol_gofs2[i]}")
+      
+hpi_head2 = apply_trans(opt_trans, hpi_dev)
+dist2 = np.linalg.norm(hpi_dig[indices]-hpi_head2[include_hpis], axis=1)
+
+if use_opt:
+    dev_to_head_trans = opt_trans
+
+# --- Apply to recording ---------------------
 print('Applying trans to recording file...')
 raw.info.update(dev_head_t=dev_to_head_trans)
 
@@ -632,7 +849,7 @@ n=int(digpts.shape[0]/3)
 digpts=digpts.reshape((n,3))
 
 with raw.info._unlock():
-    raw.info['dig']=_make_dig_points(nasion, lpa, rpa, hpi_orig, digpts)
+    raw.info['dig']=_make_dig_points(nasion, lpa, rpa, hpi_dig, digpts)
 
 print("Path of the file..", os.path.abspath(fname))
 print('File name:', os.path.basename(fname))
@@ -646,13 +863,17 @@ savename=savename.replace('_raw','')
 raw.save(('%s/%s_proc-hpi+ds_meg.fif' % (path, savename)),overwrite=True)
 
 print('---------------------------------------------')
-print(f"hpi_orig: {hpi_orig}\n")
+print(f"hpi_dig: {hpi_dig}\n")
 print(f"hpi_dev: {hpi_dev}\n")
 print(f"order: {indices}\n")
 print(f"mean distance = {np.mean(dist)*1000:.1f} mm\n")
 for index, value in enumerate(hpi_gofs):
         status = 'ok' if hpi_gofs[index]>0.9 else 'not ok'
-        print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Status: {status}")
+        if status == 'ok':
+            print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Dist(mm): {dist[index]*1e3:.1f}, Status: {status}, fixed-GOF: {pol_gofs1[index]:.3f}, opt-GOF: {pol_gofs2[index]:.3f}, opt-Dist(mm): {dist2[index]*1e3:.1f}")
+        else:
+            print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Status: {status}")
+                
 print('---------------------------------------------')
 
 if plotResult:
@@ -682,4 +903,4 @@ if plotResult:
         hpilabel+=[str(j+1)]
    
     labels = [hpilabel[i] for i in i_hpis]
-    plot_3d(senspos, senslabel, hpi_orig, labels, hpi_head, hpi_names, digpts)
+    plot_3d(senspos, senslabel, hpi_dig, labels, hpi_head, hpi_names, digpts)
