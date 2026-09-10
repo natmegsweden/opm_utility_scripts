@@ -37,11 +37,14 @@ def _load_heavy_deps():
     import mne
     import numpy as np
     from scipy.signal import find_peaks
+    from scipy.spatial.transform import Rotation
+    from scipy.optimize import minimize
     from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
     from mne._fiff.pick import pick_types
     from mne.chpi import (
         compute_chpi_amplitudes,
         compute_chpi_locs,
+        compute_chpi_opm_locs,
         compute_whitener,
         make_ad_hoc_cov,
         _concatenate_coils,
@@ -55,7 +58,8 @@ def _load_heavy_deps():
         _fit_matched_points,
         _quat_to_affine,
         apply_trans,
-        get_ras_to_neuromag_trans,
+        get_ras_to_neuromag_trans,     
+        combine_transforms,
         invert_transform,
     )
     from mne.utils import warn
@@ -122,6 +126,111 @@ def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
     residual, *_ = _magnetic_dipole_delta(fwd, whitener, B, B2)
     return float(1.0 - residual / B2)
 
+def perturb_transform(T0, params):
+    rvec = params[:3]
+    tvec = params[3:]
+    R = Rotation.from_rotvec(rvec).as_matrix()
+    delta = np.eye(4)
+    delta[:3, :3] = R
+    delta[:3, 3] = tvec
+    T = delta @ T0["trans"]
+    return Transform(
+        fro=T0["from"],
+        to=T0["to"],
+        trans=T,
+    )
+
+def mean_gof(params):
+    trans = perturb_transform(dev_to_head_trans, params)
+    head2dev = invert_transform(trans)
+    gofs = np.array([
+        _gof_at_fixed_pos(
+            slope[ch_i],
+            apply_trans(head2dev, hpi_dig[pol_i]),
+            whitener,
+            meg_coils,
+        )
+        for ch_i, pol_i in zip(incl_idx, indices)
+    ])
+    return gofs.mean()
+
+def objective(params):
+    return -mean_gof(params)
+
+def find_bads(reffile):
+    _load_heavy_deps()
+    
+    raw = mne.io.read_raw_fif(reffile)
+    raw.load_data()
+    
+    #remove bad-marked channels
+    for bad_chan in raw.info["bads"]:
+        raw.drop_channels(bad_chan)
+
+    #remove unlocalized channels
+    bads=find_zero_location_channels(raw.info)
+    for bad_chan in bads:
+        raw.drop_channels(bad_chan)
+          
+    # Detect outliers
+    picks = mne.pick_types(raw.info, meg=True, exclude='bads')
+    spectrum = raw.compute_psd(picks=picks, method="welch", fmin=70, fmax=80, n_fft=5000, n_per_seg=5000)
+    psds = spectrum.get_data()
+    background_power = psds.mean(axis=1)
+
+    good_idx = np.arange(len(background_power))
+
+    for _ in range(5): #iteratively remove outliers based on z-score>3
+        mean_power = np.mean(background_power[good_idx])
+        std_power = np.std(background_power[good_idx])
+        threshold = mean_power + 3 * std_power
+        new_good_idx = np.where(background_power <= threshold)[0]
+        if len(new_good_idx) == len(good_idx):
+            break
+        good_idx = new_good_idx
+
+    bad_idx = np.setdiff1d(np.arange(len(background_power)), good_idx)
+    ch_names = [raw.ch_names[p] for p in picks]
+    bad_chs = [ch_names[idx] for idx in bad_idx]
+
+    x = np.arange(len(background_power))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(x, background_power, 'ko', label='Background power')
+    ax.axhline( # Threshold
+        threshold,
+        color='r',
+        linestyle='--',
+        linewidth=2,
+        label=f'Threshold ({threshold:.2e})'
+    )
+    ax.plot( # Outliers
+        bad_idx,
+        background_power[bad_idx],
+        'r+',
+        markersize=10,
+        label='Bad channels'
+    )
+
+    for idx in bad_idx:
+        ax.text(
+            idx,
+            background_power[idx],
+            ch_names[idx],
+            rotation=45,
+            fontsize=8,
+            color='red'
+        )
+
+    ax.set_xlabel('Channel')
+    ax.set_ylabel('Background PSD')
+    ax.set_title(f'Bad Channel Detection Around HPI Frequency ({hpifreq} Hz)')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+    
+    return bad_chs
 
 def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     """
@@ -172,6 +281,12 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     bads = find_zero_location_channels(raw.info)
     for bad_chan in bads:
         raw.drop_channels(bad_chan)
+       
+    # Remove noisy channels
+    bads = find_bads(reffile)
+    for i in bads:
+        if i in raw.info["ch_names"]:
+            raw.drop_channels(i)
 
     hpi_names, hpi_indices = get_hpi_output_channels(raw)
     hpi_freqs = np.full(len(hpi_indices), hpifreq)
@@ -188,7 +303,8 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     # ------------------------------------------------------------------
     raw_orig = raw.copy()
     slope = np.zeros((len(hpi_indices), len(pick_types(raw.info, meg='mag'))), dtype=float)
-
+    n_hpis = 0
+    i_hpis = []
     for index in range(len(hpi_indices)):
         raw = raw_orig.copy()
         channel_index = hpi_indices[index]
@@ -210,71 +326,88 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         tmax = (maxT - minT) / 2.0 + 3 + minT
         raw.crop(tmin=tmin, tmax=tmax)
 
-        # Build HPI subsystem info so compute_chpi_amplitudes can run.
-        hpi_sub = {"hpi_coils": [{} for _ in range(len(hpi_indices))]}
-        hpi_coils = [
-            {"number": i + 1, "drive_chan": hpi_names[i], "coil_freq": hpi_freqs[i]}
-            for i in range(len(hpi_indices))
-        ]
-        for i in range(len(hpi_indices)):
-            hpi_sub["hpi_coils"][i]["event_bits"] = [256]
+        # Build HPI subsystem info for singe coil so compute_chpi_amplitudes can run.
+        hpi_sub = dict()
+
+        hpi_sub["hpi_coils"] = []
+        hpi_sub["hpi_coils"].append({})
+
+        hpi_coils=[]
+        hpi_coils.append({})
+
+        drive_channels = hpi_names[0]
+        default_freqs = hpi_freqs
+
+        # build coil structure
+        hpi_coils[0]["number"] = 1
+        hpi_coils[0]["drive_chan"] = drive_channels[0]
+        hpi_coils[0]["coil_freq"] = default_freqs[0]
+
+        hpi_sub["hpi_coils"][0]["event_bits"] = [256]
 
         with raw.info._unlock():
             raw.info["hpi_subsystem"] = hpi_sub
             raw.info["hpi_meas"] = [{"hpi_coils": hpi_coils}]
 
-        n_hpis = sum(
-            1 for d in raw.info["hpi_subsystem"]["hpi_coils"]
-            if d.get("event_bits") == [256]
-        )
+        coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2)
+        slope[index,:] = coil_amplitudes['slopes'][0][0]
+        i_hpis.append(index)
+        n_hpis+=1
+        
+    hpi_indices = hpi_indices[i_hpis]
 
-        if n_hpis < 3:
-            # NOTE: coil_amplitudes is only assigned inside the else branch.
-            # If n_hpis < 3 for every iteration the assert below will raise
-            # UnboundLocalError — this is a pre-existing behaviour preserved here.
-            warn(
-                f"{n_hpis:d} HPIs active. At least 3 needed to perform"
-                " head localization\n *NO* head localization performed"
-            )
-        else:
-            with raw.info._unlock():
-                raw.info["hpi_results"] = [
+    # Adding full hpi struct to info
+    hpi_sub = dict()
+    hpi_sub["hpi_coils"] = []
+    for _ in range(len(hpi_indices)):
+        hpi_sub["hpi_coils"].append({})
+
+    hpi_coils=[]
+    for _ in range(len(hpi_indices)):
+        hpi_coils.append({})
+
+    drive_channels = hpi_names
+    default_freqs = hpi_freqs
+    for i in range(len(hpi_indices)):
+        # build coil structure
+        hpi_coils[i]["number"] = i + 1
+        hpi_coils[i]["drive_chan"] = drive_channels[i]
+        hpi_coils[i]["coil_freq"] = default_freqs[i]
+        hpi_sub["hpi_coils"][i]["event_bits"] = [256]
+
+    with raw.info._unlock():
+        raw.info["hpi_subsystem"] = hpi_sub
+        raw.info["hpi_meas"] = [{"hpi_coils": hpi_coils}]
+        raw.info["hpi_results"] = [
+            dict(
+                dig_points=[
                     dict(
-                        dig_points=[
-                            dict(r=np.zeros(3),
-                                 coord_frame=FIFF.FIFFV_COORD_DEVICE,
-                                 ident=ii + 1)
-                            for ii in range(n_hpis)
-                        ],
-                        coord_trans=Transform("meg", "head"),
+                        r=np.zeros(3),
+                        coord_frame=FIFF.FIFFV_COORD_DEVICE,
+                        ident=ii + 1,
                     )
-                ]
-            with raw.info._unlock():
-                # None → MNE's _setup_hpi_amplitude_fitting takes the else
-                # branch and sets line_freqs = np.zeros([0]), skipping line
-                # harmonic removal.  Must be set inside _unlock() so MNE's
-                # Info validation does not reject the write.
-                raw.info["line_freq"] = None
-            coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2)
-            # When all coils share one drive frequency (single-freq OPM case),
-            # compute_chpi_amplitudes fits one 33 Hz GLM component and spreads
-            # it identically across all n_coil rows — every row is the same
-            # spatial pattern.  The correct slope for the *active* coil in
-            # this window is always row 0 (any row would give the same result).
-            # When coils have distinct frequencies (MEGIN/Elekta case), row
-            # `index` selects the component tuned to that coil's frequency.
-            n_unique_freqs = len(set(hpi_freqs))
-            slope_row = 0 if n_unique_freqs == 1 else index
-            slope[index, :] = coil_amplitudes['slopes'][0][slope_row]
+                    for ii in range(n_hpis)
+                ],
+                coord_trans=Transform("meg", "head"),
+            )
+        ]
 
+    assert len(coil_amplitudes["times"]) == 1
+    coil_amplitudes['slopes'] = np.zeros((1,slope.shape[0],slope.shape[1]))
+    coil_amplitudes['slopes'][0] = slope
+
+    if n_hpis < 3:
+        warn(
+            f"{n_hpis:d} HPIs active. At least 3 needed to perform"
+            "head localization\n *NO* head localization performed"
+        )  
+        
     # ------------------------------------------------------------------
     # Inject accumulated slope back into coil_amplitudes.
     # Also copy the HPI subsystem metadata from the last loop iteration's
     # `raw` onto `raw_orig` so compute_chpi_locs can find hpi_results,
     # hpi_subsystem, hpi_meas, and line_freq on the info it will be called with.
     # ------------------------------------------------------------------
-    assert len(coil_amplitudes["times"]) == 1  # noqa: F821
-    coil_amplitudes['slopes'][0] = slope
 
     with raw_orig.info._unlock():
         raw_orig.info['hpi_subsystem'] = raw.info.get('hpi_subsystem')
@@ -293,7 +426,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float | None = None,
-            landmark_weight: float = 1.0) -> dict:
+            landmark_weight: float = 1.0, optim: str = "none") -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
     the device-to-head transform.
@@ -488,7 +621,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             message='HPI consistency of isotrak and hpifit is poor',
             category=RuntimeWarning,
         )
-        coil_locs = compute_chpi_locs(raw_orig.info, coil_amplitudes)
+        coil_locs = compute_chpi_opm_locs(raw_orig.info, coil_amplitudes)
 
     hpi_dev  = np.array(coil_locs['rrs'][0])
     hpi_gofs = np.array(coil_locs['gofs'][0])
@@ -504,17 +637,9 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # frequency (sequential OPM case).  hpifreq is always a scalar here,
     # so check whether the coil_amplitudes hpi_freqs array has >1 unique
     # value — if so the caller somehow configured distinct freqs.
-    _amp_hpi_freqs = [
-        c['coil_freq']
-        for hm in raw_orig.info.get('hpi_meas', [])
-        for c in hm.get('hpi_coils', [])
-    ]
-    n_unique_freqs = len(set(_amp_hpi_freqs)) if _amp_hpi_freqs else 1
-    if gof_limit is None:
-        gof_limit = 0.98 if n_unique_freqs > 1 else 0.90
+    gof_limit = 0.95
     print(f'GOF threshold: {gof_limit:.2f} '
-          f'({"distinct" if n_unique_freqs > 1 else "single"}-frequency, '
-          f'{"auto" if gof_limit in (0.98, 0.90) else "user-supplied"})')
+          f'{"auto" if gof_limit in 0.95 else "user-supplied"})')
     include_hpis = hpi_gofs >= gof_limit
 
     dev_pts  = hpi_dev[include_hpis]       # fitted positions, device frame
@@ -526,100 +651,17 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             f"rigid transform. Redo the HPI recording."
         )
     n_pol    = len(hpi_orig_head)
+    
+    # Find matching coils in fits and polhemus by finding closest points 
+    # between the two. This is taking advantage of the fact that we know that 
+    # HEDSCAN device coordiantes are similar to head coordinates and transform 
+    # will entail small rotations (<< 90°).
+    tree = cKDTree(hpi_dig-hpi_dig.mean(axis=0)) # shift points to centroid to avoid problems with bad coil placement
+    distances, tree_indices = tree.query(hpi_dev[include_hpis]-hpi_dev[include_hpis].mean(axis=0)) # find closest points
 
-    # ------------------------------------------------------------------
-    # Coil-to-polhemus assignment via exhaustive permutation search.
-    #
-    # The KDTree approach (nearest-neighbour in head frame queried with
-    # device-frame coordinates) is incorrect because the two sets live in
-    # different coordinate systems — the transform is not yet known.
-    # Instead, try every injective mapping of the n_inc included fitted
-    # coils onto n_pol polhemus points, fit a rigid transform for each,
-    # and keep the mapping that minimises the total post-transform residual.
-    # With n_inc ≤ 4 and n_pol ≤ 4 this is at most 24 permutations.
-    #
-    # Two-pass algorithm:
-    #   Pass 1 (coarse, HPI only) — select the best permutation and coarse
-    #           transform using only HPI residuals (existing behaviour).
-    #   Pass 2 (refined, HPI + landmarks) — use the Pass-1 transform to
-    #           estimate device-frame landmark positions, then re-fit with
-    #           the combined point set to refine the transform.  When
-    #           landmark_weight > 0 and n_pol > n_inc, also re-score all
-    #           permutations using the landmark constraint so that a
-    #           near-symmetric coil geometry cannot produce a wrong mapping.
-    # ------------------------------------------------------------------
-
-    lm_head = np.array([nasion_head, lpa_head, rpa_head])
-    lm_dev  = None  # set after permutation selection when landmark_weight > 0
-
-    def _apply_t(T, pts):
-        return (T[:3, :3] @ pts.T).T + T[:3, 3]
-
-    # --- Permutation selection: HPI-only fit + headshape-centroid orientation prior
-    #
-    # With near-coplanar coils the HPI Procrustes is underdetermined in yaw, so
-    # two permutations can have similar HPI residuals but differ by ~180°.
-    #
-    # The disambiguating prior: when extra_pts (headshape) are available, map
-    # them into device frame via T_inv and check that their centroid z lies on
-    # the same side as the HPI coil centroid z.  Both scalp and coils sit on
-    # the head, so in ANY device frame they must share the same gross z sign.
-    # A permutation that puts the scalp centroid on the *opposite* z side from
-    # the coils is physically impossible and receives a large penalty.
-    #
-    # This is non-circular: the headshape points are independent of the HPI
-    # coils and of any landmark round-trip.  The prior acts only as a tie-
-    # breaker; when HPI residuals differ substantially (>5 mm) it has no
-    # effect.
-    #
-    # Score = HPI_residual + landmark_weight * headshape_orientation_penalty
-
-    # Expected sign: the coils (in dev frame, as given) cluster at a certain z.
-    # dev_pts are the measured device-frame coil positions — their centroid z
-    # tells us which side of the device the head is on.
-    dev_centroid_z = float(dev_pts[:, 2].mean())
-
-    # extra_pts_head is already in head frame (computed above in either branch).
-    _ep = np.asarray(extra_pts_head) if extra_pts_head is not None else np.empty((0, 3))
-    extra_head = _ep if (landmark_weight > 0.0 and _ep.shape[0] >= 3) else None
-
-    best_score  = np.inf
-    best_trans  = None
-    best_perm   = None
-
-    for perm in itertools.permutations(range(n_pol), n_inc):
-        perm = list(perm)
-        pol_pts = hpi_orig_head[perm]
-        try:
-            quat, _ = _fit_matched_points(dev_pts, pol_pts)
-        except Exception:
-            continue
-        t_cand = _quat_to_affine(quat)
-
-        # HPI residual: sum of per-coil distances after transform
-        fitted_head = _apply_t(t_cand, dev_pts)
-        hpi_res = float(np.sum(np.linalg.norm(pol_pts - fitted_head, axis=1)))
-
-        score = hpi_res
-        if extra_head is not None:
-            # Map headshape centroid to device frame via T_inv.
-            t_inv = np.linalg.inv(t_cand)
-            extra_centroid_head = extra_head.mean(axis=0)
-            extra_centroid_dev  = _apply_t(t_inv, extra_centroid_head[np.newaxis])[0]
-            # Penalty: headshape centroid must be on the SAME z-side as the
-            # HPI coils.  If it crosses to the opposite side, apply a penalty
-            # proportional to how far it is on the wrong side.
-            z_wrong = -extra_centroid_dev[2] * np.sign(dev_centroid_z)
-            orientation_penalty = float(max(0.0, z_wrong))
-            score += landmark_weight * orientation_penalty
-
-        if score < best_score:
-            best_score  = score
-            best_trans  = t_cand
-            best_perm   = perm
-
-    tree_indices      = np.array(best_perm)
-    dev_to_head_trans = Transform(fro="meg", to="head", trans=best_trans)
+    # Calculate transform
+    trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_dig[tree_indices])[0])
+    dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
 
     # Compute per-coil residuals (single source of truth — used for both
     # the diagnostic print below and the stored 'dist' in the return dict).
@@ -636,7 +678,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
               f'[{pol_pos[0]:.1f},{pol_pos[1]:.1f},{pol_pos[2]:.1f}] mm  '
               f'post-fit dist={dist[rank]*1000:.1f} mm')
 
-    _DIST_WARN_MM = 15.0
+    _DIST_WARN_MM = 10.0
     if np.any(dist * 1000 > _DIST_WARN_MM):
         bad = [hpi_names[incl_idx[i]]
                for i in range(len(dist)) if dist[i] * 1000 > _DIST_WARN_MM]
@@ -675,6 +717,47 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         )
         for ch_i, pol_i in zip(incl_idx, tree_indices)
     ])
+    
+    if optim == 'rigid':
+        # Optimize transform
+        bounds = [
+            (-np.deg2rad(5), np.deg2rad(10)),   # rx
+            (-np.deg2rad(5), np.deg2rad(10)),   # ry
+            (-np.deg2rad(5), np.deg2rad(10)),   # rz
+            (-0.005, 0.005),                   # tx 5 mm
+            (-0.005, 0.005),                   # ty
+            (-0.005, 0.005),                   # tz
+        ]
+        result = minimize(
+            objective,
+            x0=np.zeros(6),
+            method="L-BFGS-B",
+            bounds=bounds,
+        )
+        opt_trans = perturb_transform(
+            dev_to_head_trans,
+            result.x,
+        )
+        dev_to_head_trans = opt_trans
+        
+        raw_for_topomap = raw_orig.copy()
+        raw_for_topomap.pick(picks=['meg'], exclude='bads')
+        cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
+        whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
+        meg_coils   = _concatenate_coils(
+            _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
+        )
+        head2dev    = invert_transform(dev_to_head_trans)
+        incl_idx    = np.where(include_hpis)[0]
+        pol_gofs    = np.array([
+            _gof_at_fixed_pos(
+                slope[ch_i],
+                apply_trans(head2dev, hpi_orig_head[pol_i]),
+                whitener,
+                meg_coils,
+            )
+            for ch_i, pol_i in zip(incl_idx, tree_indices)
+        ])
 
     return {
         'dev_to_head_trans': dev_to_head_trans,

@@ -354,6 +354,15 @@ def _parse_args():
     parser.add_argument('--detailed', action='store_true',
                         help='Show full diagnostics in --hpi + --pol mode '
                              '(sensor count, inter-coil distance table, pol-GOFs).')
+    parser.add_argument('--optimization', choices=['none', 'rigid'],
+                        default='none',metavar='METHOD',
+                        help=(
+                            'Optimization method applied after the initial HPI→Polhemus '
+                            'coregistration. '
+                            '"none": no refinement (default). '
+                            '"rigid": refine with rigid transform of polhemus '
+                            'locations by minimizing the summed dipole RV.'
+                        ))
     return parser.parse_args()
 
 
@@ -880,7 +889,7 @@ def main():
     if hpi_file and pol_file:
         # Full coregistration
         try:
-            fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof)
+            fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof, optim=args.optimization)
             diag = compute_fit_diagnostics(fit)
             _print_diagnostics_full(fit, detailed=detailed, diag=diag)
             _build_figure_full(fit, detailed=detailed, diag=diag)
