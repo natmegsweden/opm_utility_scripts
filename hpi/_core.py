@@ -39,18 +39,20 @@ def _load_heavy_deps():
     from scipy.signal import find_peaks
     from scipy.spatial.transform import Rotation
     from scipy.optimize import minimize
+    from mne import Info, pick_info
     from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
-    from mne._fiff.pick import pick_types
+    from mne._fiff.pick import pick_types, pick_channels
     from mne.chpi import (
         compute_chpi_amplitudes,
-        compute_chpi_locs,
-        compute_chpi_opm_locs,
         compute_whitener,
         make_ad_hoc_cov,
         _concatenate_coils,
         _create_meg_coils,
         _magnetic_dipole_field_vec,
         _magnetic_dipole_delta,
+        _get_hpi_initial_fit,
+        _check_chpi_param,
+        _fit_magnetic_dipole
     )
     from mne.io.constants import FIFF
     from mne.transforms import (
@@ -62,7 +64,10 @@ def _load_heavy_deps():
         combine_transforms,
         invert_transform,
     )
-    from mne.utils import warn
+    from mne.bem import ConductorModel
+    from mne.dipole import _make_guesses
+    from mne.utils import warn, ProgressBar, _check_option, _validate_type
+    from mne.utils.check import _verbose_safe_false
     from ..channels import find_zero_location_channels, get_hpi_output_channels
 
     globals().update(dict(
@@ -71,7 +76,6 @@ def _load_heavy_deps():
         _make_dig_points=_make_dig_points,
         pick_types=pick_types,
         compute_chpi_amplitudes=compute_chpi_amplitudes,
-        compute_chpi_locs=compute_chpi_locs,
         compute_whitener=compute_whitener,
         make_ad_hoc_cov=make_ad_hoc_cov,
         _concatenate_coils=_concatenate_coils,
@@ -91,11 +95,34 @@ def _load_heavy_deps():
     ))
     _HEAVY_LOADED = True
 
+def _make_opm_guesses(meg_coils):
+    _load_heavy_deps()
+    R = np.linalg.norm(meg_coils[0], axis=1).max()
+
+    sphere = ConductorModel(
+        layers=[dict(rad=R)],
+        r0=np.zeros(3),
+        is_sphere=True,
+    )
+
+    guesses = _make_guesses(
+        sphere,
+        0.002,
+        0.0,
+        0.001,
+    )[0]["rr"]
+
+    guesses = guesses[
+        np.linalg.norm(guesses, axis=1)
+        <= np.linalg.norm(meg_coils[0], axis=1).min()
+    ]
+
+    return guesses
 
 def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
     """Evaluate dipole GOF at a *fixed* device-space position.
 
-    Unlike the floating-dipole fit in ``compute_chpi_locs``, this does not
+    Unlike the floating-dipole fit in ``compute_chpi_opm_locs``, this does not
     optimise the position — it evaluates how well a dipole *at ``pos_dev``*
     explains the measured field pattern ``slope_row``.
 
@@ -232,6 +259,152 @@ def find_bads(reffile):
     
     return bad_chs
 
+def compute_chpi_opm_locs(
+    info,
+    chpi_amplitudes,
+    t_step_max=1.0,
+    too_close="raise",
+    adjust_dig=False,
+    *,
+    verbose=None,
+):
+    """Compute locations of each cHPI coils over time.
+
+    Parameters
+    ----------
+    %(info_not_none)s
+    %(chpi_amplitudes)s
+        Typically obtained by :func:`mne.chpi.compute_chpi_amplitudes`.
+    t_step_max : float
+        Maximum time step to use.
+    too_close : str
+        How to handle HPI positions too close to the sensors,
+        can be ``'raise'`` (default), ``'warning'``, or ``'info'``.
+    %(adjust_dig_chpi)s
+    %(verbose)s
+
+    Returns
+    -------
+    %(chpi_locs)s
+
+    See Also
+    --------
+    compute_chpi_amplitudes
+    compute_head_pos
+    read_head_pos
+    write_head_pos
+    extract_chpi_locs_ctf
+
+    Notes
+    -----
+    This function is designed to take the output of
+    :func:`mne.chpi.compute_chpi_amplitudes` and:
+
+    1. Get HPI coil locations (as digitized in ``info['dig']``) in head coords.
+    2. If the amplitudes are 98%% correlated with last position
+       (and Δt < t_step_max), skip fitting.
+    3. Fit magnetic dipoles using the amplitudes for each coil frequency.
+
+    The number of fitted points ``n_pos`` will depend on the velocity of head
+    movements as well as ``t_step_max`` (and ``t_step_min`` from
+    :func:`mne.chpi.compute_chpi_amplitudes`).
+
+    .. versionadded:: 0.20
+    """
+    _load_heavy_deps()
+    # Set up magnetic dipole fits
+    _check_option("too_close", too_close, ["raise", "warning", "info"])
+    _check_chpi_param(chpi_amplitudes, "chpi_amplitudes")
+    _validate_type(info, Info, "info")
+    _validate_type(info["dev_head_t"], Transform, "info['dev_head_t']")
+    sin_fits = chpi_amplitudes  # use the old name below
+    del chpi_amplitudes
+    proj = sin_fits["proj"]
+    meg_picks = pick_channels(info["ch_names"], proj["data"]["col_names"], ordered=True)
+    info = pick_info(info, meg_picks)  # makes a copy
+    with info._unlock():
+        info["projs"] = [proj]
+    del meg_picks, proj
+    meg_coils = _concatenate_coils(_create_meg_coils(info["chs"], "accurate"))
+
+    # Set up external model for interference suppression
+    safe_false = _verbose_safe_false()
+    cov = make_ad_hoc_cov(info, verbose=safe_false)
+    whitener, _ = compute_whitener(cov, info, verbose=safe_false)
+
+    # Make location guesses
+    guesses = _make_opm_guesses(meg_coils)
+    R = np.linalg.norm(meg_coils[0], axis=1).max()
+    
+    fwd = _magnetic_dipole_field_vec(guesses, meg_coils, too_close)
+    fwd = np.dot(fwd, whitener.T)
+    fwd.shape = (guesses.shape[0], 3, -1)
+    fwd = np.linalg.svd(fwd, full_matrices=False)[2]
+    guesses = dict(rr=guesses, whitened_fwd_svd=fwd)
+    del fwd, R
+
+    iter_ = list(zip(sin_fits["times"], sin_fits["slopes"]))
+    chpi_locs = dict(times=[], rrs=[], gofs=[], moments=[])
+    # setup last iteration structure
+    hpi_dig_dev_rrs = apply_trans(
+        invert_transform(info["dev_head_t"])["trans"],
+        _get_hpi_initial_fit(info, adjust=adjust_dig),
+    )
+    last = dict(
+        sin_fit=None,
+        coil_fit_time=sin_fits["times"][0] - 1,
+        coil_dev_rrs=hpi_dig_dev_rrs,
+    )
+    n_hpi = len(hpi_dig_dev_rrs)
+    del hpi_dig_dev_rrs
+    for fit_time, sin_fit in ProgressBar(iter_, mesg="cHPI locations "):
+        # skip this window if bad
+        if not np.isfinite(sin_fit).all():
+            continue
+
+        # check if data has sufficiently changed
+        if last["sin_fit"] is not None:  # first iteration
+            corrs = np.array(
+                [np.corrcoef(s, lst)[0, 1] for s, lst in zip(sin_fit, last["sin_fit"])]
+            )
+            corrs *= corrs
+            # check to see if we need to continue
+            if (
+                fit_time - last["coil_fit_time"] <= t_step_max - 1e-7
+                and (corrs > 0.98).sum() >= 3
+            ):
+                # don't need to refit data
+                continue
+
+        # update 'last' sin_fit *before* inplace sign mult
+        last["sin_fit"] = sin_fit.copy()
+
+        #
+        # 2. Fit magnetic dipole for each coil to obtain coil positions
+        #    in device coordinates
+        #
+        coil_fits = [
+            _fit_magnetic_dipole(f, x0, too_close, whitener, meg_coils, guesses)
+            for f, x0 in zip(sin_fit, last["coil_dev_rrs"])
+        ]
+        rrs, gofs, moments = zip(*coil_fits)
+        chpi_locs["times"].append(fit_time)
+        chpi_locs["rrs"].append(rrs)
+        chpi_locs["gofs"].append(gofs)
+        chpi_locs["moments"].append(moments)
+        last["coil_fit_time"] = fit_time
+        last["coil_dev_rrs"] = rrs
+    n_times = len(chpi_locs["times"])
+    shapes = dict(
+        times=(n_times,),
+        rrs=(n_times, n_hpi, 3),
+        gofs=(n_times, n_hpi),
+        moments=(n_times, n_hpi, 3),
+    )
+    for key, val in chpi_locs.items():
+        chpi_locs[key] = np.array(val, float).reshape(shapes[key])
+    return chpi_locs
+
 def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     """
     Load an HPI recording and estimate per-coil dipole positions and GOFs.
@@ -260,10 +433,10 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             Accumulated amplitude slope matrix.
         ``raw_orig`` : mne.io.Raw
             The resampled raw with HPI subsystem metadata set.
-            Caller must embed ``dig`` before calling ``compute_chpi_locs``.
+            Caller must embed ``dig`` before calling ``compute_chpi_opm_locs``.
         ``coil_amplitudes`` : dict
             The ``compute_chpi_amplitudes`` result with the accumulated
-            slope matrix injected.  Pass this to ``compute_chpi_locs``
+            slope matrix injected.  Pass this to ``compute_chpi_opm_locs``
             after embedding proper dig points into ``raw_orig.info``.
     """
     _load_heavy_deps()
@@ -294,7 +467,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     # Always resample to the internal fitting frequency.
     raw.load_data().resample(_HPI_FIT_SFREQ)
 
-    # Seed dev_head_t with identity so compute_chpi_locs searches in
+    # Seed dev_head_t with identity so compute_chpi_opm_locs searches in
     # device coordinates (correct — we have not computed the transform yet).
     raw.info.update(dev_head_t=Transform("meg", "head"))
 
@@ -405,7 +578,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     # ------------------------------------------------------------------
     # Inject accumulated slope back into coil_amplitudes.
     # Also copy the HPI subsystem metadata from the last loop iteration's
-    # `raw` onto `raw_orig` so compute_chpi_locs can find hpi_results,
+    # `raw` onto `raw_orig` so compute_chpi_opm_locs can find hpi_results,
     # hpi_subsystem, hpi_meas, and line_freq on the info it will be called with.
     # ------------------------------------------------------------------
 
@@ -547,7 +720,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Guard: polhemus HPI count must cover the active coils.
     # If the dig has fewer positions than active coils the fit will crash
-    # with a shape mismatch in compute_chpi_locs.  Surface this clearly.
+    # with a shape mismatch in compute_chpi_opm_locs.  Surface this clearly.
     # ------------------------------------------------------------------
     n_pol_hpi = len(hpi_orig)
     n_active  = len(hpi_indices)
