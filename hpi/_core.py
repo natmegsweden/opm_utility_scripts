@@ -37,6 +37,8 @@ def _load_heavy_deps():
     import mne
     import numpy as np
     from scipy.signal import find_peaks
+    from scipy.spatial.transform import Rotation
+    from scipy.optimize import minimize
     from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
     from mne._fiff.pick import pick_types
     from mne.chpi import (
@@ -56,7 +58,8 @@ def _load_heavy_deps():
         _fit_matched_points,
         _quat_to_affine,
         apply_trans,
-        get_ras_to_neuromag_trans,
+        get_ras_to_neuromag_trans,     
+        combine_transforms,
         invert_transform,
     )
     from mne.utils import warn
@@ -122,6 +125,37 @@ def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
     fwd = _magnetic_dipole_field_vec(pos_dev[np.newaxis], meg_coils, 'info')
     residual, *_ = _magnetic_dipole_delta(fwd, whitener, B, B2)
     return float(1.0 - residual / B2)
+
+def perturb_transform(T0, params):
+    rvec = params[:3]
+    tvec = params[3:]
+    R = Rotation.from_rotvec(rvec).as_matrix()
+    delta = np.eye(4)
+    delta[:3, :3] = R
+    delta[:3, 3] = tvec
+    T = delta @ T0["trans"]
+    return Transform(
+        fro=T0["from"],
+        to=T0["to"],
+        trans=T,
+    )
+
+def mean_gof(params):
+    trans = perturb_transform(dev_to_head_trans, params)
+    head2dev = invert_transform(trans)
+    gofs = np.array([
+        _gof_at_fixed_pos(
+            slope[ch_i],
+            apply_trans(head2dev, hpi_dig[pol_i]),
+            whitener,
+            meg_coils,
+        )
+        for ch_i, pol_i in zip(incl_idx, indices)
+    ])
+    return gofs.mean()
+
+def objective(params):
+    return -mean_gof(params)
 
 def find_bads(reffile):
     _load_heavy_deps()
@@ -392,7 +426,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float | None = None,
-            landmark_weight: float = 1.0) -> dict:
+            landmark_weight: float = 1.0, optim: str = "none") -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
     the device-to-head transform.
@@ -683,6 +717,47 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         )
         for ch_i, pol_i in zip(incl_idx, tree_indices)
     ])
+    
+    if optim == 'rigid':
+        # Optimize transform
+        bounds = [
+            (-np.deg2rad(5), np.deg2rad(10)),   # rx
+            (-np.deg2rad(5), np.deg2rad(10)),   # ry
+            (-np.deg2rad(5), np.deg2rad(10)),   # rz
+            (-0.005, 0.005),                   # tx 5 mm
+            (-0.005, 0.005),                   # ty
+            (-0.005, 0.005),                   # tz
+        ]
+        result = minimize(
+            objective,
+            x0=np.zeros(6),
+            method="L-BFGS-B",
+            bounds=bounds,
+        )
+        opt_trans = perturb_transform(
+            dev_to_head_trans,
+            result.x,
+        )
+        dev_to_head_trans = opt_trans
+        
+        raw_for_topomap = raw_orig.copy()
+        raw_for_topomap.pick(picks=['meg'], exclude='bads')
+        cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
+        whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
+        meg_coils   = _concatenate_coils(
+            _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
+        )
+        head2dev    = invert_transform(dev_to_head_trans)
+        incl_idx    = np.where(include_hpis)[0]
+        pol_gofs    = np.array([
+            _gof_at_fixed_pos(
+                slope[ch_i],
+                apply_trans(head2dev, hpi_orig_head[pol_i]),
+                whitener,
+                meg_coils,
+            )
+            for ch_i, pol_i in zip(incl_idx, tree_indices)
+        ])
 
     return {
         'dev_to_head_trans': dev_to_head_trans,
