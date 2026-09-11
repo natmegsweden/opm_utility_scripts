@@ -2,9 +2,9 @@
 Unified HPI coregistration entry point.
 
 Handles both single-file and multi-file cases through one script.
-Any argument not supplied on the command line falls back to a GUI dialog,
-so the script works fully non-interactively, fully interactively, or anywhere
-in between.
+Any argument not supplied on the command line falls back to an interactive
+CLI prompt, so the script works fully non-interactively, fully
+interactively, or anywhere in between.
 
 Usage (fully non-interactive)::
 
@@ -16,7 +16,7 @@ Usage (fully non-interactive)::
         --sfreq 1000 \\
         --save --overwrite --plot
 
-Usage (fully interactive — GUI dialogs for everything)::
+Usage (fully interactive — CLI prompts for everything)::
 
     python -m opm_utility_scripts.hpi.coregister
 """
@@ -27,11 +27,10 @@ import sys
 
 
 def _load_heavy_deps():
-    """Load scientific/GUI helpers lazily so --help returns quickly."""
+    """Load scientific helpers lazily so --help returns quickly."""
     import matplotlib.pyplot as plt
     import mne
     import numpy as np
-    from ..io import get_boolean, get_file, get_files, get_input
     from ..viz import plot_hpi_alignment
     from ._core import fit_hpi, apply_transform, save_raw
 
@@ -39,15 +38,99 @@ def _load_heavy_deps():
         plt=plt,
         mne=mne,
         np=np,
-        get_boolean=get_boolean,
-        get_file=get_file,
-        get_files=get_files,
-        get_input=get_input,
         plot_hpi_alignment=plot_hpi_alignment,
         fit_hpi=fit_hpi,
         apply_transform=apply_transform,
         save_raw=save_raw,
     ))
+
+
+# ---------------------------------------------------------------------------
+# CLI input helpers (replace the old tkinter dialogs)
+# ---------------------------------------------------------------------------
+
+def _strip_quotes(raw):
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+        return raw[1:-1]
+    return raw
+
+
+def _prompt_path(title, extensions=(), allow_blank=False):
+    """Prompt for a single existing file path. Re-prompts until valid.
+
+    When ``allow_blank`` is ``True``, an empty response returns ``None``
+    instead of re-prompting (used for genuinely optional inputs).
+    """
+    hint_parts = []
+    if extensions:
+        hint_parts.append(', '.join(extensions))
+    if allow_blank:
+        hint_parts.append('leave blank to skip')
+    hint = f' ({"; ".join(hint_parts)})' if hint_parts else ''
+    while True:
+        try:
+            raw = input(f'{title}{hint}: ').strip()
+        except EOFError:
+            return None
+        if not raw:
+            if allow_blank:
+                return None
+            print('  Please enter a path.')
+            continue
+        path = os.path.expanduser(_strip_quotes(raw))
+        if not os.path.isfile(path):
+            print(f'  File not found: {path}')
+            continue
+        return path
+
+
+def _prompt_paths(title, extensions=()):
+    """Prompt for one or more existing file paths (comma-separated).
+
+    Returns a tuple of paths, matching the shape returned by the old
+    ``filedialog.askopenfilenames`` GUI helper.
+    """
+    hint = f' ({", ".join(extensions)})' if extensions else ''
+    while True:
+        try:
+            raw = input(f'{title}{hint} [comma-separated if more than one]: ').strip()
+        except EOFError:
+            return ()
+        if not raw:
+            print('  Please enter at least one path.')
+            continue
+        candidates = [os.path.expanduser(_strip_quotes(p.strip()))
+                      for p in raw.split(',') if p.strip()]
+        missing = [p for p in candidates if not os.path.isfile(p)]
+        if missing:
+            for p in missing:
+                print(f'  File not found: {p}')
+            continue
+        return tuple(candidates)
+
+
+def _prompt_value(prompt, default):
+    """Prompt for a free-text value, returning ``default`` when left blank."""
+    try:
+        raw = input(f'{prompt} [{default}]: ').strip()
+    except EOFError:
+        return default
+    return raw or default
+
+
+def _prompt_yes_no(prompt, default=False):
+    """Prompt for a yes/no answer, returning ``default`` on blank input."""
+    default_str = 'y' if default else 'n'
+    while True:
+        try:
+            raw = input(f'{prompt} (y/n) [{default_str}]: ').strip().lower()
+        except EOFError:
+            return default
+        if not raw:
+            return default
+        if raw in ('y', 'n'):
+            return raw == 'y'
+        print("  Please enter 'y' or 'n'.")
 
 
 def _output_suffix(datfile: str, new_sfreq: float) -> str:
@@ -64,7 +147,8 @@ def _parse_args():
     p = argparse.ArgumentParser(
         prog='python -m opm_utility_scripts.hpi.coregister',
         description=(
-            'HPI coregistration.  Any omitted argument opens a GUI dialog.'
+            'HPI coregistration.  Any omitted argument prompts interactively '
+            'on the command line.'
         ),
     )
     p.add_argument(
@@ -78,6 +162,12 @@ def _parse_args():
     p.add_argument(
         '--pol', '-p', metavar='FILE',
         help='Polhemus digitisation file (.json or .fif).',
+    )
+    p.add_argument(
+        '--reffile', '-r', metavar='FILE', default=None,
+        help='Optional reference recording (e.g. resting state) used for '
+             'background-power-based noisy channel detection '
+             '(default: skip this step).',
     )
     p.add_argument(
         '--freq', '-f', type=float, default=None, metavar='HZ',
@@ -107,43 +197,45 @@ def main():
     _load_heavy_deps()
 
     # ----------------------------------------------------------------
-    # Resolve inputs — CLI args take priority; fall back to GUI dialogs
+    # Resolve inputs — CLI args take priority; fall back to interactive
+    # command-line prompts for anything not supplied.
     # ----------------------------------------------------------------
-    need_gui = not all([args.data, args.hpi, args.pol,
-                        args.freq is not None, args.sfreq is not None])
-    root = None
-    if need_gui:
-        import tkinter as tk
-        root = tk.Tk()
-        root.withdraw()
+    need_prompts = not all([args.data, args.hpi, args.pol,
+                            args.freq is not None, args.sfreq is not None])
 
-    datafiles = args.data or get_files("Select data file(s)")
-    hpifile   = args.hpi  or get_file("Select HPI file")
-    polfile   = args.pol  or get_file("Select Polhemus file")
+    datafiles = args.data or _prompt_paths("Select data file(s)", extensions=('.fif',))
+    hpifile   = args.hpi  or _prompt_path("Select HPI file", extensions=('.fif',))
+    polfile   = args.pol  or _prompt_path("Select Polhemus file", extensions=('.json', '.fif'))
+
+    # Reference file is genuinely optional — only asked interactively (with
+    # a blank-to-skip option), never forced.
+    reffile = args.reffile
+    if reffile is None and need_prompts:
+        reffile = _prompt_path(
+            "Reference file for noisy-channel detection",
+            extensions=('.fif',), allow_blank=True,
+        )
 
     hpifreq   = args.freq  if args.freq  is not None \
-                else float(get_input("HPI frequency (Hz):", "33"))
+                else float(_prompt_value("HPI frequency (Hz)", "33"))
     new_sfreq = args.sfreq if args.sfreq is not None \
-                else float(get_input("Downsampling frequency (Hz):", "1000"))
+                else float(_prompt_value("Downsampling frequency (Hz)", "1000"))
 
     # Save / overwrite / plot: if any of the three flags were given on the CLI,
-    # use all CLI values directly.  Only ask interactively when a GUI is open
-    # (i.e. at least one file/freq arg was missing) and no flags were provided.
+    # use all CLI values directly.  Only ask interactively when prompts were
+    # needed above (i.e. at least one file/freq arg was missing) and no flags
+    # were provided.
     any_flags = args.save or args.overwrite or args.plot
     if any_flags:
         doSave     = args.save
         overwrite  = args.overwrite
         plotResult = args.plot
-    elif root is not None:
-        doSave     = get_boolean("Save result to disk? (default: no)")
-        overwrite  = get_boolean("Overwrite existing files? (default: no)") if doSave else False
-        plotResult = get_boolean("Plot alignment? (default: no)")
+    elif need_prompts:
+        doSave     = _prompt_yes_no("Save result to disk?", default=False)
+        overwrite  = _prompt_yes_no("Overwrite existing files?", default=False) if doSave else False
+        plotResult = _prompt_yes_no("Plot alignment?", default=False)
     else:
         doSave = overwrite = plotResult = False
-
-    if root is not None:
-        root.quit()
-        root.destroy()
 
     if not datafiles or not hpifile or not polfile:
         print("ERROR: data file(s), HPI file, and Polhemus file are all required.")
@@ -152,6 +244,7 @@ def main():
     print(f"Data file(s): {datafiles}")
     print(f"HPI file:     {hpifile}")
     print(f"Polhemus:     {polfile}")
+    print(f"Reference:    {reffile if reffile else '(none — skipping noisy channel detection)'}")
     print(f"Frequency:    {hpifreq} Hz")
     print(f"Target sfreq: {new_sfreq} Hz")
     print(f"Save:         {doSave}{'  (overwrite)' if overwrite else ''}")
@@ -160,7 +253,7 @@ def main():
     # ----------------------------------------------------------------
     # Fit HPI coils (shared across all data files)
     # ----------------------------------------------------------------
-    fit = fit_hpi(hpifile, polfile, hpifreq)
+    fit = fit_hpi(hpifile, polfile, hpifreq, reffile=reffile)
 
     hpi_names       = fit['hpi_names']
     hpi_dev         = fit['hpi_dev']

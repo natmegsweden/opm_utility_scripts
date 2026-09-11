@@ -21,82 +21,49 @@ import itertools
 import os
 import warnings
 
+import matplotlib.pyplot as plt
+import mne
+import numpy as np
+from scipy.signal import find_peaks
+from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
+from scipy.optimize import minimize
+from mne import Info, pick_info
+from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
+from mne._fiff.pick import pick_types, pick_channels
+from mne.chpi import (
+    compute_chpi_amplitudes,
+    compute_whitener,
+    make_ad_hoc_cov,
+    _concatenate_coils,
+    _create_meg_coils,
+    _magnetic_dipole_field_vec,
+    _magnetic_dipole_delta,
+    _get_hpi_initial_fit,
+    _check_chpi_param,
+    _fit_magnetic_dipole,
+)
+from mne.io.constants import FIFF
+from mne.transforms import (
+    Transform,
+    _fit_matched_points,
+    _quat_to_affine,
+    apply_trans,
+    get_ras_to_neuromag_trans,
+    combine_transforms,
+    invert_transform,
+)
+from mne.bem import ConductorModel
+from mne.dipole import _make_guesses
+from mne.utils import warn, ProgressBar, _check_option, _validate_type
+from mne.utils.check import _verbose_safe_false
+from ..channels import find_zero_location_channels, get_hpi_output_channels
+
 # Sampling frequency used internally for HPI fitting (always resample to
 # this before running the amplitude estimation loop).
 _HPI_FIT_SFREQ = 1000
 
-_HEAVY_LOADED = False
-
-
-def _load_heavy_deps():
-    """Load the scientific stack lazily on first use."""
-    global _HEAVY_LOADED
-    if _HEAVY_LOADED:
-        return
-    import matplotlib.pyplot as plt
-    import mne
-    import numpy as np
-    from scipy.signal import find_peaks
-    from scipy.spatial.transform import Rotation
-    from scipy.optimize import minimize
-    from mne import Info, pick_info
-    from mne._fiff._digitization import _call_make_dig_points, _make_dig_points
-    from mne._fiff.pick import pick_types, pick_channels
-    from mne.chpi import (
-        compute_chpi_amplitudes,
-        compute_whitener,
-        make_ad_hoc_cov,
-        _concatenate_coils,
-        _create_meg_coils,
-        _magnetic_dipole_field_vec,
-        _magnetic_dipole_delta,
-        _get_hpi_initial_fit,
-        _check_chpi_param,
-        _fit_magnetic_dipole
-    )
-    from mne.io.constants import FIFF
-    from mne.transforms import (
-        Transform,
-        _fit_matched_points,
-        _quat_to_affine,
-        apply_trans,
-        get_ras_to_neuromag_trans,     
-        combine_transforms,
-        invert_transform,
-    )
-    from mne.bem import ConductorModel
-    from mne.dipole import _make_guesses
-    from mne.utils import warn, ProgressBar, _check_option, _validate_type
-    from mne.utils.check import _verbose_safe_false
-    from ..channels import find_zero_location_channels, get_hpi_output_channels
-
-    globals().update(dict(
-        plt=plt, mne=mne, np=np, find_peaks=find_peaks,
-        _call_make_dig_points=_call_make_dig_points,
-        _make_dig_points=_make_dig_points,
-        pick_types=pick_types,
-        compute_chpi_amplitudes=compute_chpi_amplitudes,
-        compute_whitener=compute_whitener,
-        make_ad_hoc_cov=make_ad_hoc_cov,
-        _concatenate_coils=_concatenate_coils,
-        _create_meg_coils=_create_meg_coils,
-        _magnetic_dipole_field_vec=_magnetic_dipole_field_vec,
-        _magnetic_dipole_delta=_magnetic_dipole_delta,
-        FIFF=FIFF,
-        Transform=Transform,
-        _fit_matched_points=_fit_matched_points,
-        _quat_to_affine=_quat_to_affine,
-        apply_trans=apply_trans,
-        get_ras_to_neuromag_trans=get_ras_to_neuromag_trans,
-        invert_transform=invert_transform,
-        warn=warn,
-        find_zero_location_channels=find_zero_location_channels,
-        get_hpi_output_channels=get_hpi_output_channels,
-    ))
-    _HEAVY_LOADED = True
-
 def _make_opm_guesses(meg_coils):
-    _load_heavy_deps()
     R = np.linalg.norm(meg_coils[0], axis=1).max()
 
     sphere = ConductorModel(
@@ -144,7 +111,7 @@ def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
     float
         GOF in [0, 1].  Returns ``nan`` if signal power is negligible.
     """
-    _load_heavy_deps()
+
     B  = np.dot(whitener, slope_row)
     B2 = float(np.dot(B, B))
     if B2 < 1e-30:
@@ -167,29 +134,33 @@ def perturb_transform(T0, params):
         trans=T,
     )
 
-def mean_gof(params):
-    trans = perturb_transform(dev_to_head_trans, params)
-    head2dev = invert_transform(trans)
-    gofs = np.array([
-        _gof_at_fixed_pos(
-            slope[ch_i],
-            apply_trans(head2dev, hpi_dig[pol_i]),
-            whitener,
-            meg_coils,
-        )
-        for ch_i, pol_i in zip(incl_idx, indices)
-    ])
-    return gofs.mean()
+def find_bads(reffile=None, hpifreq=None):
+    """Detect noisy MEG channels from a reference recording (e.g. resting state).
 
-def objective(params):
-    return -mean_gof(params)
+    Parameters
+    ----------
+    reffile : str | None
+        Path to a reference FIF recording used for background-power-based
+        outlier detection. When ``None`` (default), no reference file is
+        available and bad-channel detection is skipped entirely — an empty
+        list is returned.
+    hpifreq : float | None
+        HPI drive frequency in Hz, used only to label the diagnostic plot.
 
-def find_bads(reffile):
-    _load_heavy_deps()
+    Returns
+    -------
+    list[str]
+        Names of channels flagged as noisy. Empty when ``reffile`` is
+        ``None``.
+    """
+    if reffile is None:
+        return []
+
+    # TODO: use end snippet from HPI recording to estimate bad
     
     raw = mne.io.read_raw_fif(reffile)
     raw.load_data()
-    
+
     #remove bad-marked channels
     for bad_chan in raw.info["bads"]:
         raw.drop_channels(bad_chan)
@@ -250,7 +221,8 @@ def find_bads(reffile):
 
     ax.set_xlabel('Channel')
     ax.set_ylabel('Background PSD')
-    ax.set_title(f'Bad Channel Detection Around HPI Frequency ({hpifreq} Hz)')
+    freq_label = f'{hpifreq} Hz' if hpifreq is not None else 'unknown Hz'
+    ax.set_title(f'Bad Channel Detection Around HPI Frequency ({freq_label})')
     ax.grid(True, alpha=0.3)
     ax.legend()
 
@@ -311,7 +283,7 @@ def compute_chpi_opm_locs(
 
     .. versionadded:: 0.20
     """
-    _load_heavy_deps()
+
     # Set up magnetic dipole fits
     _check_option("too_close", too_close, ["raise", "warning", "info"])
     _check_chpi_param(chpi_amplitudes, "chpi_amplitudes")
@@ -405,7 +377,7 @@ def compute_chpi_opm_locs(
         chpi_locs[key] = np.array(val, float).reshape(shapes[key])
     return chpi_locs
 
-def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
+def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
     """
     Load an HPI recording and estimate per-coil dipole positions and GOFs.
 
@@ -419,6 +391,10 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         Path to the raw HPI recording, or a pre-loaded Raw object.
     hpifreq : float
         Drive frequency shared by all HPI coils (Hz).
+    reffile : str | None
+        Path to a reference recording (e.g. resting state) used for
+        background-power-based noisy-channel detection. Optional — when
+        ``None`` (default), this detection step is skipped.
 
     Returns
     -------
@@ -429,6 +405,11 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             HPI output channel names (from ``get_hpi_output_channels``).
         ``hpi_indices`` : list[int]
             Channel indices of the HPI output channels in ``raw_orig``.
+        ``hpi_freqs`` : np.ndarray, shape (n_coils,)
+            Drive frequency (Hz) used for each coil.  All entries are
+            currently identical (``hpifreq`` repeated) since coils are
+            fit sequentially at one shared frequency, but this is kept
+            per-coil so callers can detect distinct-frequency setups.
         ``slope`` : np.ndarray, shape (n_coils, n_meg_mag_channels)
             Accumulated amplitude slope matrix.
         ``raw_orig`` : mne.io.Raw
@@ -439,7 +420,6 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             slope matrix injected.  Pass this to ``compute_chpi_opm_locs``
             after embedding proper dig points into ``raw_orig.info``.
     """
-    _load_heavy_deps()
 
     # ------------------------------------------------------------------
     # Load HPI recording
@@ -451,12 +431,24 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     else:
         raw = hpifile
 
+    # Some acquisition systems (e.g. FieldLine OPM) write line_freq=0 to mean
+    # "no notch filter configured" instead of leaving it unset. MNE's
+    # compute_chpi_amplitudes only guards against `None` and divides by
+    # info['line_freq'] otherwise, so a literal 0 raises ZeroDivisionError
+    # in _setup_hpi_amplitude_fitting. Normalise 0 -> None here; real line
+    # frequencies (50/60 Hz) are left untouched.
+    if raw.info.get('line_freq') == 0:
+        with raw.info._unlock():
+            raw.info['line_freq'] = None
+    # TODO: Potentially set line freq manually?
+    # raw.info['line_freq'] = 50.0
+
     bads = find_zero_location_channels(raw.info)
     for bad_chan in bads:
         raw.drop_channels(bad_chan)
        
-    # Remove noisy channels
-    bads = find_bads(reffile)
+    # Remove noisy channels (skipped when no reference file is provided)
+    bads = find_bads(reffile, hpifreq)
     for i in bads:
         if i in raw.info["ch_names"]:
             raw.drop_channels(i)
@@ -528,6 +520,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         n_hpis+=1
         
     hpi_indices = hpi_indices[i_hpis]
+    hpi_freqs   = hpi_freqs[i_hpis]
 
     # Adding full hpi struct to info
     hpi_sub = dict()
@@ -591,15 +584,16 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     return {
         'hpi_names':       hpi_names,
         'hpi_indices':     hpi_indices,
+        'hpi_freqs':       hpi_freqs,
         'slope':           slope,
         'raw_orig':        raw_orig,
         'coil_amplitudes': coil_amplitudes,
     }
 
-
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float | None = None,
-            landmark_weight: float = 1.0, optim: str = "none") -> dict:
+            landmark_weight: float = 1.0, optim: str = "none",
+            reffile: str = None) -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
     the device-to-head transform.
@@ -641,6 +635,12 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
 
         * ``0.0`` — landmarks ignored; reproduces the previous HPI-only
           behaviour (useful for regression testing).
+    reffile : str | None
+        Path to a reference recording (e.g. resting state) used for
+        background-power-based noisy-channel detection during the HPI
+        amplitude-estimation stage. Optional — when ``None`` (default),
+        this detection step is skipped. Forwarded to
+        :func:`fit_hpi_amplitudes`.
         * ``1.0`` (default) — equal metre-scale contribution.
         * Higher values — stronger landmark constraint, useful when coil
           geometry is nearly symmetric and HPI residuals alone cannot
@@ -691,14 +691,14 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             digitised position does not explain the sensor data — indicating
             a polhemus digitisation error rather than an HPI recording error.
     """
-    _load_heavy_deps()
 
     # ------------------------------------------------------------------
     # Stage 1: HPI amplitude estimation (no polhemus needed)
     # ------------------------------------------------------------------
-    amp = fit_hpi_amplitudes(hpifile, hpifreq)
+    amp = fit_hpi_amplitudes(hpifile, hpifreq, reffile=reffile)
     hpi_names       = amp['hpi_names']
     hpi_indices     = amp['hpi_indices']
+    hpi_freqs       = amp['hpi_freqs']
     slope           = amp['slope']
     raw_orig        = amp['raw_orig']
     coil_amplitudes = amp['coil_amplitudes']
@@ -807,12 +807,14 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     #   0.90 — single shared frequency (OPM without SSS; lower because
     #           the absence of spatial filtering inflates the noise floor)
     # Detect single-frequency mode: all HPI coils fired at one shared
-    # frequency (sequential OPM case).  hpifreq is always a scalar here,
-    # so check whether the coil_amplitudes hpi_freqs array has >1 unique
-    # value — if so the caller somehow configured distinct freqs.
-    gof_limit = 0.95
+    # frequency (sequential OPM case) vs. distinct per-coil frequencies
+    # (e.g. a caller configured a MEGIN/Elekta-style multi-frequency setup).
+    is_auto = gof_limit is None
+    if is_auto:
+        distinct_freqs = len(set(np.asarray(hpi_freqs).tolist())) > 1
+        gof_limit = 0.98 if distinct_freqs else 0.90
     print(f'GOF threshold: {gof_limit:.2f} '
-          f'{"auto" if gof_limit in 0.95 else "user-supplied"})')
+          f'({"auto" if is_auto else "user-supplied"})')
     include_hpis = hpi_gofs >= gof_limit
 
     dev_pts  = hpi_dev[include_hpis]       # fitted positions, device frame
@@ -829,11 +831,11 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # between the two. This is taking advantage of the fact that we know that 
     # HEDSCAN device coordiantes are similar to head coordinates and transform 
     # will entail small rotations (<< 90°).
-    tree = cKDTree(hpi_dig-hpi_dig.mean(axis=0)) # shift points to centroid to avoid problems with bad coil placement
+    tree = cKDTree(hpi_orig_head-hpi_orig_head.mean(axis=0)) # shift points to centroid to avoid problems with bad coil placement
     distances, tree_indices = tree.query(hpi_dev[include_hpis]-hpi_dev[include_hpis].mean(axis=0)) # find closest points
 
     # Calculate transform
-    trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_dig[tree_indices])[0])
+    trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig_head[tree_indices])[0])
     dev_to_head_trans = Transform(fro="meg", to="head", trans=trans)
 
     # Compute per-coil residuals (single source of truth — used for both
@@ -892,7 +894,27 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     ])
     
     if optim == 'rigid':
-        # Optimize transform
+        # Optimize transform.
+        # Nested closures (not module-level) so they see fit_hpi's locals
+        # directly: dev_to_head_trans, hpi_orig_head, whitener, meg_coils,
+        # incl_idx, tree_indices, slope.
+        def mean_gof(params):
+            trans = perturb_transform(dev_to_head_trans, params)
+            head2dev = invert_transform(trans)
+            gofs = np.array([
+                _gof_at_fixed_pos(
+                    slope[ch_i],
+                    apply_trans(head2dev, hpi_orig_head[pol_i]),
+                    whitener,
+                    meg_coils,
+                )
+                for ch_i, pol_i in zip(incl_idx, tree_indices)
+            ])
+            return gofs.mean()
+
+        def objective(params):
+            return -mean_gof(params)
+
         bounds = [
             (-np.deg2rad(5), np.deg2rad(10)),   # rx
             (-np.deg2rad(5), np.deg2rad(10)),   # ry
@@ -952,7 +974,6 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'pol_gofs':     pol_gofs,
     }
 
-
 def compute_fit_diagnostics(fit):
     """Compute all derived diagnostic scalars from a :func:`fit_hpi` result.
 
@@ -984,7 +1005,6 @@ def compute_fit_diagnostics(fit):
         the same physical coil (excluded coils and unmatched polhemus
         points are omitted).
     """
-    _load_heavy_deps()
 
     R = fit['dev_to_head_trans']['trans'][:3, :3]
     t = fit['dev_to_head_trans']['trans'][:3, 3]
@@ -1025,7 +1045,6 @@ def compute_fit_diagnostics(fit):
         'intercoil_rows': intercoil_rows,
     }
 
-
 def apply_transform(
     datfile: 'str | mne.io.Raw',
     fit_result: dict,
@@ -1058,7 +1077,6 @@ def apply_transform(
     mne.io.Raw
         The transformed raw object (preloaded, not yet saved).
     """
-    _load_heavy_deps()
 
     dev_to_head_trans = fit_result['dev_to_head_trans']
     hpi_orig = fit_result['hpi_orig']
@@ -1102,7 +1120,6 @@ def apply_transform(
 
     return raw
 
-
 def save_raw(raw: mne.io.Raw, datfile: str, suffix: str, overwrite: bool = True) -> str:
     """
     Save *raw* to disk using the standard HPI output filename convention.
@@ -1130,7 +1147,6 @@ def save_raw(raw: mne.io.Raw, datfile: str, suffix: str, overwrite: bool = True)
     str
         Absolute path of the saved file.
     """
-    _load_heavy_deps()
 
     stem = os.path.splitext(os.path.basename(datfile))[0].replace('_raw', '')
     outpath = os.path.join(os.path.dirname(datfile), stem + suffix)

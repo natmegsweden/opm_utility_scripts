@@ -17,9 +17,10 @@ Both modes use the same calculation engine in ``_core.py``.
 """
 
 import argparse
+import os
 import sys
 import warnings
-
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -29,13 +30,15 @@ import warnings
 # _get_hpi_initial_fit) and MEGIN/Elekta MaxFilter convention, consistent
 # with Zetter et al. 2019 (doi:10.1038/s41598-019-41763-4) and Tierney et
 # al. 2021 (doi:10.1016/j.neuroimage.2021.118091).
-_GOF_ACCEPT     = 0.98  # per-coil fit GOF — MNE default gof_limit / good_limit
-_POL_GOF_ACCEPT = 0.90  # polhemus-position GOF threshold — lower than _GOF_ACCEPT
+_GOF_ACCEPT     = 0.98  # per-coil fit GOF acceptance threshold (matches the
+                        # gof_limit used for coil inclusion in _core.fit_hpi)
+_POL_GOF_ACCEPT = 0.98  # polhemus-position GOF threshold — lower than _GOF_ACCEPT
                         # because _gof_at_fixed_pos uses raw slopes without the
                         # SSS-like external interference projection, so values
                         # naturally run ~0.05 below the floating-dipole GOF
 _DIST_ACCEPT    = 5.0   # per-coil residual (mm) — MNE default dist_limit 0.005 m
-_MIN_COILS      = 3     # minimum coils passing both criteria
+_MIN_COILS      = 3     # minimum coils that must pass _GOF_ACCEPT to accept the
+                        # fit — e.g. 3 of 4 coils with GOF ≥ 0.98 is accepted
 
 
 def _gof_color(g):
@@ -44,18 +47,6 @@ def _gof_color(g):
     elif g >= 0.8:
         return 'darkorange'
     return 'red'
-
-
-def _is_nasion_coil(ch_name):
-    """Return True if a channel name identifies it as a nasion landmark coil.
-
-    The FieldLine system lets operators name HPI coil slots freely.  A coil
-    placed at the nasion is sometimes labelled 'Nasion' (e.g. 'hpiout_Nasion').
-    These coils sit on a bony landmark rather than on scalp, which affects
-    the dipole fit geometry and polhemus GOF; they should not trigger a REDO
-    recommendation on their own.
-    """
-    return 'nasion' in ch_name.lower()
 
 
 def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
@@ -68,18 +59,23 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
       the single-dipole model to MEG sensor data).  A poor GOF means the coil
       signal was not cleanly captured; the remedy is to **redo the HPI
       recording** (subject may have moved, coil placement or drive issue).
+      The fit is **accepted** as long as at least ``_MIN_COILS`` coils reach
+      ``_GOF_ACCEPT`` — e.g. 3 of 4 coils with GOF ≥ 0.95 is an accepted HPI
+      recording, even if the remaining coil falls short.  Coils are scored
+      identically regardless of naming (e.g. a coil labelled 'Nasion' is
+      just a placement label and is not treated specially).
 
     * **Polhemus registration quality** — measured by ``dists_mm`` (distance
       between the fitted coil position in device space, transformed to head
-      space, and the digitised coil position).  A large residual means the
-      polhemus digitisation does not match the fitted positions; the remedy is
-      to **redo the polhemus digitisation**.
-
-    Thresholds follow MNE-Python ``compute_head_pos`` defaults
-    (``gof_limit=0.98``, ``dist_limit=0.005`` m), which originate from the
-    MEGIN/Elekta MaxFilter convention and are consistent with Zetter et al.
-    2019 (doi:10.1038/s41598-019-41763-4) and Tierney et al. 2021
-    (doi:10.1016/j.neuroimage.2021.118091).
+      space, and the digitised coil position) and ``pol_gofs`` (dipole-model
+      GOF evaluated at the digitised position). A large residual or a low
+      ``pol_gof`` means the polhemus digitisation does not match the fitted
+      positions; the remedy is to **redo the polhemus digitisation**. As with
+      the HPI verdict, the fit is **accepted** as long as at least
+      ``_MIN_COILS`` coils reach ``_POL_GOF_ACCEPT`` and no distance-based
+      disagreement was flagged — e.g. 3 of 4 polhemus coordinates with GOF ≥
+      0.90 is an accepted registration, even if the remaining coil falls
+      short.
 
     Parameters
     ----------
@@ -95,14 +91,12 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
         each included coil (from ``_gof_at_fixed_pos`` in ``_core.py``).
         ``None`` in HPI-only mode.
     hpi_names : list[str] or None
-        Channel names for all coils (same length as ``hpi_gofs``).
-        When provided, coils identified as nasion-landmark coils (via
-        ``_is_nasion_coil``) are excluded from the verdict logic — they
-        are reported in the GOF table but do not trigger REDO recommendations.
+        Channel names for all coils (same length as ``hpi_gofs``). Accepted
+        for API compatibility but not used to alter scoring.
 
     Returns
     -------
-    hpi_verdict  : str   — 'OK', 'REDO HPI', or 'POOR'
+    hpi_verdict  : str   — 'OK' or 'POOR'
     hpi_color    : str
     hpi_reasons  : list[str]
     pol_verdict  : str   — 'OK', 'REDO POLHEMUS', or 'POOR' (or None in HPI-only)
@@ -110,56 +104,42 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
     pol_reasons  : list[str] (or None)
     """
     hpi_gofs = np.asarray(hpi_gofs)
-    n_coils  = len(hpi_gofs)
-
-    # Build nasion mask — coils on bony landmarks are excluded from verdicts.
-    if hpi_names is not None and len(hpi_names) == n_coils:
-        nasion_mask = np.array([_is_nasion_coil(n) for n in hpi_names])
-    else:
-        nasion_mask = np.zeros(n_coils, dtype=bool)
 
     # ------------------------------------------------------------------ #
     # Part 1 — HPI recording quality (GOF from MEG sensor data)          #
-    # Nasion-labelled coils are noted but excluded from the verdict.      #
+    # Accepted whenever at least _MIN_COILS coils meet _GOF_ACCEPT, even  #
+    # if the remaining coil(s) fall short.                                #
     # ------------------------------------------------------------------ #
     hpi_reasons = []
 
-    # Evaluate only non-nasion coils for the verdict.
-    scoreable    = ~nasion_mask
-    poor_gof_all = hpi_gofs < _GOF_ACCEPT
-    poor_gof     = poor_gof_all & scoreable
+    poor_gof = hpi_gofs < _GOF_ACCEPT
 
     if include_hpis is not None:
-        # n_good = coils that passed GOF and are not nasion
-        n_good = int(np.sum(include_hpis & scoreable))
+        n_good = int(np.sum(include_hpis))
     else:
-        n_good = int(np.sum((hpi_gofs >= _GOF_ACCEPT) & scoreable))
+        n_good = int(np.sum(hpi_gofs >= _GOF_ACCEPT))
 
     if poor_gof.any():
         hpi_reasons.append(
             f'{poor_gof.sum()} coil(s) have GOF < {_GOF_ACCEPT} '
             f'— dipole model does not fit the MEG data well'
         )
-    if nasion_mask.any() and poor_gof_all[nasion_mask].any():
+
+    if n_good >= _MIN_COILS:
+        hpi_verdict, hpi_color = 'OK', 'green'
+        if not hpi_reasons:
+            hpi_reasons = [f'All coils GOF ≥ {_GOF_ACCEPT} — HPI recording is good']
+        else:
+            hpi_reasons.append(
+                f'→ {n_good} coil(s) GOF ≥ {_GOF_ACCEPT} (need ≥ {_MIN_COILS}) — accepted'
+            )
+    else:
+        hpi_verdict, hpi_color = 'POOR', 'red'
         hpi_reasons.append(
-            f'Nasion coil(s) also have low GOF '
-            f'(noted but not used for verdict — landmark placement expected)'
-        )
-    if n_good < _MIN_COILS:
-        hpi_reasons.append(
-            f'Only {n_good} non-nasion coil(s) pass GOF threshold '
+            f'Only {n_good} coil(s) pass GOF threshold '
             f'(need ≥ {_MIN_COILS} for a valid transform)'
         )
-
-    if not hpi_reasons:
-        hpi_verdict, hpi_color = 'OK', 'green'
-        hpi_reasons = [f'All coils GOF ≥ {_GOF_ACCEPT} — HPI recording is good']
-    elif n_good < _MIN_COILS:
-        hpi_verdict, hpi_color = 'POOR', 'red'
         hpi_reasons.append('→ Redo HPI recording (check coil drive and subject movement)')
-    else:
-        hpi_verdict, hpi_color = 'REDO HPI', 'darkorange'
-        hpi_reasons.append('→ Consider redoing HPI recording (subject movement or coil issue)')
 
     # ------------------------------------------------------------------ #
     # Part 2 — Polhemus registration quality                             #
@@ -175,24 +155,16 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
     dists_mm    = np.asarray(dists_mm)
     pol_reasons = []
 
-    # Nasion mask for the *included* coils (subset of all coils).
-    if include_hpis is not None and hpi_names is not None:
-        incl_names    = [hpi_names[i] for i in np.where(include_hpis)[0]]
-        nasion_incl   = np.array([_is_nasion_coil(n) for n in incl_names])
-        scoreable_pol = ~nasion_incl
-    else:
-        scoreable_pol = np.ones(len(dists_mm), dtype=bool)
+    large       = dists_mm >= _DIST_ACCEPT
+    mean_res    = float(np.mean(dists_mm)) if len(dists_mm) else float('nan')
+    n_good_dist = int(np.sum(~large))
 
-    large_all = dists_mm >= _DIST_ACCEPT
-    large     = large_all & scoreable_pol
-    # Mean over non-nasion included coils only.
-    scored_dists = dists_mm[scoreable_pol]
-    mean_res     = float(np.mean(scored_dists)) if len(scored_dists) else float('nan')
-
+    n_good_pol = None
     if pol_gofs is not None and len(pol_gofs):
-        pol_gofs  = np.asarray(pol_gofs)
-        finite    = np.isfinite(pol_gofs)
-        poor_pgof = finite & scoreable_pol & (pol_gofs < _POL_GOF_ACCEPT)
+        pol_gofs   = np.asarray(pol_gofs)
+        finite     = np.isfinite(pol_gofs)
+        poor_pgof  = finite & (pol_gofs < _POL_GOF_ACCEPT)
+        n_good_pol = int(np.sum(finite & (pol_gofs >= _POL_GOF_ACCEPT)))
         if poor_pgof.any():
             pol_reasons.append(
                 f'{poor_pgof.sum()} coil(s) have polhemus-position GOF < {_POL_GOF_ACCEPT} '
@@ -215,9 +187,32 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
             f'All polhemus-position GOFs ≥ {_POL_GOF_ACCEPT} and '
             f'residuals < {_DIST_ACCEPT:.0f} mm — polhemus registration is good'
         ]
+    elif (
+        n_good_dist >= _MIN_COILS
+        and (n_good_pol is None or n_good_pol >= _MIN_COILS)
+    ):
+        # Same acceptance rule as the HPI verdict, applied independently to
+        # both signals: as long as at least _MIN_COILS coils meet
+        # _POL_GOF_ACCEPT *and* at least _MIN_COILS coils have residual <
+        # _DIST_ACCEPT, accept — e.g. 3 of 4 polhemus coordinates with GOF ≥
+        # _POL_GOF_ACCEPT and residual < _DIST_ACCEPT is an accepted
+        # registration, even if the remaining coil falls short on either
+        # measure (a single bad coil — from either the OPM/HPI recording or
+        # the polhemus digitisation — routinely produces a large distance
+        # for that one coil without indicating a broader problem).
+        pol_verdict, pol_color = 'OK', 'green'
+        pol_reasons.append(
+            f'→ {n_good_dist} coil(s) residual < {_DIST_ACCEPT:.0f} mm '
+            f'(need ≥ {_MIN_COILS}) — accepted'
+        )
+        if n_good_pol is not None:
+            pol_reasons.append(
+                f'→ {n_good_pol} coil(s) polhemus-position GOF ≥ {_POL_GOF_ACCEPT} '
+                f'(need ≥ {_MIN_COILS}) — accepted'
+            )
     elif mean_res >= _DIST_ACCEPT * 2 or (
         pol_gofs is not None
-        and np.any((pol_gofs < 0.5) & scoreable_pol & np.isfinite(pol_gofs))
+        and np.any((pol_gofs < 0.5) & np.isfinite(pol_gofs))
     ):
         pol_verdict, pol_color = 'POOR', 'red'
         pol_reasons.append('→ Redo polhemus digitisation (fiducial placement or stylus error)')
@@ -323,6 +318,61 @@ def _load_heavy_deps():
     ))
 
 
+def _prompt_for_file(label, extensions=(), allow_blank=None):
+    """Prompt the user on the command line for a file path.
+
+    Parameters
+    ----------
+    label : str
+        Prompt text shown to the user (without trailing punctuation).
+    extensions : tuple[str]
+        Expected file extensions, used only for the hint shown in the
+        prompt (e.g. ``('.fif',)``). Not enforced.
+    allow_blank : str or None
+        If given, an empty response is accepted and returns ``None``;
+        the string is shown as a hint describing what a blank entry means.
+        If ``None``, an empty response re-prompts the user.
+
+    Returns
+    -------
+    str or None
+        The entered path, or ``None`` if left blank and ``allow_blank``
+        was set.
+    """
+    hint_parts = []
+    if extensions:
+        hint_parts.append(', '.join(extensions))
+    if allow_blank:
+        hint_parts.append(allow_blank)
+    hint = f' ({"; ".join(hint_parts)})' if hint_parts else ''
+
+    while True:
+        try:
+            raw = input(f'{label}{hint}: ').strip()
+        except EOFError:
+            return None
+
+        # Allow paths pasted with surrounding quotes.
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+            raw = raw[1:-1]
+
+        if not raw:
+            if allow_blank is not None:
+                return None
+            print('  Please enter a path (or press Ctrl-D to cancel).')
+            continue
+
+        path = os.path.expanduser(raw)
+        if not os.path.isfile(path):
+            print(f'  File not found: {path}')
+            retry = input('  Try again? [Y/n]: ').strip().lower()
+            if retry == 'n':
+                return None
+            continue
+
+        return path
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(
         prog='python -m opm_utility_scripts.hpi.check',
@@ -345,6 +395,10 @@ def _parse_args():
                              'Without --hpi: polhemus-only mode.')
     parser.add_argument('--freq', type=float, default=33.0, metavar='HZ',
                         help='HPI drive frequency in Hz (default: 33).')
+    parser.add_argument('--reffile', '-r', metavar='PATH', default=None,
+                        help='Optional reference recording (e.g. resting '
+                             'state) used for background-power-based noisy '
+                             'channel detection (default: skip this step).')
     parser.add_argument('--gof', type=float, default=None, metavar='THRESH',
                         help=(
                             'Minimum dipole GOF to include a coil in the transform '
@@ -864,32 +918,30 @@ def main():
     #   --hpi only       → HPI-only: GOF, sensor count, device distances  #
     #   --pol only       → Polhemus-only: dig summary, head distances      #
     #   --hpi + --pol    → Full coregistration (brief / --detailed)        #
-    #   neither          → open GUI dialogs                                #
+    #   neither          → prompt interactively on the command line        #
     # ------------------------------------------------------------------ #
 
     if hpi_file is None and pol_file is None:
-        # GUI — ask for HPI first, then optionally polhemus
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk(); root.withdraw()
-        hpi_file = filedialog.askopenfilename(
-            initialdir='/data', title='Select HPI file (cancel = polhemus-only)',
-            filetypes=[('FIF files', '*.fif'), ('All files', '*')],
-        ) or None
-        root2 = tk.Tk(); root2.withdraw()
-        pol_file = filedialog.askopenfilename(
-            initialdir='/data',
-            title='Select Polhemus file (cancel = HPI-only mode)',
-            filetypes=[('JSON files', '*.json'), ('FIF files', '*.fif'), ('All files', '*')],
-        ) or None
+        # No paths given on the command line — ask for them interactively.
+        hpi_file = _prompt_for_file(
+            'Enter path to HPI file',
+            extensions=('.fif',),
+            allow_blank='leave blank for polhemus-only mode',
+        )
+        pol_file = _prompt_for_file(
+            'Enter path to Polhemus file',
+            extensions=('.json', '.fif'),
+            allow_blank='leave blank for HPI-only mode',
+        )
         if hpi_file is None and pol_file is None:
-            print('No file selected. Exiting.')
+            print('No file provided. Exiting.')
             sys.exit(0)
 
     if hpi_file and pol_file:
         # Full coregistration
         try:
-            fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof, optim=args.optimization)
+            fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof,
+                          optim=args.optimization, reffile=args.reffile)
             diag = compute_fit_diagnostics(fit)
             _print_diagnostics_full(fit, detailed=detailed, diag=diag)
             _build_figure_full(fit, detailed=detailed, diag=diag)
@@ -904,7 +956,7 @@ def main():
     elif hpi_file:
         # HPI-only — full detail always
         try:
-            amp = fit_hpi_amplitudes(hpi_file, args.freq)
+            amp = fit_hpi_amplitudes(hpi_file, args.freq, reffile=args.reffile)
             amp = _resolve_hpi_only(amp)
             _print_diagnostics_hpi_only(amp)
             _build_figure_hpi_only(amp)
