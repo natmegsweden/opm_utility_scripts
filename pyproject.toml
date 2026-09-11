@@ -44,6 +44,5 @@ opm_utility_scripts = "."
 "opm_utility_scripts.tools" = "tools"
 
 [tool.setuptools.package-data]
-opm_utility_scripts = ["config.yml"]
 "opm_utility_scripts.analog" = ["analog_channel_mapping.json"]
 "opm_utility_scripts.tools" = ["*.csv", "*.mat"]
