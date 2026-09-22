@@ -956,7 +956,7 @@ def main():
     elif hpi_file:
         # HPI-only — full detail always
         try:
-            amp = fit_hpi_amplitudes(hpi_file, args.freq, reffile=args.reffile)
+            amp = fit_hpi_amplitudes(hpi_file, args.freq)
             amp = _resolve_hpi_only(amp)
             _print_diagnostics_hpi_only(amp)
             _build_figure_hpi_only(amp)
