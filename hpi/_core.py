@@ -156,10 +156,13 @@ def find_bads(reffile=None, hpifreq=None):
     if reffile is None:
         return []
 
-    # TODO: use end snippet from HPI recording to estimate bad
-    
-    raw = mne.io.read_raw_fif(reffile)
-    raw.load_data()
+    # If reffile is defined as a string, load it as a raw object. Otherwise, assume it's already a raw object.
+    if isinstance(reffile, str):
+        raw = mne.io.read_raw_fif(reffile)
+        raw.load_data()
+    else:
+        # Raw object is deferred from last 5 seconds of HPI recorging
+        raw = reffile
 
     #remove bad-marked channels
     for bad_chan in raw.info["bads"]:
@@ -226,10 +229,10 @@ def find_bads(reffile=None, hpifreq=None):
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    plt.tight_layout()
-    plt.show()
+    fig.tight_layout()
+    #plt.show()
     
-    return bad_chs
+    return bad_chs, fig
 
 def compute_chpi_opm_locs(
     info,
@@ -377,7 +380,7 @@ def compute_chpi_opm_locs(
         chpi_locs[key] = np.array(val, float).reshape(shapes[key])
     return chpi_locs
 
-def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
+def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     """
     Load an HPI recording and estimate per-coil dipole positions and GOFs.
 
@@ -391,10 +394,6 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
         Path to the raw HPI recording, or a pre-loaded Raw object.
     hpifreq : float
         Drive frequency shared by all HPI coils (Hz).
-    reffile : str | None
-        Path to a reference recording (e.g. resting state) used for
-        background-power-based noisy-channel detection. Optional — when
-        ``None`` (default), this detection step is skipped.
 
     Returns
     -------
@@ -431,6 +430,9 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
     else:
         raw = hpifile
 
+    hpi_names, hpi_indices = get_hpi_output_channels(raw)
+    hpi_freqs = np.full(len(hpi_indices), hpifreq)
+
     # Some acquisition systems (e.g. FieldLine OPM) write line_freq=0 to mean
     # "no notch filter configured" instead of leaving it unset. MNE's
     # compute_chpi_amplitudes only guards against `None` and divides by
@@ -439,22 +441,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
     # frequencies (50/60 Hz) are left untouched.
     if raw.info.get('line_freq') == 0:
         with raw.info._unlock():
-            raw.info['line_freq'] = None
-    # TODO: Potentially set line freq manually?
-    # raw.info['line_freq'] = 50.0
-
-    bads = find_zero_location_channels(raw.info)
-    for bad_chan in bads:
-        raw.drop_channels(bad_chan)
-       
-    # Remove noisy channels (skipped when no reference file is provided)
-    bads = find_bads(reffile, hpifreq)
-    for i in bads:
-        if i in raw.info["ch_names"]:
-            raw.drop_channels(i)
-
-    hpi_names, hpi_indices = get_hpi_output_channels(raw)
-    hpi_freqs = np.full(len(hpi_indices), hpifreq)
+            raw.info['line_freq'] = 50.0 # Or None, can't be 0.
 
     # Always resample to the internal fitting frequency.
     raw.load_data().resample(_HPI_FIT_SFREQ)
@@ -470,6 +457,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
     slope = np.zeros((len(hpi_indices), len(pick_types(raw.info, meg='mag'))), dtype=float)
     n_hpis = 0
     i_hpis = []
+    peak_tmax = []
     for index in range(len(hpi_indices)):
         raw = raw_orig.copy()
         channel_index = hpi_indices[index]
@@ -487,6 +475,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
 
         minT = peaks[0] / raw.info['sfreq']
         maxT = peaks[-1] / raw.info['sfreq']
+        peak_tmax.append(maxT)
         tmin = (maxT - minT) / 2.0 - 3 + minT
         tmax = (maxT - minT) / 2.0 + 3 + minT
         raw.crop(tmin=tmin, tmax=tmax)
@@ -521,6 +510,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
         
     hpi_indices = hpi_indices[i_hpis]
     hpi_freqs   = hpi_freqs[i_hpis]
+    peak_tlast    = max(peak_tmax)
 
     # Adding full hpi struct to info
     hpi_sub = dict()
@@ -588,6 +578,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, reffile: str=None) -> dict:
         'slope':           slope,
         'raw_orig':        raw_orig,
         'coil_amplitudes': coil_amplitudes,
+        'peak_tlast':       peak_tlast,
     }
 
 def fit_hpi(hpifile, polfile, hpifreq: float,
@@ -695,16 +686,47 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Stage 1: HPI amplitude estimation (no polhemus needed)
     # ------------------------------------------------------------------
-    amp = fit_hpi_amplitudes(hpifile, hpifreq, reffile=reffile)
+    amp = fit_hpi_amplitudes(hpifile, hpifreq)
     hpi_names       = amp['hpi_names']
     hpi_indices     = amp['hpi_indices']
     hpi_freqs       = amp['hpi_freqs']
     slope           = amp['slope']
     raw_orig        = amp['raw_orig']
     coil_amplitudes = amp['coil_amplitudes']
+    peak_tlast       = amp['peak_tlast']
+
+    raw = raw_orig.copy()
 
     # ------------------------------------------------------------------
-    # Stage 2: Load Polhemus and embed digitisation into raw
+    # Stage 2: Detect and remove noisy channels from the HPI recording. 
+    # ------------------------------------------------------------------
+
+    # Find channels with zero location
+    bads = find_zero_location_channels(raw.info)
+    for bad_chan in bads:
+        raw.drop_channels(bad_chan)
+
+    # Remove noisy channels (skipped when no reference file is provided)
+    if reffile is None:
+        twindow = 5
+        tmax = raw.times[-1]
+
+        if peak_tlast + twindow > tmax:
+            print("WARNING: HPI recording is too short to extract a reference segment for bad-channel detection. Skipping bad-channel detection.")
+            reffile=None
+        else:
+            print(f"Extracting {twindow}s reference segment from the end of the HPI recording for bad-channel detection.")
+            tmin = tmax - twindow
+            reffile = raw.copy().crop(tmin=tmin, tmax=tmax)
+
+    bads, bads_fig = find_bads(reffile, hpifreq)
+    for i in bads:
+        if i in raw.info["ch_names"]:
+            raw.drop_channels(i)
+
+
+    # ------------------------------------------------------------------
+    # Stage 3: Load Polhemus and embed digitisation into raw
     # ------------------------------------------------------------------
     if isinstance(polfile, dict):
         pol = polfile
@@ -783,7 +805,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             )
 
     # ------------------------------------------------------------------
-    # Stage 3: Compute coil locations now that dig is properly set
+    # Stage 4: Compute coil locations now that dig is properly set
     # ------------------------------------------------------------------
     # Suppress the "HPI consistency of isotrak and hpifit is poor" warning —
     # it fires because hpi_results dig_points are intentionally zero-initialised
@@ -800,7 +822,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     hpi_gofs = np.array(coil_locs['gofs'][0])
 
     # ------------------------------------------------------------------
-    # Stage 4: Compute device-to-head transform
+    # Stage 5: Compute device-to-head transform
     # ------------------------------------------------------------------
     # Auto-select GOF threshold when not explicitly supplied:
     #   0.98 — distinct frequencies (MEGIN/Elekta + SSS, MNE default)
@@ -865,7 +887,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         )
 
     # ------------------------------------------------------------------
-    # Stage 5: Polhemus-position GOF
+    # Stage 6: Polhemus-position GOF
     # Evaluate the dipole forward model at each *digitised* polhemus coil
     # position (transformed back to device frame) against the measured MEG
     # field pattern for the matched channel.  Unlike hpi_gofs (which floats
@@ -972,6 +994,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'include_hpis': include_hpis,
         'tree_indices': tree_indices,
         'pol_gofs':     pol_gofs,
+        'bads':         bads,
+        'bads_fig':     bads_fig,
     }
 
 def compute_fit_diagnostics(fit):
@@ -1043,6 +1067,8 @@ def compute_fit_diagnostics(fit):
         'trans_mm':       trans_mm,
         'mean_res_mm':    mean_res_mm,
         'intercoil_rows': intercoil_rows,
+        'bads':           fit.get('bads', []),
+        'bads_fig':       fit.get('bads_fig', []),
     }
 
 def apply_transform(
