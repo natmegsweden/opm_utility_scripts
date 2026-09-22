@@ -347,8 +347,75 @@ def load_hpifile(path: str):
     return raw
 
 
-def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float) -> tuple[str, dict]:
-    """Fit all HPI candidates and return the highest-scoring path and fit."""
+def _load_noise_reffile_window(path: str, tstart: float = 10.0, twindow: float = 10.0):
+    """Load a noise-reference FIF and crop it to a fixed detection window.
+
+    Extracts a ``twindow``-second segment starting ``tstart`` seconds into
+    the recording (default: a 10s window beginning 10s after the recording
+    start), which avoids onset artefacts near t=0 while keeping the
+    background-power estimate cheap and consistent across recordings.
+
+    Parameters
+    ----------
+    path : str
+        Path to the reference FIF recording.
+    tstart : float
+        Offset from the start of the recording (seconds) where the window
+        begins.
+    twindow : float
+        Length of the window (seconds).
+
+    Returns
+    -------
+    mne.io.Raw
+        Preloaded, cropped reference recording.
+    """
+    import mne
+
+    raw = mne.io.read_raw_fif(path, preload=True, verbose=False)
+    tmax_avail = raw.times[-1]
+    tend = tstart + twindow
+
+    if tend <= tmax_avail:
+        raw.crop(tmin=tstart, tmax=tend)
+    elif tstart < tmax_avail:
+        warnings.warn(
+            f'Noise reference file {path!r} ({tmax_avail:.1f}s) is shorter '
+            f'than the requested {tstart:.0f}-{tend:.0f}s window; using '
+            f'{tstart:.1f}-{tmax_avail:.1f}s instead.'
+        )
+        raw.crop(tmin=tstart, tmax=tmax_avail)
+    else:
+        warnings.warn(
+            f'Noise reference file {path!r} ({tmax_avail:.1f}s) is too short '
+            f'for the requested {tstart:.0f}s start offset; using the full '
+            'recording for noisy-channel detection instead.'
+        )
+
+    return raw
+
+
+def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
+                          reffile: str | None = None) -> tuple[str, dict]:
+    """Fit all HPI candidates and return the highest-scoring path and fit.
+
+    Parameters
+    ----------
+    hpi_files : list[str]
+        Candidate HPI recording paths.
+    polhemus : dict
+        Polhemus digitisation info, as returned by :func:`load_polhemus`.
+    hpifreq : float
+        Drive frequency shared by all HPI coils (Hz).
+    reffile : str | None
+        Path to a reference recording (e.g. empty-room or resting-state)
+        used for background-power-based noisy-channel detection. When
+        given, a fixed 10s window starting 10s after the recording start
+        is extracted once (via :func:`_load_noise_reffile_window`) and
+        forwarded as ``reffile`` to :func:`~opm_utility_scripts.hpi._core.fit_hpi`
+        for every candidate. When ``None`` (default), each ``fit_hpi`` call
+        falls back to its own automatic reference-window selection.
+    """
     from .hpi._core import fit_hpi
 
     best_path = None
@@ -357,9 +424,15 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float) -
     best_raw_mean = -np.inf
     errors = []
 
+    ref_raw = _load_noise_reffile_window(reffile) if reffile is not None else None
+
     for path in hpi_files:
         try:
-            fit = fit_hpi(path, polhemus, hpifreq)
+            # Pass a fresh copy per candidate: fit_hpi/find_bads may drop
+            # channels from the reference raw in place, and each candidate
+            # should see the same untouched reference.
+            candidate_reffile = ref_raw.copy() if ref_raw is not None else None
+            fit = fit_hpi(path, polhemus, hpifreq, reffile=candidate_reffile)
         except Exception as exc:
             errors.append(f'{path}: {exc}')
             continue
