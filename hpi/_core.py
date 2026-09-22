@@ -154,7 +154,7 @@ def find_bads(reffile=None, hpifreq=None):
         ``None``.
     """
     if reffile is None:
-        return []
+        return [], None
 
     # If reffile is defined as a string, load it as a raw object. Otherwise, assume it's already a raw object.
     if isinstance(reffile, str):
@@ -429,6 +429,14 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             raw.drop_channels(bad_chan)
     else:
         raw = hpifile
+
+    # Drop channels with zero/invalid location before any MEG-geometry-based
+    # computation. Left in place, these cause a division by zero (r_n == 0)
+    # when MNE builds the spherical-harmonic external-interference basis in
+    # compute_chpi_amplitudes -> _setup_ext_proj, propagating NaN/Inf into an
+    # SVD call and crashing with "array must not contain infs or NaNs".
+    for bad_chan in find_zero_location_channels(raw.info):
+        raw.drop_channels(bad_chan)
 
     hpi_names, hpi_indices = get_hpi_output_channels(raw)
     hpi_freqs = np.full(len(hpi_indices), hpifreq)
