@@ -416,6 +416,16 @@ def _parse_args():
                             '"rigid": refine with rigid transform of polhemus '
                             'locations by minimizing the summed dipole RV.'
                         ))
+    parser.add_argument('--no-center-matching', dest='center_matching',
+                        action='store_false', default=True,
+                        help=(
+                            'Match HPI/Polhemus coil positions on raw (uncentred) '
+                            'coordinates instead of centroid-centring both point '
+                            'clouds first (default: centred). Uncentred matching '
+                            'reproduces the legacy pipeline\'s behaviour and is '
+                            'intended for regression testing / legacy-parity '
+                            'comparisons, not routine use.'
+                        ))
     return parser.parse_args()
 
 
@@ -940,7 +950,8 @@ def main():
         # Full coregistration
         try:
             fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof,
-                          optim=args.optimization, reffile=args.reffile)
+                          optim=args.optimization, reffile=args.reffile,
+                          center_matching=args.center_matching)
             diag = compute_fit_diagnostics(fit)
             _print_diagnostics_full(fit, detailed=detailed, diag=diag)
             _build_figure_full(fit, detailed=detailed, diag=diag)

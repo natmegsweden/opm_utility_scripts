@@ -87,6 +87,14 @@ opmutil coregister \
     --reffile RestingState_raw.fif \
     --freq 33 --sfreq 1000 --gof 0.9 \
     --save
+
+# Legacy-parity matching (regression testing only)
+opmutil coregister \
+    --data AudOdd_raw.fif \
+    --hpi  HPIBefore_raw.fif \
+    --pol  digitisation.json \
+    --no-center-matching \
+    --save
 ```
 
 | Flag | Description | Default |
@@ -97,6 +105,7 @@ opmutil coregister \
 | `--reffile` | Optional reference recording (e.g. resting state) used for background-power-based noisy channel detection | skip this step |
 | `--freq` | HPI drive frequency in Hz | *(ask)* |
 | `--gof` | Minimum dipole GOF for a coil to be included in the device-to-head transform fit | `0.95` |
+| `--no-center-matching` | Match HPI/Polhemus coil positions on raw (uncentred) coordinates instead of centroid-centring both point clouds first. Reproduces legacy matching behaviour; regression-testing only | centred |
 | `--sfreq` | Target sampling frequency in Hz | *(ask)* |
 | `--save` / `--overwrite` / `--plot` | Save output, overwrite existing files, show/save alignment plot | off |
 
@@ -126,6 +135,10 @@ opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
 # With noise-reference bad-channel detection and rigid-refinement optimization
 opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
     --reffile RestingState_raw.fif --optimization rigid
+
+# Legacy-parity matching (regression testing only)
+opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
+    --no-center-matching
 ```
 
 | Flag | Description | Default |
@@ -137,6 +150,7 @@ opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
 | `--gof` | Minimum dipole GOF for a coil to be included in the device-to-head transform fit | `0.95` |
 | `--detailed` | Show full diagnostics in `--hpi` + `--pol` mode | off |
 | `--optimization` | Refinement applied after the initial HPI→Polhemus coregistration: `none` or `rigid` (bounded L-BFGS-B refit maximizing signal-fit GOF) | `none` |
+| `--no-center-matching` | Match HPI/Polhemus coil positions on raw (uncentred) coordinates instead of centroid-centring both point clouds first. Independent of `--optimization` — it changes which points are matched during the initial fit, not whether a post-fit refinement runs. Reproduces legacy matching behaviour; regression-testing only | centred |
 
 ## Submodules (python -m)
 

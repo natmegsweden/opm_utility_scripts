@@ -592,7 +592,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float = 0.95,
             landmark_weight: float = 1.0, optim: str = "none",
-            reffile: str = None) -> dict:
+            reffile: str = None, center_matching: bool = True) -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
     the device-to-head transform.
@@ -637,6 +637,18 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         * Higher values — stronger landmark constraint, useful when coil
           geometry is nearly symmetric and HPI residuals alone cannot
           disambiguate the mapping.
+    center_matching : bool (default True)
+        Whether to subtract each point cloud's centroid before the
+        nearest-neighbour (cKDTree) match between fitted device-frame HPI
+        coil positions and head-frame Polhemus positions. Centring makes
+        the match invariant to a bulk translation offset between the two
+        frames, not just rotation — the more robust default. Set to
+        ``False`` to match on the raw (uncentred) coordinates instead,
+        reproducing the legacy pipeline's matching behaviour. This is
+        independent of ``optim``: it changes *which points are matched*
+        during the closed-form fit (Stage 5), not whether a post-fit
+        optimisation is applied afterwards. Intended for regression
+        testing / legacy-parity comparisons rather than routine use.
 
     Returns
     -------
@@ -842,8 +854,21 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # between the two. This is taking advantage of the fact that we know that 
     # HEDSCAN device coordiantes are similar to head coordinates and transform 
     # will entail small rotations (<< 90°).
-    tree = cKDTree(hpi_orig_head-hpi_orig_head.mean(axis=0)) # shift points to centroid to avoid problems with bad coil placement
-    distances, tree_indices = tree.query(hpi_dev[include_hpis]-hpi_dev[include_hpis].mean(axis=0)) # find closest points
+    if center_matching:
+        # Shift both point clouds to their own centroid first, so the match
+        # is invariant to a bulk translation offset between the device and
+        # head frames (not just rotation) — avoids problems with bad coil
+        # placement.
+        ref_pts = hpi_orig_head - hpi_orig_head.mean(axis=0)
+        query_pts = hpi_dev[include_hpis] - hpi_dev[include_hpis].mean(axis=0)
+    else:
+        # Legacy behaviour: match on raw (uncentred) coordinates. Only
+        # invariant to rotation, not translation offset — kept for
+        # regression testing / legacy-parity comparisons.
+        ref_pts = hpi_orig_head
+        query_pts = hpi_dev[include_hpis]
+    tree = cKDTree(ref_pts)
+    distances, tree_indices = tree.query(query_pts) # find closest points
 
     # Calculate transform
     trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig_head[tree_indices])[0])
