@@ -179,6 +179,15 @@ def _parse_args():
              'device-to-head transform fit (default: 0.95).',
     )
     p.add_argument(
+        '--no-center-matching', dest='center_matching',
+        action='store_false', default=True,
+        help='Match HPI/Polhemus coil positions on raw (uncentred) '
+             'coordinates instead of centroid-centring both point clouds '
+             'first (default: centred). Uncentred matching reproduces the '
+             'legacy pipeline\'s behaviour; intended for regression '
+             'testing / legacy-parity comparisons, not routine use.',
+    )
+    p.add_argument(
         '--sfreq', '-s', type=float, default=None, metavar='HZ',
         help='Target sampling frequency in Hz (default: ask).',
     )
@@ -252,6 +261,7 @@ def main():
     print(f"Reference:    {reffile if reffile else '(none — skipping noisy channel detection)'}")
     print(f"Frequency:    {hpifreq} Hz")
     print(f"GOF limit:    {args.gof}")
+    print(f"Matching:     {'centred' if args.center_matching else 'uncentred (legacy)'}")
     print(f"Target sfreq: {new_sfreq} Hz")
     print(f"Save:         {doSave}{'  (overwrite)' if overwrite else ''}")
     print(f"Plot:         {plotResult}")
@@ -259,7 +269,8 @@ def main():
     # ----------------------------------------------------------------
     # Fit HPI coils (shared across all data files)
     # ----------------------------------------------------------------
-    fit = fit_hpi(hpifile, polfile, hpifreq, gof_limit=args.gof, reffile=reffile)
+    fit = fit_hpi(hpifile, polfile, hpifreq, gof_limit=args.gof, reffile=reffile,
+                  center_matching=args.center_matching)
 
     hpi_names       = fit['hpi_names']
     hpi_dev         = fit['hpi_dev']
