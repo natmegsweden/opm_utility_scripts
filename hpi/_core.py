@@ -154,7 +154,7 @@ def find_bads(reffile=None, hpifreq=None):
         ``None``.
     """
     if reffile is None:
-        return []
+        return [], None
 
     # If reffile is defined as a string, load it as a raw object. Otherwise, assume it's already a raw object.
     if isinstance(reffile, str):
@@ -430,6 +430,14 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     else:
         raw = hpifile
 
+    # Drop channels with zero/invalid location before any MEG-geometry-based
+    # computation. Left in place, these cause a division by zero (r_n == 0)
+    # when MNE builds the spherical-harmonic external-interference basis in
+    # compute_chpi_amplitudes -> _setup_ext_proj, propagating NaN/Inf into an
+    # SVD call and crashing with "array must not contain infs or NaNs".
+    for bad_chan in find_zero_location_channels(raw.info):
+        raw.drop_channels(bad_chan)
+
     hpi_names, hpi_indices = get_hpi_output_channels(raw)
     hpi_freqs = np.full(len(hpi_indices), hpifreq)
 
@@ -582,7 +590,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     }
 
 def fit_hpi(hpifile, polfile, hpifreq: float,
-            gof_limit: float | None = None,
+            gof_limit: float = 0.95,
             landmark_weight: float = 1.0, optim: str = "none",
             reffile: str = None) -> dict:
     """
@@ -606,15 +614,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         dicts are used directly.
     hpifreq : float
         Drive frequency shared by all HPI coils (Hz).
-    gof_limit : float | None
-        Minimum dipole GOF for a coil to be included in the transform fit.
-        When ``None`` (default) the threshold is chosen automatically:
-
-        * **0.98** when coils use distinct drive frequencies (MEGIN/Elekta
-          convention with SSS — standard MNE default).
-        * **0.90** when all coils share one drive frequency (single-frequency
-          OPM case without SSS — lower threshold accounts for the absence
-          of spatial filtering).
+    gof_limit : float (default 0.95)
 
         Pass an explicit float to override the automatic selection.
     landmark_weight : float
@@ -824,19 +824,11 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Stage 5: Compute device-to-head transform
     # ------------------------------------------------------------------
-    # Auto-select GOF threshold when not explicitly supplied:
-    #   0.98 — distinct frequencies (MEGIN/Elekta + SSS, MNE default)
-    #   0.90 — single shared frequency (OPM without SSS; lower because
-    #           the absence of spatial filtering inflates the noise floor)
     # Detect single-frequency mode: all HPI coils fired at one shared
     # frequency (sequential OPM case) vs. distinct per-coil frequencies
     # (e.g. a caller configured a MEGIN/Elekta-style multi-frequency setup).
-    is_auto = gof_limit is None
-    if is_auto:
-        distinct_freqs = len(set(np.asarray(hpi_freqs).tolist())) > 1
-        gof_limit = 0.98 if distinct_freqs else 0.90
-    print(f'GOF threshold: {gof_limit:.2f} '
-          f'({"auto" if is_auto else "user-supplied"})')
+
+    print(f'GOF threshold: {gof_limit:.2f} ')
     include_hpis = hpi_gofs >= gof_limit
 
     dev_pts  = hpi_dev[include_hpis]       # fitted positions, device frame
