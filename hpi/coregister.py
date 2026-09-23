@@ -188,6 +188,13 @@ def _parse_args():
              'testing / legacy-parity comparisons, not routine use.',
     )
     p.add_argument(
+        '--optimization', choices=['none', 'rigid'], default='none', metavar='METHOD',
+        help='Optimization method applied after the initial HPI→Polhemus '
+             'coregistration. "none": no refinement (default). "rigid": '
+             'refine with rigid transform of polhemus locations by '
+             'minimizing the summed dipole RV.',
+    )
+    p.add_argument(
         '--sfreq', '-s', type=float, default=None, metavar='HZ',
         help='Target sampling frequency in Hz (default: ask).',
     )
@@ -262,6 +269,7 @@ def main():
     print(f"Frequency:    {hpifreq} Hz")
     print(f"GOF limit:    {args.gof}")
     print(f"Matching:     {'centred' if args.center_matching else 'uncentred (legacy)'}")
+    print(f"Optimization: {args.optimization}")
     print(f"Target sfreq: {new_sfreq} Hz")
     print(f"Save:         {doSave}{'  (overwrite)' if overwrite else ''}")
     print(f"Plot:         {plotResult}")
@@ -270,7 +278,7 @@ def main():
     # Fit HPI coils (shared across all data files)
     # ----------------------------------------------------------------
     fit = fit_hpi(hpifile, polfile, hpifreq, gof_limit=args.gof, reffile=reffile,
-                  center_matching=args.center_matching)
+                  center_matching=args.center_matching, optim=args.optimization)
 
     hpi_names       = fit['hpi_names']
     hpi_dev         = fit['hpi_dev']

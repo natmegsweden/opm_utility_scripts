@@ -95,6 +95,14 @@ opmutil coregister \
     --pol  digitisation.json \
     --no-center-matching \
     --save
+
+# With rigid-refinement optimization
+opmutil coregister \
+    --data AudOdd_raw.fif \
+    --hpi  HPIBefore_raw.fif \
+    --pol  digitisation.json \
+    --optimization rigid \
+    --save
 ```
 
 | Flag | Description | Default |
@@ -106,6 +114,7 @@ opmutil coregister \
 | `--freq` | HPI drive frequency in Hz | *(ask)* |
 | `--gof` | Minimum dipole GOF for a coil to be included in the device-to-head transform fit | `0.95` |
 | `--no-center-matching` | Match HPI/Polhemus coil positions on raw (uncentred) coordinates instead of centroid-centring both point clouds first. Reproduces legacy matching behaviour; regression-testing only | centred |
+| `--optimization` | Refinement applied after the initial HPI→Polhemus coregistration: `none` or `rigid` (bounded L-BFGS-B refit maximizing signal-fit GOF) | `none` |
 | `--sfreq` | Target sampling frequency in Hz | *(ask)* |
 | `--save` / `--overwrite` / `--plot` | Save output, overwrite existing files, show/save alignment plot | off |
 
