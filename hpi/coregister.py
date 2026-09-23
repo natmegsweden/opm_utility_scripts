@@ -174,6 +174,11 @@ def _parse_args():
         help='HPI drive frequency in Hz (default: ask).',
     )
     p.add_argument(
+        '--gof', type=float, default=0.95, metavar='THRESH',
+        help='Minimum dipole GOF for a coil to be included in the '
+             'device-to-head transform fit (default: 0.95).',
+    )
+    p.add_argument(
         '--sfreq', '-s', type=float, default=None, metavar='HZ',
         help='Target sampling frequency in Hz (default: ask).',
     )
@@ -246,6 +251,7 @@ def main():
     print(f"Polhemus:     {polfile}")
     print(f"Reference:    {reffile if reffile else '(none — skipping noisy channel detection)'}")
     print(f"Frequency:    {hpifreq} Hz")
+    print(f"GOF limit:    {args.gof}")
     print(f"Target sfreq: {new_sfreq} Hz")
     print(f"Save:         {doSave}{'  (overwrite)' if overwrite else ''}")
     print(f"Plot:         {plotResult}")
@@ -253,7 +259,7 @@ def main():
     # ----------------------------------------------------------------
     # Fit HPI coils (shared across all data files)
     # ----------------------------------------------------------------
-    fit = fit_hpi(hpifile, polfile, hpifreq, reffile=reffile)
+    fit = fit_hpi(hpifile, polfile, hpifreq, gof_limit=args.gof, reffile=reffile)
 
     hpi_names       = fit['hpi_names']
     hpi_dev         = fit['hpi_dev']

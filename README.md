@@ -36,7 +36,8 @@ opm_utility_scripts/
 │   └── analog_channel_mapping.json  Default mapping (ai1–ai20 → labelled channels)
 ├── hpi/
 │   ├── __init__.py
-│   ├── _core.py                      Shared HPI pipeline (fit_hpi, apply_transform)
+│   ├── _core.py                      Shared HPI pipeline (fit_hpi, fit_hpi_amplitudes,
+│   │                                 apply_transform, save_raw, compute_fit_diagnostics)
 │   ├── coregister.py                 Unified single/multi-file entry point
 │   └── check.py                      Dipole-fit HPI quality check
 └── tools/
@@ -77,7 +78,27 @@ opmutil coregister \
     --pol  digitisation.json \
     --freq 33 --sfreq 1000 \
     --save --overwrite --plot
+
+# With noise-reference bad-channel detection and a custom GOF threshold
+opmutil coregister \
+    --data AudOdd_raw.fif \
+    --hpi  HPIBefore_raw.fif \
+    --pol  digitisation.json \
+    --reffile RestingState_raw.fif \
+    --freq 33 --sfreq 1000 --gof 0.9 \
+    --save
 ```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--data` | One or more data files to apply the transform to | *(ask)* |
+| `--hpi` | Raw HPI recording | *(ask)* |
+| `--pol` | Polhemus digitisation file (`.json` or `.fif`) | *(ask)* |
+| `--reffile` | Optional reference recording (e.g. resting state) used for background-power-based noisy channel detection | skip this step |
+| `--freq` | HPI drive frequency in Hz | *(ask)* |
+| `--gof` | Minimum dipole GOF for a coil to be included in the device-to-head transform fit | `0.95` |
+| `--sfreq` | Target sampling frequency in Hz | *(ask)* |
+| `--save` / `--overwrite` / `--plot` | Save output, overwrite existing files, show/save alignment plot | off |
 
 ### `opmutil check`
 
@@ -101,7 +122,21 @@ opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json
 # Override drive frequency and GOF threshold; verbose output
 opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
     --freq 33 --gof 0.95 --detailed
+
+# With noise-reference bad-channel detection and rigid-refinement optimization
+opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
+    --reffile RestingState_raw.fif --optimization rigid
 ```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--hpi` | Path to the raw HPI `.fif` file | *(ask)* |
+| `--pol` | Path to Polhemus file (`.fif` or `.json`) | *(ask)* |
+| `--freq` | HPI drive frequency in Hz | `33` |
+| `--reffile` | Optional reference recording used for background-power-based noisy channel detection | skip this step |
+| `--gof` | Minimum dipole GOF for a coil to be included in the device-to-head transform fit | `0.95` |
+| `--detailed` | Show full diagnostics in `--hpi` + `--pol` mode | off |
+| `--optimization` | Refinement applied after the initial HPI→Polhemus coregistration: `none` or `rigid` (bounded L-BFGS-B refit maximizing signal-fit GOF) | `none` |
 
 ## Submodules (python -m)
 
@@ -143,27 +178,37 @@ arguments.
 
 ## Public API
 
+The `channels`, `viz`, `io`, and `analog.*` symbols below are also re-exported
+(lazily) directly from the top-level `opm_utility_scripts` package, e.g.
+`from opm_utility_scripts import plot_hpi_alignment` works. The `hpi.*`
+symbols are not re-exported at the top level and must be imported from the
+`hpi` subpackage as shown.
+
 ```python
 from opm_utility_scripts.channels import (
     find_zero_location_channels,   # was TC_findzerochans
     get_hpi_output_channels,       # was TC_get_hpiout_names
     pick_low_noise_meg_chs,
 )
-from opm_utility_scripts.viz import plot_3d, plot_psd, rotate_points, create_aligned_grid
-from opm_utility_scripts.io import get_file, get_files, get_input, get_boolean, write_bw_marker_file
+from opm_utility_scripts.viz import (
+    plot_3d, plot_hpi_alignment, plot_psd, rotate_points, create_aligned_grid,
+)
+from opm_utility_scripts.io import (
+    get_file, get_files, get_input, get_boolean, write_bw_marker_file,
+    load_datafile, load_hpifile, load_polhemus, select_best_hpi_file,
+)
 from opm_utility_scripts.analog.mapping import generate_analog_channel_mapping   # was generate_mapping
 from opm_utility_scripts.analog.rename import rename_channels
+from opm_utility_scripts.hpi import (
+    fit_hpi, fit_hpi_amplitudes, apply_transform, save_raw, compute_fit_diagnostics,
+)
 ```
 
 ## Dependencies
 
 | Group | Packages | Install extra |
 |-------|----------|---------------|
-| Core | `mne>=1.8`, `numpy>=1.26`, `scipy>=1.12`, `matplotlib>=3.8` | *(default)* |
+| Core | `mne>=1.12`, `numpy>=1.26`, `scipy>=1.12`, `matplotlib>=3.8` | *(default)* |
 | Tools | `pandas>=2.2` | `[tools]` |
 | VTK visualiser | `pandas>=2.2`, `PyQt5>=5.15`, `vtk>=9.3` | `[vtk]` |
 
-## Known pre-existing issues (preserved, not changed)
-
-- `hpi/check.py`: uses `raw.info` (not `epochs.info`) for the channel lookup
-  inside `main()`.  Behaviour is preserved from the original script.

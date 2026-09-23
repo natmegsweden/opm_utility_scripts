@@ -399,11 +399,10 @@ def _parse_args():
                         help='Optional reference recording (e.g. resting '
                              'state) used for background-power-based noisy '
                              'channel detection (default: skip this step).')
-    parser.add_argument('--gof', type=float, default=None, metavar='THRESH',
+    parser.add_argument('--gof', type=float, default=0.95, metavar='THRESH',
                         help=(
-                            'Minimum dipole GOF to include a coil in the transform '
-                            '(default: auto — 0.98 for distinct-frequency systems, '
-                            '0.90 for single-frequency OPM systems).'
+                            'Minimum dipole GOF for a coil to be included in the '
+                            'device-to-head transform fit (default: 0.95).'
                         ))
     parser.add_argument('--detailed', action='store_true',
                         help='Show full diagnostics in --hpi + --pol mode '

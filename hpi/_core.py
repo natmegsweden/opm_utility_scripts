@@ -615,8 +615,9 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     hpifreq : float
         Drive frequency shared by all HPI coils (Hz).
     gof_limit : float (default 0.95)
-
-        Pass an explicit float to override the automatic selection.
+        Minimum dipole GOF for a coil to be included in the device-to-head
+        transform fit. Coils with ``hpi_gofs < gof_limit`` are excluded
+        from the point-matching/rigid-transform step (Stage 5).
     landmark_weight : float
         Weight for the landmark (nasion, LPA, RPA) constraint in the
         device-to-head transform fit.  The combined score used for
@@ -671,7 +672,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         ``dist`` : np.ndarray
             Per-coil residual distances in head space (metres).
         ``include_hpis`` : np.ndarray of bool
-            Mask of coils whose GOF ≥ ``gof_limit`` (auto-selected or explicit).
+            Mask of coils whose GOF ≥ ``gof_limit``.
         ``tree_indices`` : np.ndarray
             KDTree indices mapping included device coils to Polhemus targets.
         ``pol_gofs`` : np.ndarray, shape (n_included_coils,)
@@ -824,10 +825,6 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Stage 5: Compute device-to-head transform
     # ------------------------------------------------------------------
-    # Detect single-frequency mode: all HPI coils fired at one shared
-    # frequency (sequential OPM case) vs. distinct per-coil frequencies
-    # (e.g. a caller configured a MEGIN/Elekta-style multi-frequency setup).
-
     print(f'GOF threshold: {gof_limit:.2f} ')
     include_hpis = hpi_gofs >= gof_limit
 

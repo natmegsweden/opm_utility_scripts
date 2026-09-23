@@ -396,6 +396,7 @@ def _load_noise_reffile_window(path: str, tstart: float = 10.0, twindow: float =
 
 
 def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
+                          gof_limit: float = 0.95,
                           reffile: str | None = None) -> tuple[str, dict]:
     """Fit all HPI candidates and return the highest-scoring path and fit.
 
@@ -407,6 +408,10 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         Polhemus digitisation info, as returned by :func:`load_polhemus`.
     hpifreq : float
         Drive frequency shared by all HPI coils (Hz).
+    gof_limit : float (default 0.95)
+        Minimum dipole GOF for a coil to be included in the device-to-head
+        transform fit. Forwarded unchanged to
+        :func:`~opm_utility_scripts.hpi._core.fit_hpi` for every candidate.
     reffile : str | None
         Path to a reference recording (e.g. empty-room or resting-state)
         used for background-power-based noisy-channel detection. When
@@ -432,7 +437,8 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
             # channels from the reference raw in place, and each candidate
             # should see the same untouched reference.
             candidate_reffile = ref_raw.copy() if ref_raw is not None else None
-            fit = fit_hpi(path, polhemus, hpifreq, reffile=candidate_reffile)
+            fit = fit_hpi(path, polhemus, hpifreq, gof_limit=gof_limit,
+                          reffile=candidate_reffile)
         except Exception as exc:
             errors.append(f'{path}: {exc}')
             continue
