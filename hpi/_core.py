@@ -164,14 +164,14 @@ def find_bads(reffile=None, hpifreq=None):
         # Raw object is deferred from last 5 seconds of HPI recorging
         raw = reffile
 
-    #remove bad-marked channels
-    for bad_chan in raw.info["bads"]:
-        raw.drop_channels(bad_chan)
-
-    #remove unlocalized channels
-    bads=find_zero_location_channels(raw.info)
-    for bad_chan in bads:
-        raw.drop_channels(bad_chan)
+    # Remove bad-marked and unlocalized channels in a single batched call.
+    # Dropping channels one at a time reallocates the full (preloaded) data
+    # array on every call, which is expensive when there are many of them.
+    to_drop = list(dict.fromkeys(
+        list(raw.info["bads"]) + list(find_zero_location_channels(raw.info))
+    ))
+    if to_drop:
+        raw.drop_channels(to_drop)
           
     # Detect outliers
     picks = mne.pick_types(raw.info, meg=True, exclude='bads')
@@ -425,8 +425,9 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     # ------------------------------------------------------------------
     if isinstance(hpifile, str):
         raw = mne.io.read_raw_fif(hpifile, preload=True)
-        for bad_chan in list(raw.info['bads']):
-            raw.drop_channels(bad_chan)
+        bad_marked = list(raw.info['bads'])
+        if bad_marked:
+            raw.drop_channels(bad_marked)
     else:
         raw = hpifile
 
@@ -435,8 +436,11 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     # when MNE builds the spherical-harmonic external-interference basis in
     # compute_chpi_amplitudes -> _setup_ext_proj, propagating NaN/Inf into an
     # SVD call and crashing with "array must not contain infs or NaNs".
-    for bad_chan in find_zero_location_channels(raw.info):
-        raw.drop_channels(bad_chan)
+    # Batched into a single drop_channels() call — dropping one at a time
+    # reallocates the full preloaded data array on every call.
+    zero_loc = list(find_zero_location_channels(raw.info))
+    if zero_loc:
+        raw.drop_channels(zero_loc)
 
     hpi_names, hpi_indices = get_hpi_output_channels(raw)
     hpi_freqs = np.full(len(hpi_indices), hpifreq)
@@ -714,10 +718,10 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # Stage 2: Detect and remove noisy channels from the HPI recording. 
     # ------------------------------------------------------------------
 
-    # Find channels with zero location
+    # Find channels with zero location (batched drop — see note in find_bads).
     bads = find_zero_location_channels(raw.info)
-    for bad_chan in bads:
-        raw.drop_channels(bad_chan)
+    if len(bads):
+        raw.drop_channels(list(bads))
 
     # Remove noisy channels (skipped when no reference file is provided)
     if reffile is None:
@@ -733,9 +737,9 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             reffile = raw.copy().crop(tmin=tmin, tmax=tmax)
 
     bads, bads_fig = find_bads(reffile, hpifreq)
-    for i in bads:
-        if i in raw.info["ch_names"]:
-            raw.drop_channels(i)
+    bads_present = [i for i in bads if i in raw.info["ch_names"]]
+    if bads_present:
+        raw.drop_channels(bads_present)
 
 
     # ------------------------------------------------------------------
@@ -1134,12 +1138,14 @@ def apply_transform(
     if new_sfreq is not None and new_sfreq != raw.info['sfreq']:
         raw.load_data().resample(new_sfreq)
 
-    for bad_chan in raw.info["bads"]:
-        raw.drop_channels(bad_chan)
-
-    bads = find_zero_location_channels(raw.info)
-    for bad_chan in bads:
-        raw.drop_channels(bad_chan)
+    # Batched drop — dropping channels one at a time reallocates the full
+    # preloaded data array on every call, which is costly when there are
+    # many bad/zero-location channels (this pipeline can see up to ~100).
+    to_drop = list(dict.fromkeys(
+        list(raw.info["bads"]) + list(find_zero_location_channels(raw.info))
+    ))
+    if to_drop:
+        raw.drop_channels(to_drop)
 
     raw.info.update(dev_head_t=dev_to_head_trans)
 

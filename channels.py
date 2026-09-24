@@ -59,7 +59,10 @@ def get_hpi_output_channels(raw):
 
     for name in hpi_raw.info['ch_names']:
         if 'out' in name:
-            if raw.copy().pick([name])._data.var() > 1e-25:
+            # get_data(picks=...) returns just the requested channel(s)
+            # without deep-copying the entire (preloaded) raw object, unlike
+            # raw.copy().pick([name]) which duplicates the full data array.
+            if raw.get_data(picks=[name]).var() > 1e-25:
                 hpi_names += [name]
 
     hpi_indices = np.zeros(len(hpi_names), dtype=np.int64)
