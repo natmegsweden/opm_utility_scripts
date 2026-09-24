@@ -342,8 +342,9 @@ def load_hpifile(path: str):
     import mne
 
     raw = mne.io.read_raw_fif(path, preload=True)
-    for ch in list(raw.info['bads']):
-        raw.drop_channels(ch)
+    bads = list(raw.info['bads'])
+    if bads:
+        raw.drop_channels(bads)
     return raw
 
 
@@ -372,7 +373,10 @@ def _load_noise_reffile_window(path: str, tstart: float = 10.0, twindow: float =
     """
     import mne
 
-    raw = mne.io.read_raw_fif(path, preload=True, verbose=False)
+    # Open without preloading first so we only ever read the small window we
+    # actually need off disk, instead of pulling the entire (potentially
+    # large) reference recording into RAM before cropping it down.
+    raw = mne.io.read_raw_fif(path, preload=False, verbose=False)
     tmax_avail = raw.times[-1]
     tend = tstart + twindow
 
@@ -392,6 +396,7 @@ def _load_noise_reffile_window(path: str, tstart: float = 10.0, twindow: float =
             'recording for noisy-channel detection instead.'
         )
 
+    raw.load_data()
     return raw
 
 
