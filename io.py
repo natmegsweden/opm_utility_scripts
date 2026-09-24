@@ -3,6 +3,7 @@
 import json
 import os
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
@@ -400,10 +401,49 @@ def _load_noise_reffile_window(path: str, tstart: float = 10.0, twindow: float =
     return raw
 
 
+def _select_best_hpi_pool_initializer():
+    """``ProcessPoolExecutor`` initializer: force a headless matplotlib backend.
+
+    ``fit_hpi`` calls ``find_bads()``, which creates a matplotlib figure via
+    ``plt.subplots()``. That figure must be pickled back to the parent
+    process, and worker processes have no interactive display attached, so
+    the backend is forced to the non-interactive ``Agg`` backend here,
+    before any candidate runs. Doing this in each worker process (rather
+    than using a thread pool in the parent process) is deliberate: pyplot
+    keeps a process-global registry of open figures (``Gcf``), and
+    concurrent ``plt.subplots()`` calls from multiple *threads* in one
+    process would race on that shared mutable state. Separate processes
+    each get their own independent copy of it, so this hazard does not
+    arise.
+    """
+    import matplotlib
+    matplotlib.use('Agg', force=True)
+
+
+def _select_best_hpi_worker(path, polhemus, hpifreq, gof_limit, reffile,
+                             center_matching, n_jobs):
+    """Module-level worker run in a ``ProcessPoolExecutor`` by
+    :func:`select_best_hpi_file`.
+
+    Must stay a top-level function (not a closure) so it can be pickled and
+    dispatched to a worker process. ``fit_hpi`` is imported lazily inside
+    the function body, mirroring the local import used by the sequential
+    path below, to avoid the ``io`` <-> ``hpi._core`` circular import; it
+    also means each freshly-spawned worker process performs its own import
+    at call time, which is fine since it starts a new interpreter anyway.
+    """
+    from .hpi._core import fit_hpi
+
+    return fit_hpi(path, polhemus, hpifreq, gof_limit=gof_limit,
+                    reffile=reffile, center_matching=center_matching,
+                    n_jobs=n_jobs)
+
+
 def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
                           gof_limit: float = 0.95,
                           reffile: str | None = None,
-                          center_matching: bool = True) -> tuple[str, dict]:
+                          center_matching: bool = True,
+                          n_jobs: int = -1) -> tuple[str, dict]:
     """Fit all HPI candidates and return the highest-scoring path and fit.
 
     Parameters
@@ -431,8 +471,84 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         nearest-neighbour matching. Forwarded unchanged to
         :func:`~opm_utility_scripts.hpi._core.fit_hpi` for every candidate.
         See :func:`~opm_utility_scripts.hpi._core.fit_hpi` for details.
+    n_jobs : int (default -1)
+        Number of HPI candidates to fit concurrently, each in its own
+        worker process. Every candidate runs the *entire* ``fit_hpi``
+        pipeline independently of the others (amplitude estimation, noisy-
+        channel detection, Polhemus registration, and the time-resolved
+        coil-position fit), so this parallelises cleanly across files.
+        ``-1`` (default) uses ``min(len(hpi_files), os.cpu_count())``
+        worker processes; ``1`` runs the original strictly sequential loop
+        (identical to the pre-parallelisation behaviour, and avoids
+        process-pool startup overhead when there is only one candidate).
+        Each worker process forces the non-interactive ``Agg`` matplotlib
+        backend (see :func:`_select_best_hpi_pool_initializer`) so that
+        ``find_bads()``'s figure can be created headlessly and pickled
+        back to the caller regardless of the host's default backend.
+        ``fit_hpi_amplitudes`` (Stage 1 of each candidate's fit) already
+        spins up its own internal thread pool when *its own* ``n_jobs`` is
+        not 1; to avoid oversubscribing CPUs with
+        ``n_jobs`` (outer processes) ``x`` inner threads, each candidate's
+        inner ``fit_hpi`` call is forced to ``n_jobs=1`` whenever more than
+        one outer worker process is used. When ``n_jobs=1`` here
+        (sequential path), the inner call keeps its own default so
+        single-candidate behaviour/speed is unaffected. Each candidate's
+        HPI recording (and reference window, if any) is preloaded
+        independently in its own process, so peak memory scales with the
+        number of concurrently-running candidates -- reduce ``n_jobs`` if
+        that becomes a constraint for very large HPI recordings.
     """
     from .hpi._core import fit_hpi
+
+    n_files = len(hpi_files)
+    if n_jobs is None or n_jobs == -1:
+        max_workers = min(n_files, os.cpu_count() or 1)
+    else:
+        max_workers = max(1, min(int(n_jobs), n_files)) if n_files else 1
+
+    ref_raw = _load_noise_reffile_window(reffile) if reffile is not None else None
+
+    # Results are collected indexed by original hpi_files position (not
+    # completion order) so the tie-breaking reduction below sees candidates
+    # in exactly the same order as the original sequential loop, and thus
+    # produces a bit-identical selection regardless of which worker
+    # finishes first.
+    results: list[dict | None] = [None] * n_files
+    errors_by_index: list[str | None] = [None] * n_files
+
+    if max_workers <= 1 or n_files <= 1:
+        for i, path in enumerate(hpi_files):
+            try:
+                # Pass a fresh copy per candidate: fit_hpi/find_bads may drop
+                # channels from the reference raw in place, and each candidate
+                # should see the same untouched reference.
+                candidate_reffile = ref_raw.copy() if ref_raw is not None else None
+                results[i] = fit_hpi(path, polhemus, hpifreq, gof_limit=gof_limit,
+                                      reffile=candidate_reffile,
+                                      center_matching=center_matching)
+            except Exception as exc:
+                errors_by_index[i] = f'{path}: {exc}'
+    else:
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_select_best_hpi_pool_initializer,
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _select_best_hpi_worker, path, polhemus, hpifreq, gof_limit,
+                    ref_raw.copy() if ref_raw is not None else None,
+                    center_matching,
+                    1,  # inner fit_hpi_amplitudes n_jobs: avoid oversubscription
+                ): i
+                for i, path in enumerate(hpi_files)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                path = hpi_files[i]
+                try:
+                    results[i] = future.result()
+                except Exception as exc:
+                    errors_by_index[i] = f'{path}: {exc}'
 
     best_path = None
     best_fit = None
@@ -440,20 +556,11 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
     best_raw_mean = -np.inf
     errors = []
 
-    ref_raw = _load_noise_reffile_window(reffile) if reffile is not None else None
-
-    for path in hpi_files:
-        try:
-            # Pass a fresh copy per candidate: fit_hpi/find_bads may drop
-            # channels from the reference raw in place, and each candidate
-            # should see the same untouched reference.
-            candidate_reffile = ref_raw.copy() if ref_raw is not None else None
-            fit = fit_hpi(path, polhemus, hpifreq, gof_limit=gof_limit,
-                          reffile=candidate_reffile,
-                          center_matching=center_matching)
-        except Exception as exc:
-            errors.append(f'{path}: {exc}')
+    for i, path in enumerate(hpi_files):
+        if errors_by_index[i] is not None:
+            errors.append(errors_by_index[i])
             continue
+        fit = results[i]
 
         gofs = np.asarray(fit['hpi_gofs'], dtype=float)
         high_gofs = gofs[gofs >= gof_limit]
