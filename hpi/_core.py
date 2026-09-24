@@ -37,8 +37,8 @@ from mne.chpi import (
     make_ad_hoc_cov,
     _concatenate_coils,
     _create_meg_coils,
+    # _magnetic_dipole_delta # New location in mne 1.13 (_chpi_numba.py) defined in script
     _magnetic_dipole_field_vec,
-    _magnetic_dipole_delta,
     _get_hpi_initial_fit,
     _check_chpi_param,
     _fit_magnetic_dipole,
@@ -85,6 +85,15 @@ def _make_opm_guesses(meg_coils):
     ]
 
     return guesses
+
+# New location in mne 1.13 (_chpi_numba.py) 
+def _magnetic_dipole_delta(fwd, whitener, B, B2):
+    # Here we use .T to get whitener to Fortran order, which speeds things up
+    fwd = fwd @ whitener.T
+    u, s, v = np.linalg.svd(fwd, full_matrices=False)
+    one = v @ B
+    Bm2 = one @ one
+    return B2 - Bm2, u, s, one
 
 def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
     """Evaluate dipole GOF at a *fixed* device-space position.
@@ -740,7 +749,6 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     bads_present = [i for i in bads if i in raw.info["ch_names"]]
     if bads_present:
         raw.drop_channels(bads_present)
-
 
     # ------------------------------------------------------------------
     # Stage 3: Load Polhemus and embed digitisation into raw
