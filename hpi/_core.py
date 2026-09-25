@@ -20,6 +20,7 @@ utilities.
 import itertools
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import matplotlib.pyplot as plt
 import mne
@@ -319,7 +320,6 @@ def compute_chpi_opm_locs(
     # Make location guesses
     guesses = _make_opm_guesses(meg_coils)
     R = np.linalg.norm(meg_coils[0], axis=1).max()
-    
     fwd = _magnetic_dipole_field_vec(guesses, meg_coils, too_close)
     fwd = np.dot(fwd, whitener.T)
     fwd.shape = (guesses.shape[0], 3, -1)
@@ -389,7 +389,99 @@ def compute_chpi_opm_locs(
         chpi_locs[key] = np.array(val, float).reshape(shapes[key])
     return chpi_locs
 
-def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
+def _fit_single_hpi_coil(index, raw_orig, hpi_indices, hpi_names, hpi_freqs):
+    """Estimate the amplitude slope for a single HPI coil.
+
+    This is the body of the per-coil loop in :func:`fit_hpi_amplitudes`,
+    factored out so it can be run concurrently across coils (see the
+    ``n_jobs`` parameter there).
+
+    Each call works on its own ``raw_orig.copy()`` and reads only its own
+    arguments — no shared mutable state is written — so it is safe to
+    invoke from multiple threads at once. The heavy lifting inside
+    ``compute_chpi_amplitudes`` (SVD-based sinusoid fitting) is done in
+    numpy/scipy, which release the GIL for most of their runtime, so a
+    thread pool gives real wall-clock speedup here despite CPython's GIL.
+
+    Parameters
+    ----------
+    index : int
+        Position of this coil in ``hpi_indices`` / ``hpi_freqs``.
+    raw_orig : mne.io.Raw
+        The resampled, HPI-metadata-free raw recording (already loaded).
+        Copied internally — never mutated.
+    hpi_indices : np.ndarray
+        Channel indices of all HPI output channels.
+    hpi_names : list[str]
+        HPI output channel names (see ``get_hpi_output_channels``).
+    hpi_freqs : np.ndarray
+        Drive frequency (Hz) for each coil.
+
+    Returns
+    -------
+    dict | None
+        ``None`` when no peaks were found for this coil (the coil is
+        skipped, matching the previous sequential behaviour). Otherwise a
+        dict with keys ``index``, ``slope_row``, ``peak_tmax``, and
+        ``coil_amplitudes`` (the raw ``compute_chpi_amplitudes`` output for
+        this single coil; only its structure/shape is used downstream).
+    """
+    raw = raw_orig.copy()
+    channel_index = hpi_indices[index]
+    chan_name = raw.info['ch_names'][channel_index]
+
+    b = raw[channel_index, :][0].ravel()
+    peak_dist = round(raw.info['sfreq'] / hpi_freqs[index]) - 2
+    peaks, _ = find_peaks(b, distance=peak_dist, height=0.0001)
+
+    if len(peaks) < 1:
+        print('ERROR: no peaks found for this coil — skipping')
+        return None
+
+    minT = peaks[0] / raw.info['sfreq']
+    maxT = peaks[-1] / raw.info['sfreq']
+    tmin = (maxT - minT) / 2.0 - 3 + minT
+    tmax = (maxT - minT) / 2.0 + 3 + minT
+    raw.crop(tmin=tmin, tmax=tmax)
+
+    # Build HPI subsystem info for single coil so compute_chpi_amplitudes can run.
+    hpi_sub = dict()
+    hpi_sub["hpi_coils"] = []
+    hpi_sub["hpi_coils"].append({})
+
+    hpi_coils = []
+    hpi_coils.append({})
+
+    drive_channels = hpi_names[0]
+    default_freqs = hpi_freqs
+
+    # build coil structure
+    hpi_coils[0]["number"] = 1
+    hpi_coils[0]["drive_chan"] = drive_channels[0]
+    hpi_coils[0]["coil_freq"] = default_freqs[0]
+
+    hpi_sub["hpi_coils"][0]["event_bits"] = [256]
+
+    with raw.info._unlock():
+        raw.info["hpi_subsystem"] = hpi_sub
+        raw.info["hpi_meas"] = [{"hpi_coils": hpi_coils}]
+
+    # verbose='error' silences compute_chpi_amplitudes' own per-call tqdm
+    # progress bar. With several coils fitted concurrently that would print
+    # one interleaved bar per worker; instead fit_hpi_amplitudes drives a
+    # single shared ProgressBar covering all coils (see there).
+    coil_amplitudes = compute_chpi_amplitudes(
+        raw, tmin=0, tmax=2, t_window=2, t_step_min=2, verbose='error'
+    )
+
+    return {
+        'index': index,
+        'slope_row': coil_amplitudes['slopes'][0][0],
+        'peak_tmax': maxT,
+        'coil_amplitudes': coil_amplitudes,
+    }
+
+def fit_hpi_amplitudes(hpifile, hpifreq: float, n_jobs: int = -1) -> dict:
     """
     Load an HPI recording and estimate per-coil dipole positions and GOFs.
 
@@ -403,6 +495,23 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         Path to the raw HPI recording, or a pre-loaded Raw object.
     hpifreq : float
         Drive frequency shared by all HPI coils (Hz).
+    n_jobs : int (default -1)
+        Number of coils to fit concurrently in the per-coil amplitude
+        estimation loop (Stage 1). Each coil's fit is independent (its own
+        cropped copy of the raw recording and its own
+        ``compute_chpi_amplitudes`` call), so this loop parallelises
+        cleanly. ``-1`` (default) uses ``min(n_coils, os.cpu_count())``
+        worker threads; ``1`` runs the loop sequentially (identical to the
+        pre-parallelisation behaviour, useful for debugging or exact
+        single-threaded reproducibility); any other positive integer caps
+        the number of worker threads. A thread pool (not a process pool) is
+        used because each worker only needs a private ``raw`` copy — no
+        cross-process pickling of large Raw/Info objects is required — and
+        the numpy/scipy linear-algebra calls inside
+        ``compute_chpi_amplitudes`` release the GIL for most of their
+        runtime, so threads still achieve real parallel speedup. Coil
+        order in the returned arrays is unaffected by scheduling order —
+        results are always reassembled in the original coil order.
 
     Returns
     -------
@@ -433,7 +542,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     # Load HPI recording
     # ------------------------------------------------------------------
     if isinstance(hpifile, str):
-        raw = mne.io.read_raw_fif(hpifile, preload=True)
+        raw = mne.io.read_raw_fif(hpifile, preload=True, verbose='error')
         bad_marked = list(raw.info['bads'])
         if bad_marked:
             raw.drop_channels(bad_marked)
@@ -450,10 +559,10 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     zero_loc = list(find_zero_location_channels(raw.info))
     if zero_loc:
         raw.drop_channels(zero_loc)
-
+    
     hpi_names, hpi_indices = get_hpi_output_channels(raw)
     hpi_freqs = np.full(len(hpi_indices), hpifreq)
-
+    
     # Some acquisition systems (e.g. FieldLine OPM) write line_freq=0 to mean
     # "no notch filter configured" instead of leaving it unset. MNE's
     # compute_chpi_amplitudes only guards against `None` and divides by
@@ -465,12 +574,11 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             raw.info['line_freq'] = 50.0 # Or None, can't be 0.
 
     # Always resample to the internal fitting frequency.
-    raw.load_data().resample(_HPI_FIT_SFREQ)
-
+    raw.load_data().resample(_HPI_FIT_SFREQ, verbose='error')
     # Seed dev_head_t with identity so compute_chpi_opm_locs searches in
     # device coordinates (correct — we have not computed the transform yet).
+    
     raw.info.update(dev_head_t=Transform("meg", "head"))
-
     # ------------------------------------------------------------------
     # Per-coil amplitude estimation loop
     # ------------------------------------------------------------------
@@ -479,59 +587,69 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     n_hpis = 0
     i_hpis = []
     peak_tmax = []
-    for index in range(len(hpi_indices)):
-        raw = raw_orig.copy()
-        channel_index = hpi_indices[index]
-        chan_name = raw.info['ch_names'][channel_index]
+    
+    # Fit each coil's amplitude slope, parallelised across coils. Each
+    # coil's fit is fully independent (own raw copy, own crop, own
+    # compute_chpi_amplitudes call), so we dispatch them to a thread pool
+    # and reassemble results in the original coil order afterwards — this
+    # keeps slope/i_hpis/peak_tmax/n_hpis bookkeeping identical to the
+    # previous strictly-sequential loop regardless of completion order.
+    n_coils = len(hpi_indices)
+    if n_jobs is None or n_jobs == -1:
+        max_workers = min(n_coils, os.cpu_count() or 1)
+    else:
+        max_workers = max(1, min(int(n_jobs), n_coils))
 
-        print(f'**** HPI coil {chan_name} (index {channel_index}) ****')
+    results = [None] * n_coils
+    # One shared progress bar for the whole stage, advanced once per
+    # completed coil. Used as a plain counter (not the joblib/mmap
+    # `with pb:` pattern — that spawns a background thread which drives the
+    # bar from a memmap array and would fight with the manual updates here).
+    # compute_chpi_amplitudes' own per-call bar is silenced (verbose='error'
+    # in _fit_single_hpi_coil) so concurrent workers don't each print their
+    # own interleaved bar.
+    pbar = ProgressBar(n_coils, mesg='Fitting HPI coil amplitudes')
+    if max_workers <= 1 or n_coils <= 1:
+        # Sequential fallback — also avoids thread-pool overhead for a
+        # single coil, and gives a deterministic single-threaded path for
+        # debugging.
+        for index in range(n_coils):
+            results[index] = _fit_single_hpi_coil(
+                index, raw_orig, hpi_indices, hpi_names, hpi_freqs
+            )
+            pbar.update_with_increment_value(1)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(
+                    _fit_single_hpi_coil, index, raw_orig, hpi_indices, hpi_names, hpi_freqs
+                ): index
+                for index in range(n_coils)
+            }
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+                pbar.update_with_increment_value(1)
 
-        b = raw[channel_index, :][0].ravel()
-        peak_dist = round(raw.info['sfreq'] / hpifreq) - 2
-        peaks, _ = find_peaks(b, distance=peak_dist, height=0.0001)
-
-        if len(peaks) < 1:
-            print('ERROR: no peaks found for this coil — skipping')
+    coil_amplitudes = None
+    for index in range(n_coils):
+        result = results[index]
+        if result is None:
             continue
-
-        minT = peaks[0] / raw.info['sfreq']
-        maxT = peaks[-1] / raw.info['sfreq']
-        peak_tmax.append(maxT)
-        tmin = (maxT - minT) / 2.0 - 3 + minT
-        tmax = (maxT - minT) / 2.0 + 3 + minT
-        raw.crop(tmin=tmin, tmax=tmax)
-
-        # Build HPI subsystem info for singe coil so compute_chpi_amplitudes can run.
-        hpi_sub = dict()
-
-        hpi_sub["hpi_coils"] = []
-        hpi_sub["hpi_coils"].append({})
-
-        hpi_coils=[]
-        hpi_coils.append({})
-
-        drive_channels = hpi_names[0]
-        default_freqs = hpi_freqs
-
-        # build coil structure
-        hpi_coils[0]["number"] = 1
-        hpi_coils[0]["drive_chan"] = drive_channels[0]
-        hpi_coils[0]["coil_freq"] = default_freqs[0]
-
-        hpi_sub["hpi_coils"][0]["event_bits"] = [256]
-
-        with raw.info._unlock():
-            raw.info["hpi_subsystem"] = hpi_sub
-            raw.info["hpi_meas"] = [{"hpi_coils": hpi_coils}]
-
-        coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2)
-        slope[index,:] = coil_amplitudes['slopes'][0][0]
+        slope[index, :] = result['slope_row']
         i_hpis.append(index)
-        n_hpis+=1
-        
+        peak_tmax.append(result['peak_tmax'])
+        coil_amplitudes = result['coil_amplitudes']
+        n_hpis += 1
+
     hpi_indices = hpi_indices[i_hpis]
     hpi_freqs   = hpi_freqs[i_hpis]
     peak_tlast    = max(peak_tmax)
+
+    # Fresh, unmodified copy to attach the aggregated HPI struct below — the
+    # per-coil loop above no longer leaves a mutated `raw` in scope
+    # (previously this was whichever raw copy the last loop iteration
+    # produced; that object's identity was otherwise unused).
+    raw = raw_orig.copy()
 
     # Adding full hpi struct to info
     hpi_sub = dict()
@@ -605,7 +723,8 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float = 0.95,
             landmark_weight: float = 1.0, optim: str = "none",
-            reffile: str = None, center_matching: bool = True) -> dict:
+            reffile: str = None, center_matching: bool = True,
+            n_jobs: int = -1) -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
     the device-to-head transform.
@@ -662,6 +781,9 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         during the closed-form fit (Stage 5), not whether a post-fit
         optimisation is applied afterwards. Intended for regression
         testing / legacy-parity comparisons rather than routine use.
+    n_jobs : int (default -1)
+        Forwarded to :func:`fit_hpi_amplitudes` to control how many coils
+        are fit concurrently in Stage 1. See its docstring for details.
 
     Returns
     -------
@@ -712,7 +834,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Stage 1: HPI amplitude estimation (no polhemus needed)
     # ------------------------------------------------------------------
-    amp = fit_hpi_amplitudes(hpifile, hpifreq)
+    amp = fit_hpi_amplitudes(hpifile, hpifreq, n_jobs=n_jobs)
     hpi_names       = amp['hpi_names']
     hpi_indices     = amp['hpi_indices']
     hpi_freqs       = amp['hpi_freqs']
