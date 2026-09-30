@@ -144,7 +144,7 @@ def perturb_transform(T0, params):
         trans=T,
     )
 
-def find_bads(reffile=None, hpifreq=None):
+def find_bads(reffile=None, hpifreq=None, match_channels=None):
     """Detect noisy MEG channels from a reference recording (e.g. resting state).
 
     Parameters
@@ -156,6 +156,23 @@ def find_bads(reffile=None, hpifreq=None):
         list is returned.
     hpifreq : float | None
         HPI drive frequency in Hz, used only to label the diagnostic plot.
+    match_channels : list[str] | None
+        Channel names to restrict the reference recording to before running
+        outlier detection — pass the *target* recording's own remaining
+        channel names here (e.g. the HPI raw's ``info['ch_names']`` after
+        its own zero-location/explicit-bad channels have already been
+        dropped). When ``reffile`` is an independent recording (not simply
+        a cropped copy of the target raw), its channel population, its own
+        ``info['bads']``, and its own zero-location channels generally
+        differ from the target's. Without this restriction the background
+        power mean/std/threshold used for the z-score cut are computed over
+        the *reference file's* population, not the target's — channels
+        present only in the reference pollute the statistics, and channels
+        present only in the target are never tested at all. Restricting to
+        the intersection here makes the returned bad-channel list, and the
+        statistics behind it, reflect exactly the channel set that will
+        actually be used downstream. When ``None`` (default), no
+        restriction is applied — matches the previous behaviour.
 
     Returns
     -------
@@ -182,7 +199,18 @@ def find_bads(reffile=None, hpifreq=None):
     ))
     if to_drop:
         raw.drop_channels(to_drop)
-          
+
+    # Restrict to the channels also present in the target recording so the
+    # outlier statistics (and the returned bad list) are computed over the
+    # exact channel population that will actually be used downstream — see
+    # the ``match_channels`` docstring above for why this matters whenever
+    # ``reffile`` is an independently-loaded recording.
+    if match_channels is not None:
+        keep_set = set(match_channels)
+        extra = [ch for ch in raw.ch_names if ch not in keep_set]
+        if extra:
+            raw.drop_channels(extra)
+
     # Detect outliers
     picks = mne.pick_types(raw.info, meg=True, exclude='bads')
     spectrum = raw.compute_psd(picks=picks, method="welch", fmin=70, fmax=80, n_fft=5000, n_per_seg=5000)
@@ -722,7 +750,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, n_jobs: int = -1) -> dict:
 
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float = 0.95,
-            landmark_weight: float = 1.0, optim: str = "none",
+            landmark_weight: float = 1.0, optim: str = "rigid",
             reffile: str = None, center_matching: bool = True,
             n_jobs: int = -1) -> dict:
     """
@@ -759,6 +787,13 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
 
         * ``0.0`` — landmarks ignored; reproduces the previous HPI-only
           behaviour (useful for regression testing).
+    optim : str (default "rigid")
+        Optimization method applied after the initial HPI→Polhemus
+        coregistration (Stage 5). ``"none"``: no refinement. ``"rigid"``
+        (default): refine the device-to-head transform with a bounded
+        L-BFGS-B search over a small rigid perturbation (±5–10° rotation,
+        ±5 mm translation) that maximises the mean dipole-fit GOF at the
+        digitised polhemus positions (Stage 6).
     reffile : str | None
         Path to a reference recording (e.g. resting state) used for
         background-power-based noisy-channel detection during the HPI
@@ -867,7 +902,12 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             tmin = tmax - twindow
             reffile = raw.copy().crop(tmin=tmin, tmax=tmax)
 
-    bads, bads_fig = find_bads(reffile, hpifreq)
+    # Restrict the reference file's outlier-detection population to the
+    # HPI recording's own remaining channels (post zero-location drop
+    # above) — see find_bads' match_channels docstring for why this
+    # matters whenever reffile is an independently-loaded recording rather
+    # than a cropped copy of raw itself.
+    bads, bads_fig = find_bads(reffile, hpifreq, match_channels=raw.info["ch_names"])
     bads_present = [i for i in bads if i in raw.info["ch_names"]]
     if bads_present:
         raw.drop_channels(bads_present)
@@ -1144,6 +1184,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'pol_gofs':     pol_gofs,
         'bads':         bads,
         'bads_fig':     bads_fig,
+        'optim':        optim,
     }
 
 def compute_fit_diagnostics(fit):
@@ -1169,6 +1210,11 @@ def compute_fit_diagnostics(fit):
         Translation magnitude of the device-to-head transform in mm.
     ``mean_res_mm`` : float
         Mean per-coil residual over included coils (mm).
+    ``mean_gof`` : float
+        Mean per-coil dipole-fit GOF over *all* coils (0-1).
+    ``optim`` : str
+        Optimization method used by :func:`fit_hpi` for this result
+        (``"none"`` or ``"rigid"``).
     ``intercoil_rows`` : list[tuple]
         One entry per coil pair among *included* coils.  Each tuple is
         ``(name_i, name_j, dev_dist_mm, pol_dist_mm, diff_mm)``
@@ -1185,6 +1231,9 @@ def compute_fit_diagnostics(fit):
 
     dists_mm = np.array(fit['dist']) * 1000
     mean_res_mm = float(np.mean(dists_mm)) if len(dists_mm) else float('nan')
+
+    hpi_gofs_all = np.array(fit['hpi_gofs'])
+    mean_gof = float(np.mean(hpi_gofs_all)) if len(hpi_gofs_all) else float('nan')
 
     # Inter-coil distances — included coils only, polhemus reordered by
     # tree_indices so that dev[k] and orig[k] are the same physical coil.
@@ -1214,6 +1263,8 @@ def compute_fit_diagnostics(fit):
         'rot_deg':        rot_deg,
         'trans_mm':       trans_mm,
         'mean_res_mm':    mean_res_mm,
+        'mean_gof':       mean_gof,
+        'optim':          fit.get('optim', 'none'),
         'intercoil_rows': intercoil_rows,
         'bads':           fit.get('bads', []),
         'bads_fig':       fit.get('bads_fig', []),
