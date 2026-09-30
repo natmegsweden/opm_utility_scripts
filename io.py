@@ -373,6 +373,10 @@ def _load_noise_reffile_window(path: str, tstart: float = 10.0, twindow: float =
         Preloaded, cropped reference recording.
     """
     import mne
+    
+    if not os.path.exists(path):
+        print(f'No file associated with {path}')
+        return None
 
     # Open without preloading first so we only ever read the small window we
     # actually need off disk, instead of pulling the entire (potentially
