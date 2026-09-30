@@ -188,11 +188,11 @@ def _parse_args():
              'testing / legacy-parity comparisons, not routine use.',
     )
     p.add_argument(
-        '--optimization', choices=['none', 'rigid'], default='none', metavar='METHOD',
+        '--optimization', choices=['none', 'rigid'], default='rigid', metavar='METHOD',
         help='Optimization method applied after the initial HPI→Polhemus '
-             'coregistration. "none": no refinement (default). "rigid": '
+             'coregistration. "none": no refinement. "rigid": '
              'refine with rigid transform of polhemus locations by '
-             'minimizing the summed dipole RV.',
+             'minimizing the summed dipole RV (default).',
     )
     p.add_argument(
         '--sfreq', '-s', type=float, default=None, metavar='HZ',

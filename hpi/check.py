@@ -30,12 +30,9 @@ import numpy as np
 # _get_hpi_initial_fit) and MEGIN/Elekta MaxFilter convention, consistent
 # with Zetter et al. 2019 (doi:10.1038/s41598-019-41763-4) and Tierney et
 # al. 2021 (doi:10.1016/j.neuroimage.2021.118091).
-_GOF_ACCEPT     = 0.98  # per-coil fit GOF acceptance threshold (matches the
+_GOF_ACCEPT     = 0.95  # per-coil fit GOF acceptance threshold (matches the
                         # gof_limit used for coil inclusion in _core.fit_hpi)
-_POL_GOF_ACCEPT = 0.98  # polhemus-position GOF threshold — lower than _GOF_ACCEPT
-                        # because _gof_at_fixed_pos uses raw slopes without the
-                        # SSS-like external interference projection, so values
-                        # naturally run ~0.05 below the floating-dipole GOF
+_POL_GOF_ACCEPT = 0.95  # polhemus-position GOF threshold — same as _GOF_ACCEPT
 _DIST_ACCEPT    = 5.0   # per-coil residual (mm) — MNE default dist_limit 0.005 m
 _MIN_COILS      = 3     # minimum coils that must pass _GOF_ACCEPT to accept the
                         # fit — e.g. 3 of 4 coils with GOF ≥ 0.98 is accepted
@@ -408,13 +405,13 @@ def _parse_args():
                         help='Show full diagnostics in --hpi + --pol mode '
                              '(sensor count, inter-coil distance table, pol-GOFs).')
     parser.add_argument('--optimization', choices=['none', 'rigid'],
-                        default='none',metavar='METHOD',
+                        default='rigid',metavar='METHOD',
                         help=(
                             'Optimization method applied after the initial HPI→Polhemus '
                             'coregistration. '
-                            '"none": no refinement (default). '
+                            '"none": no refinement. '
                             '"rigid": refine with rigid transform of polhemus '
-                            'locations by minimizing the summed dipole RV.'
+                            'locations by minimizing the summed dipole RV (default).'
                         ))
     parser.add_argument('--no-center-matching', dest='center_matching',
                         action='store_false', default=True,
@@ -743,7 +740,13 @@ def _build_figure_full(fit, detailed=False, diag=None):
     ax_3d.xaxis.pane.set_edgecolor('white')
     ax_3d.yaxis.pane.set_edgecolor('white')
     ax_3d.zaxis.pane.set_edgecolor('white')
-    ax_3d.set_title('HPI fitted (●) vs Polhemus target (★) — head space', fontsize=9)
+    if diag is None:
+        diag = compute_fit_diagnostics(fit)
+    ax_3d.set_title(
+        f'HPI fitted (●) vs Polhemus target (★) — head space\n'
+        f'mean GOF={diag["mean_gof"]:.3f}, optim={diag["optim"]}',
+        fontsize=9,
+    )
 
     _fill_text_panel_full(ax_text, fit, detailed=detailed, diag=diag)
     return fig
@@ -771,6 +774,7 @@ def _fill_text_panel_full(ax, fit, detailed=False, diag=None):
     def add(t, c='black'): lines.append((t, c))
 
     add('HPI Check (full coregistration)', 'black')
+    add(f'mean GOF={diag["mean_gof"]:.3f}, optim={diag["optim"]}', '#444444')
     add('─' * 40, '#888888')
 
     # Sensor count (detailed only)
@@ -851,7 +855,8 @@ def _print_diagnostics_full(fit, detailed=False, diag=None):
     if diag is None:
         diag = compute_fit_diagnostics(fit)
 
-    _sep('HPI Check — full coregistration')
+    _sep(f'HPI Check — full coregistration '
+         f'(mean GOF={diag["mean_gof"]:.3f}, optim={diag["optim"]})')
 
     if detailed:
         raw = fit.get('raw_for_topomap')
