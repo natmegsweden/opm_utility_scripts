@@ -631,8 +631,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float = 0.95,
             landmark_weight: float = 1.0, optim: str = "rigid",
-            reffile: str = None, center_matching: bool = True,
-            n_jobs: int = -1) -> dict:
+            reffile: str = None, center_matching: bool = True) -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
     the device-to-head transform.
@@ -696,10 +695,6 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         during the closed-form fit (Stage 5), not whether a post-fit
         optimisation is applied afterwards. Intended for regression
         testing / legacy-parity comparisons rather than routine use.
-    n_jobs : int (default -1)
-        Forwarded to :func:`fit_hpi_amplitudes` to control how many coils
-        are fit concurrently in Stage 1. See its docstring for details.
-
     Returns
     -------
     dict
@@ -749,7 +744,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Stage 1: HPI amplitude estimation (no polhemus needed)
     # ------------------------------------------------------------------
-    amp = fit_hpi_amplitudes(hpifile, hpifreq, n_jobs=n_jobs)
+    amp = fit_hpi_amplitudes(hpifile, hpifreq)
     hpi_names       = amp['hpi_names']
     hpi_indices     = amp['hpi_indices']
     hpi_freqs       = amp['hpi_freqs']
