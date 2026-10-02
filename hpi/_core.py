@@ -784,6 +784,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # than a cropped copy of raw itself.
     bads, bads_fig = find_bads(reffile, hpifreq, match_channels=raw.info["ch_names"])
     bads_present = [i for i in bads if i in raw.info["ch_names"]]
+    print(f"Detected {len(bads_present)} bad channel(s) for exclusion.")
     if bads_present:
         raw.drop_channels(bads_present)
 
