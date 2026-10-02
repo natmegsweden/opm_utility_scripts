@@ -258,7 +258,7 @@ def find_bads(reffile=None, hpifreq=None, match_channels=None):
         ax.text(
             idx,
             background_power[idx],
-            ch_names[idx],
+            bad_chs,
             rotation=45,
             fontsize=8,
             color='red'
@@ -928,6 +928,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # Detect and remove noisy channels.
     bads, bads_fig = _detect_noise(raw0, reffile, hpifreq, peak_tlast_override=None)
     bads_present = [i for i in bads if i in raw0.info["ch_names"]]
+    print(f"Detected {len(bads_present)} bad channel(s) for exclusion.")
     if bads_present:
         raw0.drop_channels(bads_present)
 
