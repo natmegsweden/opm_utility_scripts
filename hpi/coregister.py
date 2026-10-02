@@ -296,7 +296,7 @@ def main():
     print(f"hpi_dev  (device frame, mm):\n{np.round(hpi_dev * 1000, 1)}\n")
     print(f"mean distance = {np.mean(dist) * 1000:.1f} mm\n")
     for index, value in enumerate(hpi_gofs):
-        status = 'ok' if value > 0.9 else 'not ok'
+        status = 'ok' if fit['include_hpis'][index] else 'not ok'
         print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Status: {status}")
     print('---------------------------------------------')
 

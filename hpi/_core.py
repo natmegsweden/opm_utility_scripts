@@ -181,7 +181,7 @@ def find_bads(reffile=None, hpifreq=None, match_channels=None):
         ``None``.
     """
     if reffile is None:
-        return [], None
+        return [], None, []
 
     # If reffile is defined as a string, load it as a raw object. Otherwise, assume it's already a raw object.
     if isinstance(reffile, str):
@@ -211,11 +211,16 @@ def find_bads(reffile=None, hpifreq=None, match_channels=None):
         if extra:
             raw.drop_channels(extra)
 
-    # Detect outliers
-    picks = mne.pick_types(raw.info, meg=True, exclude='bads')
+    # Detect outliers: use meg=True (covers both mag and grad in MEG),
+    # eeg=False (exclude EEG channels), exclude='bads' to skip pre-marked bads.
+    picks = pick_types(raw.info, meg=True, eeg=False, exclude='bads')
     spectrum = raw.compute_psd(picks=picks, method="welch", fmin=70, fmax=80, n_fft=5000, n_per_seg=5000)
     psds = spectrum.get_data()
     background_power = psds.mean(axis=1)
+
+    # Record the channel names corresponding to the PSD picks — used later as
+    # slope_ch_names so downstream topomap geometry can be validated.
+    slope_ch_names = [raw.ch_names[p] for p in picks]
 
     good_idx = np.arange(len(background_power))
 
@@ -229,8 +234,7 @@ def find_bads(reffile=None, hpifreq=None, match_channels=None):
         good_idx = new_good_idx
 
     bad_idx = np.setdiff1d(np.arange(len(background_power)), good_idx)
-    ch_names = [raw.ch_names[p] for p in picks]
-    bad_chs = [ch_names[idx] for idx in bad_idx]
+    bad_chs = [slope_ch_names[idx] for idx in bad_idx]
 
     x = np.arange(len(background_power))
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -270,7 +274,7 @@ def find_bads(reffile=None, hpifreq=None, match_channels=None):
     fig.tight_layout()
     #plt.show()
     
-    return bad_chs, fig
+    return bad_chs, fig, slope_ch_names
 
 def compute_chpi_opm_locs(
     info,
@@ -439,7 +443,7 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
 
         ``hpi_names`` : list[str]
             HPI output channel names (from ``get_hpi_output_channels``).
-        ``hpi_indices`` : list[int]
+        ``hpi_indices`` : np.ndarray
             Channel indices of the HPI output channels in ``raw_orig``.
         ``hpi_freqs`` : np.ndarray, shape (n_coils,)
             Drive frequency (Hz) used for each coil.  All entries are
@@ -448,6 +452,12 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             per-coil so callers can detect distinct-frequency setups.
         ``slope`` : np.ndarray, shape (n_coils, n_meg_mag_channels)
             Accumulated amplitude slope matrix.
+        ``slope_ch_names`` : list[str]
+            Ordered MEG sensor names identifying the slope columns.
+        ``original_coil_indices`` : np.ndarray
+            Surviving coil indices in the original drive-channel ordering.
+        ``peak_tlast`` : float
+            Last detected drive peak time in seconds.
         ``raw_orig`` : mne.io.Raw
             The resampled raw with HPI subsystem metadata set.
             Caller must embed ``dig`` before calling ``compute_chpi_opm_locs``.
@@ -466,7 +476,9 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         if bad_marked:
             raw.drop_channels(bad_marked)
     else:
-        raw = hpifile
+        raw = hpifile.copy()
+        if raw.info['bads']:
+            raw.drop_channels(list(raw.info['bads']))
         
     # Drop channels with zero/invalid location before any MEG-geometry-based
     # computation. Left in place, these cause a division by zero (r_n == 0)
@@ -503,7 +515,17 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
     # Per-coil amplitude estimation loop
     # ------------------------------------------------------------------
     raw_orig = raw.copy()
-    slope = np.zeros((len(hpi_indices), len(pick_types(raw.info, meg='mag'))), dtype=float)
+    # Record the MEG-mag column ordering at the *start* (before any per-coil
+    # crops alter raw).  The same ordering must be used for the slope matrix,
+    # the projector column names, whitener, meg_coils geometry, fixed-position
+    # pol_gofs, and topomap — all downstream paths assume a consistent
+    # sensor ordering derived from the original full recording.
+    # Use meg=True, eeg=False to pick all MEG sensor types (mag + grad)
+    # matching MNE convention, not just magnetometers.
+    _meg_mag_picks = pick_types(raw.info, meg=True, eeg=False, exclude='bads')
+    slope_ch_names = [raw.ch_names[p] for p in _meg_mag_picks]
+    n_meg = len(_meg_mag_picks)
+    slope = np.zeros((len(hpi_indices), n_meg), dtype=float)
     n_hpis = 0
     i_hpis = []
     peak_tmax = []
@@ -523,11 +545,39 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         minT = peaks[0] / raw.info['sfreq']
         maxT = peaks[-1] / raw.info['sfreq']
         peak_tmax.append(maxT)
-        tmin = (maxT - minT) / 2.0 - 3 + minT
-        tmax = (maxT - minT) / 2.0 + 3 + minT
+
+        # Centered 2-second crop: midpoint ± 1 s, explicitly guard against
+        # negative times and insufficient recording/activation length.
+        mid = (minT + maxT) / 2.0
+        if maxT - minT < 2.0 - 2.0 / raw.info['sfreq']:
+            raise ValueError(f"Cannot fit coil {chan_name}: activation is shorter than 2 seconds.")
+        tmin = mid - 1.0
+        tmax = mid + 1.0
+        # Guard: clip to valid recording boundaries (no silent shortening).
+        if tmin < raw.times[0]:
+            raise ValueError(
+                f"Cannot fit coil {chan_name}: centred crop tmin={tmin:.3f}s "
+                f"is before recording start ({raw.times[0]:.3f}s). "
+                f"Activation [{minT:.3f}, {maxT:.3f}]s is too early."
+            )
+        if tmax > raw.times[-1]:
+            raise ValueError(
+                f"Cannot fit coil {chan_name}: centred crop tmax={tmax:.3f}s "
+                f"is beyond recording end ({raw.times[-1]:.3f}s). "
+                f"Activation [{minT:.3f}, {maxT:.3f}]s is too late."
+            )
         raw.crop(tmin=tmin, tmax=tmax)
 
-        # Build HPI subsystem info for singe coil so compute_chpi_amplitudes can run.
+        # Ensure the cropped duration is at least 2 seconds
+        # (sample-rounding robust).
+        actual_duration = (raw.last_samp - raw.first_samp + 1) / raw.info['sfreq']
+        if actual_duration < 1.99:
+            raise ValueError(
+                f"Cannot fit coil {chan_name}: centred crop [{tmin:.3f}, {tmax:.3f}]s "
+                f"is only {actual_duration:.4f}s after sample-rounding (< 2s)."
+            )
+
+        # Build HPI subsystem info for single coil so compute_chpi_amplitudes can run.
         hpi_sub = dict()
 
         hpi_sub["hpi_coils"] = []
@@ -536,13 +586,15 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         hpi_coils=[]
         hpi_coils.append({})
 
-        drive_channels = hpi_names[0]
-        default_freqs = hpi_freqs
+        # Use the *full* drive-channel name of the current coil, not the
+        # first character of the first coil's name.
+        drive_chan = hpi_names[index]
+        coil_freq = hpi_freqs[index]
 
         # build coil structure
         hpi_coils[0]["number"] = 1
-        hpi_coils[0]["drive_chan"] = drive_channels[0]
-        hpi_coils[0]["coil_freq"] = default_freqs[0]
+        hpi_coils[0]["drive_chan"] = drive_chan
+        hpi_coils[0]["coil_freq"] = coil_freq
 
         hpi_sub["hpi_coils"][0]["event_bits"] = [256]
 
@@ -550,14 +602,27 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
             raw.info["hpi_subsystem"] = hpi_sub
             raw.info["hpi_meas"] = [{"hpi_coils": hpi_coils}]
 
+        # Fit at [0, 2] from crop start (= midpoint-1 to midpoint+1).
         coil_amplitudes = compute_chpi_amplitudes(raw, tmin=0, tmax=2, t_window=2, t_step_min=2, verbose='error')
         slope[index,:] = coil_amplitudes['slopes'][0][0]
         i_hpis.append(index)
         n_hpis+=1
         
-    hpi_indices = hpi_indices[i_hpis]
+    if n_hpis == 0:
+        raise ValueError(
+            "No HPI coils had detectable peaks. Cannot proceed; "
+            "check the HPI drive signal and recording."
+        )
+    # Filter per-coil metadata to match only coils with peaks, preserving
+    # the original index mapping: hpi_names, hpi_indices, hpi_freqs, and
+    # slope rows are filtered together consistently.  i_hpis holds the
+    # original indices of coils that succeeded, and slope rows for failed
+    # coils remain as unfilled zeros (they will be dropped below).
+    slope = slope[i_hpis]         # keep only rows for coils with peaks
+    hpi_names = [hpi_names[i] for i in i_hpis]
+    hpi_indices = np.asarray(hpi_indices)[i_hpis]
     hpi_freqs   = hpi_freqs[i_hpis]
-    peak_tlast    = max(peak_tmax)
+    peak_tlast  = max(peak_tmax)
 
     # Adding full hpi struct to info
     hpi_sub = dict()
@@ -623,10 +688,86 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float) -> dict:
         'hpi_indices':     hpi_indices,
         'hpi_freqs':       hpi_freqs,
         'slope':           slope,
+        'slope_ch_names':  slope_ch_names,
         'raw_orig':        raw_orig,
         'coil_amplitudes': coil_amplitudes,
         'peak_tlast':       peak_tlast,
+        'original_coil_indices': np.asarray(i_hpis, dtype=int),
     }
+
+def _detect_noise(raw, reffile, hpifreq, peak_tlast_override=None):
+    """Detect noisy MEG channels and return (bads_list, bads_fig).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        The HPI recording (preloaded, zero-location channels already dropped).
+    reffile : str | mne.io.Raw | None
+        Path to a reference recording, a pre-loaded Raw object, or None.
+        When None, the last 5 seconds of *raw* are used as the reference
+        segment, provided they are at least 5 seconds after the final
+        activation peak (``peak_tlast_override``) or the last actual drive
+        peak found by interleaving the HPI drive channels.
+    hpifreq : float | None
+        HPI drive frequency for plot labelling.
+    peak_tlast_override : float | None
+        If provided, use this as the last activation peak time instead of
+        detecting peaks from scratch.  Used when ``_detect_noise`` is
+        called *before* amplitude estimation, so the per-coil peak
+        detection has not run yet.
+
+    Returns
+    -------
+    bads : list[str]
+        Channel names flagged as noisy.  Empty when detection is skipped.
+    bads_fig : matplotlib.figure.Figure or None
+    """
+    if reffile is None:
+        # Auto-detect from the tail of *raw*.
+        tmax = raw.times[-1]
+        duration = tmax - raw.times[0]
+        # Compute the last actual drive peak from HPI output channels before
+        # peak_tlast_override (if available), or from the raw recording itself.
+        if peak_tlast_override is not None:
+            last_peak = peak_tlast_override
+        else:
+            # Find drive peaks by scanning HPI output channels and interleaving.
+            hpi_names_detect, _ = get_hpi_output_channels(raw)
+            all_peaks = []
+            for ch_name in hpi_names_detect:
+                if ch_name in raw.info['ch_names']:
+                    sig, = raw[raw.info['ch_names'].index(ch_name), :][0]
+                    peak_dist = round(raw.info['sfreq'] / max(hpifreq, 1.0)) - 2
+                    pk, _ = find_peaks(sig, distance=peak_dist, height=0.0001)
+                    if len(pk):
+                        all_peaks.append(pk[-1] / raw.info['sfreq'])
+            last_peak = max(all_peaks) if all_peaks else 0.0
+
+        twindow = 5.0
+        # Guard: only fall back to last-5-seconds if the last peak is early
+        # enough that 5 s of clean tail remains.
+        if last_peak + 5.0 > duration:
+            print("WARNING: HPI recording is too short to extract a reference "
+                  "segment for bad-channel detection. Skipping.")
+            return [], None
+        print("Extracting 5 s reference segment from the end of the HPI "
+              "recording for bad-channel detection.")
+        tmin = tmax - twindow
+        ref = raw.copy().crop(tmin=tmin, tmax=tmax)
+        # Resample the reference segment to 1000 Hz before noise PSD so the
+        # spectral resolution is consistent regardless of the original sfreq.
+        ref.load_data().resample(1000.0, verbose='error')
+    else:
+        if isinstance(reffile, str):
+            ref = mne.io.read_raw_fif(reffile, preload=True, verbose='error')
+            ref.resample(1000.0, verbose='error')
+        else:
+            ref = reffile.copy()
+            ref.load_data().resample(1000.0, verbose='error')
+
+    bads, fig, _ = find_bads(ref, hpifreq, match_channels=raw.info["ch_names"])
+    return bads, fig
+
 
 def fit_hpi(hpifile, polfile, hpifreq: float,
             gof_limit: float = 0.95,
@@ -658,37 +799,27 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         transform fit. Coils with ``hpi_gofs < gof_limit`` are excluded
         from the point-matching/rigid-transform step (Stage 5).
     landmark_weight : float
-        Weight for the landmark (nasion, LPA, RPA) constraint in the
-        device-to-head transform fit.  The combined score used for
-        permutation selection and the refined fit is::
-
-            score = HPI_residual + landmark_weight * landmark_residual
-
-        * ``0.0`` — landmarks ignored; reproduces the previous HPI-only
-          behaviour (useful for regression testing).
+        Deprecated inactive compatibility parameter. No landmark-weighted
+        objective is implemented; a non-default value emits a warning.
     optim : str (default "rigid")
         Optimization method applied after the initial HPI→Polhemus
         coregistration (Stage 5). ``"none"``: no refinement. ``"rigid"``
         (default): refine the device-to-head transform with a bounded
-        L-BFGS-B search over a small rigid perturbation (±5–10° rotation,
+        L-BFGS-B search over a small rigid perturbation (±5° rotation,
         ±5 mm translation) that maximises the mean dipole-fit GOF at the
         digitised polhemus positions (Stage 6).
     reffile : str | None
         Path to a reference recording (e.g. resting state) used for
         background-power-based noisy-channel detection during the HPI
         amplitude-estimation stage. Optional — when ``None`` (default),
-        this detection step is skipped. Forwarded to
-        :func:`fit_hpi_amplitudes`.
-        * ``1.0`` (default) — equal metre-scale contribution.
-        * Higher values — stronger landmark constraint, useful when coil
-          geometry is nearly symmetric and HPI residuals alone cannot
-          disambiguate the mapping.
+        the final five seconds are used only if they follow HPI activation.
+        Detection and exclusions happen before amplitude estimation.
     center_matching : bool (default True)
         Whether to subtract each point cloud's centroid before the
         nearest-neighbour (cKDTree) match between fitted device-frame HPI
         coil positions and head-frame Polhemus positions. Centring makes
-        the match invariant to a bulk translation offset between the two
-        frames, not just rotation — the more robust default. Set to
+        the match invariant to a bulk translation offset, but not arbitrary
+        inter-frame rotation. Set to
         ``False`` to match on the raw (uncentred) coordinates instead,
         reproducing the legacy pipeline's matching behaviour. This is
         independent of ``optim``: it changes *which points are matched*
@@ -726,6 +857,18 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             Accumulated slope matrix (used for topomaps in ``coregister.py``).
         ``raw_for_topomap`` : mne.io.Raw
             MEG-only copy of the HPI raw suitable for EvokedArray topomaps.
+        ``slope_ch_names`` : list[str]
+            Ordered sensor names shared by slopes and topomap geometry.
+        ``bads`` : list[str]
+            Detected noisy channels excluded before amplitude estimation.
+        ``bads_fig`` : matplotlib.figure.Figure | None
+            Noise diagnostic figure, when noise detection ran.
+        ``optim`` : str
+            Requested refinement method.
+        ``opt_status`` : int | None
+            Optimizer status, or None when refinement was not run.
+        ``opt_success`` : bool | None
+            Whether a finite successful refinement was accepted.
         ``dist`` : np.ndarray
             Per-coil residual distances in head space (metres).
         ``include_hpis`` : np.ndarray of bool
@@ -742,9 +885,54 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     """
 
     # ------------------------------------------------------------------
+    # Stage 0: Validate and warn for documented-but-unimplemented options
+    # ------------------------------------------------------------------
+    # landmark_weight is accepted for API compatibility but not implemented.
+    # The rigid fit uses HPI coil positions, not weighted fiducial landmarks.
+    if landmark_weight != 1.0:
+        warnings.warn(
+            "landmark_weight != 1.0 is accepted for API compatibility but "
+            "has no effect: the current rigid fit uses HPI coil positions "
+            "only, without landmark constraints.",
+            UserWarning, stacklevel=2,
+        )
+
+    # ------------------------------------------------------------------
     # Stage 1: HPI amplitude estimation (no polhemus needed)
     # ------------------------------------------------------------------
-    amp = fit_hpi_amplitudes(hpifile, hpifreq)
+    # Before fitting amplitudes, detect and remove bad/noisy channels
+    # from the HPI recording.  This must happen *before* amplitude
+    # estimation so the projector, whitener, and sensor geometry all
+    # reflect the cleaned channel set — not merely a diagnostic copy.
+    # ------------------------------------------------------------------
+    # Stage 1a: Load and clean the HPI recording
+    # ------------------------------------------------------------------
+    if isinstance(hpifile, str):
+        raw0 = mne.io.read_raw_fif(hpifile, preload=True, verbose='error')
+        bad_marked = list(raw0.info['bads'])
+        if bad_marked:
+            raw0.drop_channels(bad_marked)
+    else:
+        raw0 = hpifile.copy().load_data()
+        if raw0.info['bads']:
+            raw0.drop_channels(list(raw0.info['bads']))
+
+    # Drop zero/invalid-location channels before any MEG-geometry computation.
+    zero_loc = list(find_zero_location_channels(raw0.info))
+    if zero_loc:
+        raw0.drop_channels(zero_loc)
+
+    # Use the same internal sampling rate for noise PSD and amplitude fitting.
+    raw0.load_data().resample(_HPI_FIT_SFREQ, verbose='error')
+
+    # Detect and remove noisy channels.
+    bads, bads_fig = _detect_noise(raw0, reffile, hpifreq, peak_tlast_override=None)
+    bads_present = [i for i in bads if i in raw0.info["ch_names"]]
+    if bads_present:
+        raw0.drop_channels(bads_present)
+
+    # Now run amplitude estimation on the cleaned raw0.
+    amp = fit_hpi_amplitudes(raw0, hpifreq)
     hpi_names       = amp['hpi_names']
     hpi_indices     = amp['hpi_indices']
     hpi_freqs       = amp['hpi_freqs']
@@ -753,42 +941,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     coil_amplitudes = amp['coil_amplitudes']
     peak_tlast       = amp['peak_tlast']
 
-    raw = raw_orig.copy()
-
     # ------------------------------------------------------------------
-    # Stage 2: Detect and remove noisy channels from the HPI recording. 
-    # ------------------------------------------------------------------
-
-    # Find channels with zero location (batched drop — see note in find_bads).
-    bads = find_zero_location_channels(raw.info)
-    if len(bads):
-        raw.drop_channels(list(bads))
-
-    # Remove noisy channels (skipped when no reference file is provided)
-    if reffile is None:
-        twindow = 5
-        tmax = raw.times[-1]
-
-        if peak_tlast + twindow > tmax:
-            print("WARNING: HPI recording is too short to extract a reference segment for bad-channel detection. Skipping bad-channel detection.")
-            reffile=None
-        else:
-            print(f"Extracting {twindow}s reference segment from the end of the HPI recording for bad-channel detection.")
-            tmin = tmax - twindow
-            reffile = raw.copy().crop(tmin=tmin, tmax=tmax)
-
-    # Restrict the reference file's outlier-detection population to the
-    # HPI recording's own remaining channels (post zero-location drop
-    # above) — see find_bads' match_channels docstring for why this
-    # matters whenever reffile is an independently-loaded recording rather
-    # than a cropped copy of raw itself.
-    bads, bads_fig = find_bads(reffile, hpifreq, match_channels=raw.info["ch_names"])
-    bads_present = [i for i in bads if i in raw.info["ch_names"]]
-    if bads_present:
-        raw.drop_channels(bads_present)
-
-    # ------------------------------------------------------------------
-    # Stage 3: Load Polhemus and embed digitisation into raw
+    # Stage 2: Load Polhemus and embed digitisation into raw
     # ------------------------------------------------------------------
     if isinstance(polfile, dict):
         pol = polfile
@@ -918,6 +1072,27 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         query_pts = hpi_dev[include_hpis]
     tree = cKDTree(ref_pts)
     distances, tree_indices = tree.query(query_pts) # find closest points
+    incl_idx = np.flatnonzero(include_hpis)
+
+    # Guard against duplicate KD-tree assignments: two fitted coils mapping
+    # to the same digitised point produces a degenerate rigid fit.
+    if len(set(tree_indices)) < len(tree_indices):
+        # Find duplicated polhemus indices (they appear more than once in
+        # tree_indices). Report the fitted coil names that hit each duplicate.
+        uniq, counts = np.unique(tree_indices, return_counts=True)
+        dup_pol_idx = uniq[counts > 1]
+        dup_msg_parts = []
+        for pol_i in dup_pol_idx:
+            dup_coil_names = [hpi_names[incl_idx[i]]
+                              for i in range(len(tree_indices))
+                              if tree_indices[i] == pol_i]
+            dup_msg_parts.append(f"pol#{pol_i+1} ← {{{', '.join(dup_coil_names)}}}")
+        raise ValueError(
+            f"Duplicate KD-tree assignment: fitted coils map to the same "
+            f"polhemus HPI point(s): {'; '.join(dup_msg_parts)}. "
+            f"This produces a degenerate transform. Check that each HPI coil "
+            f"has a distinct digitised position."
+        )
 
     # Calculate transform
     trans = _quat_to_affine(_fit_matched_points(hpi_dev[include_hpis], hpi_orig_head[tree_indices])[0])
@@ -950,16 +1125,26 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         )
 
     # ------------------------------------------------------------------
-    # Stage 6: Polhemus-position GOF
-    # Evaluate the dipole forward model at each *digitised* polhemus coil
-    # position (transformed back to device frame) against the measured MEG
-    # field pattern for the matched channel.  Unlike hpi_gofs (which floats
-    # the position to maximise fit), pol_gofs uses the fixed polhemus position.
-    # A low pol_gof with a high hpi_gof means the digitised position is wrong
-    # even though the coil itself was recorded cleanly → redo polhemus.
+    # Stage 6: Polhemus-position GOF (pre-refinement baseline)
     # ------------------------------------------------------------------
     raw_for_topomap = raw_orig.copy()
-    raw_for_topomap.pick(picks=['meg'], exclude='bads')
+    # Use meg=True, eeg=False, exclude='bads' for consistent sensor picks
+    # matching MNE convention (not a string 'meg' which only picks mag).
+    topo_picks = pick_types(raw_for_topomap.info, meg=True, eeg=False, exclude='bads')
+    raw_for_topomap.pick(picks=topo_picks)
+    slope_ch_names = amp['slope_ch_names']
+
+    # Assert that the slope matrix columns match the topomap channel ordering
+    # before building geometry — mismatch causes silent wrong results.
+    _meg_mag_picks_full = pick_types(raw_orig.info, meg=True, eeg=False)
+    full_meg_ch_names = [raw_orig.ch_names[p] for p in _meg_mag_picks_full]
+    # The slope was computed over meg=True, eeg=False picks, and both
+    # geometry builds use the same channel ordering. Assert here.
+    assert slope_ch_names == raw_for_topomap.ch_names and slope.shape[1] == len(slope_ch_names), (
+        f"Mismatch between slope column channels and topomap channels. "
+        f"Slope has {len(full_meg_ch_names)} cols: {full_meg_ch_names}, "
+        f"topomap has {len(slope_ch_names)}: {slope_ch_names}"
+    )
 
     cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
     whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
@@ -977,7 +1162,11 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         )
         for ch_i, pol_i in zip(incl_idx, tree_indices)
     ])
-    
+
+    # Track state for return dict
+    _opt_status = None
+    opt_success = None
+
     if optim == 'rigid':
         # Optimize transform.
         # Nested closures (not module-level) so they see fit_hpi's locals
@@ -1001,9 +1190,9 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             return -mean_gof(params)
 
         bounds = [
-            (-np.deg2rad(5), np.deg2rad(10)),   # rx
-            (-np.deg2rad(5), np.deg2rad(10)),   # ry
-            (-np.deg2rad(5), np.deg2rad(10)),   # rz
+            (-np.deg2rad(5), np.deg2rad(5)),   # rx
+            (-np.deg2rad(5), np.deg2rad(5)),   # ry
+            (-np.deg2rad(5), np.deg2rad(5)),   # rz
             (-0.005, 0.005),                   # tx 5 mm
             (-0.005, 0.005),                   # ty
             (-0.005, 0.005),                   # tz
@@ -1014,30 +1203,59 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             method="L-BFGS-B",
             bounds=bounds,
         )
-        opt_trans = perturb_transform(
-            dev_to_head_trans,
-            result.x,
-        )
-        dev_to_head_trans = opt_trans
-        
-        raw_for_topomap = raw_orig.copy()
-        raw_for_topomap.pick(picks=['meg'], exclude='bads')
-        cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
-        whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
-        meg_coils   = _concatenate_coils(
-            _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
-        )
-        head2dev    = invert_transform(dev_to_head_trans)
-        incl_idx    = np.where(include_hpis)[0]
-        pol_gofs    = np.array([
-            _gof_at_fixed_pos(
-                slope[ch_i],
-                apply_trans(head2dev, hpi_orig_head[pol_i]),
-                whitener,
-                meg_coils,
+        opt_status = result.status
+        opt_success = result.success and np.all(np.isfinite(result.x)) and np.isfinite(result.fun)
+        _opt_status = opt_status
+
+        if opt_success:
+            opt_trans = perturb_transform(
+                dev_to_head_trans,
+                result.x,
             )
-            for ch_i, pol_i in zip(incl_idx, tree_indices)
-        ])
+            dev_to_head_trans = opt_trans
+
+            raw_for_topomap = raw_orig.copy()
+            topo_picks = pick_types(raw_for_topomap.info, meg=True, eeg=False, exclude='bads')
+            raw_for_topomap.pick(picks=topo_picks)
+            assert slope_ch_names == raw_for_topomap.ch_names and slope.shape[1] == len(slope_ch_names), (
+                f"Mismatch between slope column channels and topomap channels "
+                f"in refinement rebuild."
+            )
+            cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
+            whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
+            meg_coils   = _concatenate_coils(
+                _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
+            )
+            head2dev    = invert_transform(dev_to_head_trans)
+            incl_idx    = np.where(include_hpis)[0]
+
+            # Recompute pol_gofs and dist with the refined transform.
+            pol_gofs_refined = np.array([
+                _gof_at_fixed_pos(
+                    slope[ch_i],
+                    apply_trans(head2dev, hpi_orig_head[pol_i]),
+                    whitener,
+                    meg_coils,
+                )
+                for ch_i, pol_i in zip(incl_idx, tree_indices)
+            ])
+            # Recompute dist for the *returned* transform.
+            hpi_head_refined = apply_trans(dev_to_head_trans, hpi_dev)
+            dist_refined = np.linalg.norm(
+                hpi_orig_head[tree_indices] - hpi_head_refined[include_hpis], axis=1
+            )
+
+            # Store both the initial and refined residuals.
+            dist = dist_refined
+            pol_gofs = pol_gofs_refined
+        else:
+            warnings.warn(
+                f"Transform refinement L-BFGS-B did not converge "
+                f"(status={opt_status}, success={result.success}, "
+                f"x={result.x}). Retaining the initial rigid transform.",
+                RuntimeWarning, stacklevel=2,
+            )
+            # dev_to_head_trans, dist, pol_gofs remain as computed in Stage 5/6.
 
     return {
         'dev_to_head_trans': dev_to_head_trans,
@@ -1052,6 +1270,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'extra_pts':  extra_pts_head,
         'eeg_pts':    eeg_pts_head,
         'slope':      slope,
+        'slope_ch_names': slope_ch_names,
         'raw_for_topomap': raw_for_topomap,
         'dist':         dist,
         'include_hpis': include_hpis,
@@ -1060,6 +1279,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'bads':         bads,
         'bads_fig':     bads_fig,
         'optim':        optim,
+        'opt_status':    _opt_status,
+        'opt_success':   opt_success,
     }
 
 def compute_fit_diagnostics(fit):

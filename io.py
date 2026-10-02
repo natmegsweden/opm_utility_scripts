@@ -425,7 +425,7 @@ def _select_best_hpi_pool_initializer():
 
 
 def _select_best_hpi_worker(path, polhemus, hpifreq, gof_limit, reffile,
-                             center_matching, n_jobs):
+                             center_matching):
     """Module-level worker run in a ``ProcessPoolExecutor`` by
     :func:`select_best_hpi_file`.
 
@@ -435,12 +435,16 @@ def _select_best_hpi_worker(path, polhemus, hpifreq, gof_limit, reffile,
     path below, to avoid the ``io`` <-> ``hpi._core`` circular import; it
     also means each freshly-spawned worker process performs its own import
     at call time, which is fine since it starts a new interpreter anyway.
+
+    Note: ``n_jobs`` is intentionally NOT forwarded to ``fit_hpi`` — its
+    signature does not accept a parallelisation parameter, and amplitude
+    estimation runs sequentially per coil. Parallelisation is handled at
+    the candidate level by ``ProcessPoolExecutor``.
     """
     from .hpi._core import fit_hpi
 
     return fit_hpi(path, polhemus, hpifreq, gof_limit=gof_limit,
-                    reffile=reffile, center_matching=center_matching,
-                    n_jobs=n_jobs)
+                    reffile=reffile, center_matching=center_matching)
 
 
 def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
@@ -476,11 +480,14 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         :func:`~opm_utility_scripts.hpi._core.fit_hpi` for every candidate.
         See :func:`~opm_utility_scripts.hpi._core.fit_hpi` for details.
     n_jobs : int (default -1)
-        Number of HPI candidates to fit concurrently, each in its own
+        Number of HPI **candidates** to fit concurrently, each in its own
         worker process. Every candidate runs the *entire* ``fit_hpi``
         pipeline independently of the others (amplitude estimation, noisy-
         channel detection, Polhemus registration, and the time-resolved
-        coil-position fit), so this parallelises cleanly across files.
+        coil-position fit), so this parallelises cleanly at the candidate
+        level. It does **not** parallelise ``fit_hpi`` itself — amplitude
+        estimation within a single candidate always runs sequentially
+        (per-coil).
         ``-1`` (default) uses ``min(len(hpi_files), os.cpu_count())``
         worker processes; ``1`` runs the original strictly sequential loop
         (identical to the pre-parallelisation behaviour, and avoids
@@ -489,18 +496,11 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         backend (see :func:`_select_best_hpi_pool_initializer`) so that
         ``find_bads()``'s figure can be created headlessly and pickled
         back to the caller regardless of the host's default backend.
-        ``fit_hpi_amplitudes`` (Stage 1 of each candidate's fit) already
-        spins up its own internal thread pool when *its own* ``n_jobs`` is
-        not 1; to avoid oversubscribing CPUs with
-        ``n_jobs`` (outer processes) ``x`` inner threads, each candidate's
-        inner ``fit_hpi`` call is forced to ``n_jobs=1`` whenever more than
-        one outer worker process is used. When ``n_jobs=1`` here
-        (sequential path), the inner call keeps its own default so
-        single-candidate behaviour/speed is unaffected. Each candidate's
-        HPI recording (and reference window, if any) is preloaded
-        independently in its own process, so peak memory scales with the
-        number of concurrently-running candidates -- reduce ``n_jobs`` if
-        that becomes a constraint for very large HPI recordings.
+        Each candidate's HPI recording (and reference window, if any) is
+        preloaded independently in its own process, so peak memory scales
+        with the number of concurrently-running candidates -- reduce
+        ``n_jobs`` if that becomes a constraint for very large HPI
+        recordings.
     """
     from .hpi._core import fit_hpi
 
@@ -537,12 +537,14 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
             max_workers=max_workers,
             initializer=_select_best_hpi_pool_initializer,
         ) as pool:
+            # Prevent outer-process-level parallelisation from being forwarded
+            # as an argument to the worker function — the worker signature
+            # intentionally does not accept n_jobs (see docstring note).
             futures = {
                 pool.submit(
                     _select_best_hpi_worker, path, polhemus, hpifreq, gof_limit,
                     ref_raw.copy() if ref_raw is not None else None,
                     center_matching,
-                    1,  # inner fit_hpi_amplitudes n_jobs: avoid oversubscription
                 ): i
                 for i, path in enumerate(hpi_files)
             }
@@ -575,7 +577,7 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         else:
             score = raw_mean
             warnings.warn(
-                f'No HPI coils exceeded GOF 0.9 for {path}; using raw mean GOF {raw_mean:.3f}'
+                f'No HPI coils exceeded GOF {gof_limit} for {path}; using raw mean GOF {raw_mean:.3f}'
             )
 
         if score > best_score or (score == best_score and raw_mean > best_raw_mean):
