@@ -1261,7 +1261,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     peak_tlast       = amp['peak_tlast']
 
     # ------------------------------------------------------------------
-    # Stage 2: Load Polhemus and embed digitisation into raw
+    # Stage 2-3: Load Polhemus and embed digitisation into raw
     # ------------------------------------------------------------------
     original_indices = amp['original_coil_indices']
     
