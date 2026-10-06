@@ -317,8 +317,21 @@ def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=Non
         if temp_path is not None and os.path.exists(temp_path):
             os.unlink(temp_path)
 
-def _make_opm_guesses(meg_coils):
-    R = np.linalg.norm(meg_coils[0], axis=1).max()
+def _make_opm_guesses(meg_coils, localization_grid='fine'):
+    """Build dipole-location guesses using the fine or stock MNE grid."""
+    _check_option('localization_grid', localization_grid, ('fine', 'legacy'))
+    coil_radii = np.linalg.norm(meg_coils[0], axis=1)
+    if localization_grid == 'legacy':
+        # Match MNE's stock compute_chpi_locs search domain: a 10 mm
+        # Cartesian grid, 5 mm inside a sphere whose radius is the nearest
+        # MEG coil integration point. The origin is not excluded.
+        R = coil_radii.min()
+        grid, mindist = 0.01, 0.005
+    else:
+        # The current OPM-specific search uses a denser grid and its existing
+        # maximum-radius sphere/minimum-radius clipping behavior.
+        R = coil_radii.max()
+        grid, mindist = 0.002, 0.001
 
     sphere = ConductorModel(
         layers=[dict(rad=R)],
@@ -326,17 +339,10 @@ def _make_opm_guesses(meg_coils):
         is_sphere=True,
     )
 
-    guesses = _make_guesses(
-        sphere,
-        0.002,
-        0.0,
-        0.001,
-    )[0]["rr"]
+    guesses = _make_guesses(sphere, grid, 0.0, mindist)[0]["rr"]
 
-    guesses = guesses[
-        np.linalg.norm(guesses, axis=1)
-        <= np.linalg.norm(meg_coils[0], axis=1).min()
-    ]
+    if localization_grid == 'fine':
+        guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii.min()]
 
     return guesses
 
@@ -540,6 +546,7 @@ def compute_chpi_opm_locs(
     too_close="raise",
     adjust_dig=False,
     *,
+    localization_grid='fine',
     verbose=None,
 ):
     """Compute locations of each cHPI coils over time.
@@ -607,7 +614,7 @@ def compute_chpi_opm_locs(
     whitener, _ = compute_whitener(cov, info, verbose=safe_false)
 
     # Make location guesses
-    guesses = _make_opm_guesses(meg_coils)
+    guesses = _make_opm_guesses(meg_coils, localization_grid)
     R = np.linalg.norm(meg_coils[0], axis=1).max()
     fwd = _magnetic_dipole_field_vec(guesses, meg_coils, too_close)
     fwd = np.dot(fwd, whitener.T)
@@ -1057,6 +1064,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
              reffile: str = None, center_matching: bool = None, *,
              bad_channel_policy='auto', activation_window_s=2.0,
              gof_comparison='inclusive', matching_strategy=None, unique_matches=True,
+             localization_grid='fine',
              settings_json=None) -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
@@ -1124,6 +1132,11 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         Default centroid_nearest. Raw coordinates are used for coordinate_nearest.
         Both feed the same rigid fit. center_matching is a compatibility alias;
         contradictory explicitly supplied values raise.
+    localization_grid : {'fine', 'legacy'}
+        Dipole-search initial guesses. ``fine`` uses the current 2 mm OPM grid;
+        ``legacy`` uses the stock-MNE 10 mm grid, 5 mm sphere inset, and
+        minimum sensor-coil radius. This isolates grid effects but does not
+        select the complete historical localization/amplitude engine.
     unique_matches : bool, default True
         Reject repeated nearest targets. False permits repeats only when the
         resulting correspondences still determine a non-degenerate rigid fit.
@@ -1200,6 +1213,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
                                 activation_window_s, reffile)
     _gof_mask([], gof_limit, gof_comparison)
     _check_option('optim', optim, ('none', 'rigid', 'rigid_gof'))
+    _check_option('localization_grid', localization_grid, ('fine', 'legacy'))
     # Keep the compatibility alias accepted at the API boundary, but store and
     # report one canonical optimizer name throughout the fit result.
     if optim == 'rigid':
@@ -1243,6 +1257,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     settings = dict(amp['settings'])
     settings.update({
         'coil_inclusion': {'gof_limit': float(gof_limit), 'comparison': gof_comparison},
+        'localization_grid': localization_grid,
         'matching': {'strategy': matching_strategy, 'unique_matches': bool(unique_matches)},
         'transform_refinement': {'method': 'rigid_gof' if optim != 'none' else 'none',
                                  'rotation_bound_deg': 5.0 if optim != 'none' else None,
@@ -1282,7 +1297,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             message='HPI consistency of isotrak and hpifit is poor',
             category=RuntimeWarning,
         )
-        coil_locs = compute_chpi_opm_locs(raw_orig.info, coil_amplitudes)
+        coil_locs = compute_chpi_opm_locs(
+            raw_orig.info, coil_amplitudes, localization_grid=localization_grid)
 
     hpi_dev  = np.array(coil_locs['rrs'][0])
     hpi_gofs = np.array(coil_locs['gofs'][0])

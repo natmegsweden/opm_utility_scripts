@@ -7,6 +7,8 @@ def add_fit_options(parser):
                         'required reference, or none. Explicit bads are always excluded.')
     parser.add_argument('--activation-window-s', type=float, default=2.0,
                         help='Actual fit duration in seconds, centered on activation midpoint (default: 2).')
+    parser.add_argument('--localization-grid', choices=['fine', 'legacy'], default='fine',
+                        help='Dipole search grid: current fine OPM grid or stock-MNE legacy grid.')
     parser.add_argument('--gof-comparison', choices=['inclusive', 'strict'], default='inclusive',
                         help='Coil inclusion uses >= (inclusive) or > (strict) the GOF limit.')
     matching = parser.add_mutually_exclusive_group()
@@ -27,4 +29,5 @@ def fit_options(args):
     return dict(bad_channel_policy=args.bad_channel_policy,
                 activation_window_s=args.activation_window_s, gof_comparison=args.gof_comparison,
                 matching_strategy=args.matching_strategy, unique_matches=args.unique_matches,
+                localization_grid=args.localization_grid,
                 optim=args.optimization, settings_json=args.settings_json)

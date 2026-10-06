@@ -55,7 +55,11 @@ class PolicyTests(unittest.TestCase):
 
     def test_coregister_sidecars_default_on_check_remains_opt_in(self):
         with patch('sys.argv', ['coregister']):
-            self.assertEqual(coregister._parse_args().settings_json, '')
+            args = coregister._parse_args()
+            self.assertEqual(args.settings_json, '')
+            self.assertEqual(fit_options(args)['localization_grid'], 'fine')
+        with patch('sys.argv', ['coregister', '--localization-grid', 'legacy']):
+            self.assertEqual(fit_options(coregister._parse_args())['localization_grid'], 'legacy')
         with patch('sys.argv', ['check']):
             self.assertIsNone(check._parse_args().settings_json)
 
@@ -63,6 +67,7 @@ class PolicyTests(unittest.TestCase):
         for kwargs in ({'bad_channel_policy': 'other'},
                        {'activation_window_s': 0}, {'gof_limit': float('nan')},
                        {'gof_comparison': 'other'}, {'matching_strategy': 'other'},
+                       {'localization_grid': 'other'},
                        {'unique_matches': None}, {'optim': 'legacy'},
                        {'bad_channel_policy': 'reference'},
                        {'center_matching': True, 'matching_strategy': 'coordinate_nearest'}):
@@ -116,6 +121,23 @@ class PolicyTests(unittest.TestCase):
         raw.info['chs'][2]['loc'][0] = np.nan
         core._select_sensors(raw)
         self.assertNotIn('grad1', raw.ch_names)
+
+    def test_localization_grid_profiles(self):
+        coils = [np.array([[0.0, 0.0, 0.08], [0.0, 0.0, 0.10]])]
+        guesses = np.array([[0.0, 0.0, 0.075], [0.0, 0.0, 0.09]])
+        for mode, expected_radius, expected_grid, expected_mindist in (
+                ('fine', 0.10, 0.002, 0.001),
+                ('legacy', 0.08, 0.01, 0.005)):
+            with self.subTest(mode=mode), patch.object(
+                    core, '_make_guesses', return_value=[{'rr': guesses}]) as make:
+                result = core._make_opm_guesses(coils, mode)
+            sphere = make.call_args.args[0]
+            self.assertAlmostEqual(sphere['layers'][0]['rad'], expected_radius)
+            self.assertEqual(make.call_args.args[1:], (expected_grid, 0.0, expected_mindist))
+            if mode == 'fine':
+                np.testing.assert_array_equal(result, guesses[:1])
+            else:
+                np.testing.assert_array_equal(result, guesses)
 
     def test_reference_statistics_population_and_no_mutation(self):
         raw = synthetic_raw()
@@ -210,6 +232,7 @@ class PipelineTests(unittest.TestCase):
             payload = json.loads(path.read_text())
             self.assertEqual(payload['schema_version'], 1)
             self.assertEqual(payload['settings']['matching']['strategy'], 'centroid_nearest')
+            self.assertEqual(payload['settings']['localization_grid'], 'fine')
             self.assertEqual(payload['results_summary']['included_coils'], 4)
             self.assertIsNone(payload['results_summary']['optimizer_success'])
             fit_results = payload['fit_results']
@@ -239,6 +262,7 @@ class PipelineTests(unittest.TestCase):
         np.testing.assert_array_equal(fit['original_coil_indices'], [0, 2, 3])
         np.testing.assert_array_equal(fit['tree_indices'], [0, 2, 3])
         info = core.compute_chpi_opm_locs.call_args.args[0]
+        self.assertEqual(core.compute_chpi_opm_locs.call_args.kwargs['localization_grid'], 'fine')
         dig_hpi = [d['r'] for d in info['dig'] if d['kind'] == mne.io.constants.FIFF.FIFFV_POINT_HPI]
         np.testing.assert_allclose(dig_hpi, POINTS[[0, 2, 3]])
 
@@ -337,13 +361,15 @@ class CallerTests(unittest.TestCase):
     def test_cli_parsers_forward_options(self):
         flags = ['--bad-channel-policy', 'none', '--activation-window-s', '3',
                  '--gof-comparison', 'strict', '--matching-strategy', 'coordinate_nearest',
-                 '--allow-repeated-matches', '--optimization', 'none', '--settings-json', 'fit.json']
+                 '--allow-repeated-matches', '--optimization', 'none', '--settings-json', 'fit.json',
+                 '--localization-grid', 'legacy']
         for module in (check, coregister):
             with patch('sys.argv', ['program'] + flags):
                 options = fit_options(module._parse_args())
             self.assertEqual(options, dict(bad_channel_policy='none',
                                           activation_window_s=3., gof_comparison='strict',
                                           matching_strategy='coordinate_nearest', unique_matches=False,
+                                          localization_grid='legacy',
                                           optim='none', settings_json='fit.json'))
         parser = argparse.ArgumentParser()
         add_fit_options(parser)

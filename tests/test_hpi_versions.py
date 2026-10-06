@@ -84,6 +84,8 @@ def _parse_args(argv=None):
                         help='HPI drive frequency (default: 33).')
     parser.add_argument('--sfreq', type=float, default=None, metavar='HZ',
                         help='Optional output sampling frequency (default: retain source rate).')
+    parser.add_argument('--localization-grid', choices=('fine', 'legacy'), default='fine',
+                        help='Use the current fine grid or stock-MNE legacy search grid for every fit.')
     parser.add_argument('--output-dir', type=Path, default=Path('hpi_version_comparison'),
                         metavar='DIR', help='Directory for version-specific outputs.')
     parser.add_argument('--overwrite', action='store_true',
@@ -170,13 +172,14 @@ def main(argv=None):
     errors = []
 
     for version, settings in VERSION_SETTINGS.items():
+        run_settings = dict(settings, localization_grid=args.localization_grid)
         version_dir = args.output_dir / version
         version_dir.mkdir(parents=True, exist_ok=True)
         print(f'\n=== {version} settings ===')
-        print(settings)
+        print(run_settings)
         try:
             fit = fit_hpi(args.hpi, args.pol, args.freq, reffile=args.reffile,
-                          **settings)
+                          **run_settings)
             results[version] = {'fit': fit, 'outputs': []}
             fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=False)
             plot_path = version_dir / f'{version}_alignment.png'

@@ -249,8 +249,20 @@ opmutil coregister \
 ```
 
 This does not select the historical duplicate-frequency amplitude model,
-integer-frequency peak spacing, stock MNE localizer, or legacy input parsing.
-The current sequential fitter and its non-degeneracy checks remain in effect.
+integer-frequency peak spacing, or legacy input parsing. The current sequential
+fitter and its non-degeneracy checks remain in effect. To test whether the
+localization search grid explains a result difference, add
+`--localization-grid legacy`; this selects the stock-MNE initial-guess grid
+without changing the rest of the current pipeline.
+
+The `--localization-grid` option defaults to `fine` (2 mm spacing). Its
+`legacy` value uses the stock MNE search grid: 10 mm spacing, 5 mm inset, and a
+sphere radius based on the minimum MEG coil integration-point radius. This is
+an isolated grid comparison, not full legacy parity; the local optimizer,
+amplitude fitting, and other current checks remain unchanged. The exact stock
+grid is also MNE-version-dependent. `tests/test_hpi_versions.py` accepts the
+same option to apply either grid consistently across its v0.1.0/v0.2.0/v0.3.0
+settings runs.
 
 The comparison matrix summarizes the historical behavior versus current
 controls. All approaches in the historical comparison used sequential coil
@@ -331,8 +343,9 @@ refinement bounds remain ±5°):
 }
 ```
 
-This does not select the historical duplicate-frequency amplitude model,
-integer-frequency peak spacing or stock MNE localizer, nor suppress the current
+This does not select the historical duplicate-frequency amplitude model or
+integer-frequency peak spacing. The stock MNE localizer can be selected
+separately with `--localization-grid legacy`; it does not suppress the current
 fixed-position Polhemus GOF diagnostic. The historical v0.1.0 implementation
 accepted verified head-frame FIF/DigMontage digitisation, not JSON. Its
 configurable fitting sample rate is also not reproduced: the current HPI fit
