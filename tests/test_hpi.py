@@ -242,6 +242,33 @@ class PipelineTests(unittest.TestCase):
         dig_hpi = [d['r'] for d in info['dig'] if d['kind'] == mne.io.constants.FIFF.FIFFV_POINT_HPI]
         np.testing.assert_allclose(dig_hpi, POINTS[[0, 2, 3]])
 
+    def test_prepare_polhemus_for_localization_frame_conversion_and_validation(self):
+        original_indices = np.array([0, 2, 3])
+        hpi_names = ['hpi1', 'hpi3', 'hpi4']
+        raw_fif = synthetic_raw()
+        result_fif = core._prepare_polhemus_for_localization(
+            POL, raw_fif, hpi_names, original_indices)
+        np.testing.assert_allclose(result_fif[1], POINTS)
+        fif_dig_hpi = [d['r'] for d in raw_fif.info['dig']
+                       if d['kind'] == mne.io.constants.FIFF.FIFFV_POINT_HPI]
+        np.testing.assert_allclose(fif_dig_hpi, POINTS[original_indices])
+
+        json_pol = dict(POL, source='json')
+        raw_json = synthetic_raw()
+        result_json = core._prepare_polhemus_for_localization(
+            json_pol, raw_json, hpi_names, original_indices)
+        isotrak_to_head = core.get_ras_to_neuromag_trans(POL['nasion'], POL['lpa'], POL['rpa'])
+        expected_head = core.apply_trans(isotrak_to_head, POINTS)
+        np.testing.assert_allclose(result_json[1], expected_head)
+        json_dig_hpi = [d['r'] for d in raw_json.info['dig']
+                        if d['kind'] == mne.io.constants.FIFF.FIFFV_POINT_HPI]
+        np.testing.assert_allclose(json_dig_hpi, expected_head[original_indices])
+
+        too_few = dict(POL, hpi_orig=POINTS[:2])
+        with self.assertRaisesRegex(ValueError, 'Polhemus has 2 HPI dig point'):
+            core._prepare_polhemus_for_localization(
+                too_few, synthetic_raw(), hpi_names, original_indices)
+
     def test_strict_threshold_and_failed_optimizer(self):
         self.mock_localization(gofs=[.95, .99, .99, .99])
         failure = SimpleNamespace(status=2, success=False, x=np.zeros(6), fun=-.98)

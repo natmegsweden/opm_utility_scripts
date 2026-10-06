@@ -153,6 +153,79 @@ def _input_identifier(value):
     return None if value is None else f'<{type(value).__name__}>'
 
 
+def _prepare_polhemus_for_localization(polfile, raw_orig, hpi_names,
+                                       original_coil_indices):
+    """Load/normalize Polhemus data and seed its HPI points into ``raw_orig``.
+
+    This intentionally mutates ``raw_orig.info['dig']``: the embedded points
+    provide the digitization seed consumed by the subsequent magnetic-dipole
+    localization. Returns the source Polhemus mapping and its fiducials,
+    HPI points, extra points, and EEG points normalized to head coordinates.
+    """
+    if isinstance(polfile, dict):
+        pol = polfile
+    else:
+        from ..io import load_polhemus
+        pol = load_polhemus(polfile)
+
+    lpa = pol['lpa']
+    nasion = pol['nasion']
+    rpa = pol['rpa']
+    hpi_orig = np.asarray(pol['hpi_orig'], dtype=float)
+    if hpi_orig.ndim != 2 or hpi_orig.shape[1] != 3 or not np.isfinite(hpi_orig).all():
+        raise ValueError('Polhemus HPI positions must be finite 3D coordinates.')
+
+    original_indices = np.asarray(original_coil_indices, dtype=int)
+    n_pol_hpi = len(hpi_orig)
+    n_active = len(hpi_names)
+    if n_pol_hpi < n_active or (len(original_indices) and original_indices.max() >= n_pol_hpi):
+        raise ValueError(
+            f'Polhemus has {n_pol_hpi} HPI dig point(s) but {n_active} active '
+            f'HPI coil(s) were detected ({hpi_names}). '
+            f'Every active coil needs a digitised position. '
+            f'Original active coil indices are {original_indices.tolist()}; '
+            f'missing-peak coils must not shift digitisation ordering. '
+            f'Check that the correct polhemus file is being used and that all '
+            f'active coils were digitised.'
+        )
+
+    if pol.get('source', 'json') == 'fif':
+        hpi_orig_head = hpi_orig
+        nasion_head = nasion
+        lpa_head = lpa
+        rpa_head = rpa
+        extra_pts_head = pol['extra_pts']
+        eeg_pts_head = pol['eeg_pts']
+        with raw_orig.info._unlock():
+            raw_orig.info['dig'] = _make_dig_points(
+                nasion_head, lpa_head, rpa_head,
+                hpi_orig_head[original_indices], extra_pts_head,
+                coord_frame='head',
+            )
+    else:
+        isotrak_to_head = get_ras_to_neuromag_trans(nasion, lpa, rpa)
+        hpi_orig_head = apply_trans(isotrak_to_head, hpi_orig)
+        nasion_head = apply_trans(isotrak_to_head, nasion)
+        lpa_head = apply_trans(isotrak_to_head, lpa)
+        rpa_head = apply_trans(isotrak_to_head, rpa)
+        extra_pts_head = (
+            apply_trans(isotrak_to_head, pol['extra_pts'])
+            if len(pol['extra_pts']) else pol['extra_pts']
+        )
+        eeg_pts_head = (
+            apply_trans(isotrak_to_head, pol['eeg_pts'])
+            if len(pol['eeg_pts']) else pol['eeg_pts']
+        )
+        with raw_orig.info._unlock():
+            raw_orig.info['dig'], _ = _call_make_dig_points(
+                nasion, lpa, rpa, hpi_orig[original_indices],
+                pol['extra_pts'], convert=True,
+            )
+
+    return (pol, hpi_orig_head, nasion_head, lpa_head, rpa_head,
+            extra_pts_head, eeg_pts_head)
+
+
 def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=None,
                         datafile=None, output_file=None):
     """Atomically replace a sidecar after success; parent directory must exist.
@@ -1190,86 +1263,12 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # ------------------------------------------------------------------
     # Stage 2: Load Polhemus and embed digitisation into raw
     # ------------------------------------------------------------------
-    if isinstance(polfile, dict):
-        pol = polfile
-    else:
-        from ..io import load_polhemus
-        pol = load_polhemus(polfile)
-
-    lpa      = pol['lpa']
-    nasion   = pol['nasion']
-    rpa      = pol['rpa']
-    hpi_orig = np.asarray(pol['hpi_orig'], dtype=float)
-    if hpi_orig.ndim != 2 or hpi_orig.shape[1] != 3 or not np.isfinite(hpi_orig).all():
-        raise ValueError('Polhemus HPI positions must be finite 3D coordinates.')
-
-    # ------------------------------------------------------------------
-    # Guard: polhemus HPI count must cover the active coils.
-    # If the dig has fewer positions than active coils the fit will crash
-    # with a shape mismatch in compute_chpi_opm_locs.  Surface this clearly.
-    # ------------------------------------------------------------------
-    n_pol_hpi = len(hpi_orig)
-    n_active  = len(hpi_indices)
     original_indices = amp['original_coil_indices']
-    if n_pol_hpi < n_active or (len(original_indices) and original_indices.max() >= n_pol_hpi):
-        raise ValueError(
-            f'Polhemus has {n_pol_hpi} HPI dig point(s) but {n_active} active '
-            f'HPI coil(s) were detected ({hpi_names}). '
-            f'Every active coil needs a digitised position. '
-            f'Original active coil indices are {original_indices.tolist()}; '
-            f'missing-peak coils must not shift digitisation ordering. '
-            f'Check that the correct polhemus file is being used and that all '
-            f'active coils were digitised.'
-        )
-
-    # ------------------------------------------------------------------
-    # Coordinate-frame handling:
-    # JSON polhemus → isotrak frame → must convert to head frame.
-    # FIF polhemus  → already in head frame → use as-is.
-    # ------------------------------------------------------------------
-    pol_source = pol.get('source', 'json')
-
-    if pol_source == 'fif':
-        # Points are already in head coordinates — no conversion needed.
-        hpi_orig_head  = hpi_orig
-        nasion_head    = nasion
-        lpa_head       = lpa
-        rpa_head       = rpa
-        extra_pts_head = pol['extra_pts']
-        eeg_pts_head   = pol['eeg_pts']
-
-        # Embed dig points in head frame directly.
-        with raw_orig.info._unlock():
-            raw_orig.info['dig'] = _make_dig_points(
-                nasion_head, lpa_head, rpa_head,
-                hpi_orig_head[original_indices],
-                extra_pts_head,
-                coord_frame='head',
-            )
-    else:
-        # JSON / isotrak frame — build isotrak→head transform from fiducials.
-        isotrak_to_head = get_ras_to_neuromag_trans(nasion, lpa, rpa)
-        hpi_orig_head  = apply_trans(isotrak_to_head, hpi_orig)
-        nasion_head    = apply_trans(isotrak_to_head, nasion)
-        lpa_head       = apply_trans(isotrak_to_head, lpa)
-        rpa_head       = apply_trans(isotrak_to_head, rpa)
-        extra_pts_head = (
-            apply_trans(isotrak_to_head, pol['extra_pts'])
-            if len(pol['extra_pts']) else pol['extra_pts']
-        )
-        eeg_pts_head = (
-            apply_trans(isotrak_to_head, pol['eeg_pts'])
-            if len(pol['eeg_pts']) else pol['eeg_pts']
-        )
-
-        # Embed dig points, converting isotrak → head using fiducials.
-        with raw_orig.info._unlock():
-            raw_orig.info['dig'], _ = _call_make_dig_points(
-                nasion, lpa, rpa,
-                hpi_orig[original_indices],
-                pol['extra_pts'],
-                convert=True,
-            )
+    
+    # _prepare_polhemus_for_localization manipulates raw_orig inplace
+    (pol, hpi_orig_head, nasion_head, lpa_head, rpa_head,
+     extra_pts_head, eeg_pts_head) = _prepare_polhemus_for_localization(
+         polfile, raw_orig, hpi_names, original_indices)
 
     # ------------------------------------------------------------------
     # Stage 4: Compute coil locations now that dig is properly set
