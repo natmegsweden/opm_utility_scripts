@@ -226,8 +226,9 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(fit['slope_ch_names'], fit['raw_for_topomap'].ch_names)
             keys = {'dev_to_head_trans', 'hpi_dev', 'hpi_gofs', 'hpi_orig', 'hpi_names',
                     'nasion', 'lpa', 'rpa', 'pol_info', 'extra_pts', 'eeg_pts', 'slope',
-                    'slope_ch_names', 'raw_for_topomap', 'dist', 'include_hpis', 'tree_indices',
-                    'pol_gofs', 'bads', 'bads_fig', 'optim', 'opt_status', 'opt_success'}
+                     'slope_ch_names', 'raw_for_topomap', 'dist', 'include_hpis', 'tree_indices',
+                     'pol_gofs', 'bads', 'bads_fig', 'optim', 'opt_status', 'opt_success',
+                     'opt_delta_deg', 'opt_delta_mm'}
             self.assertTrue(keys <= fit.keys())
             payload = json.loads(path.read_text())
             self.assertEqual(payload['schema_version'], 1)
@@ -244,6 +245,8 @@ class PipelineTests(unittest.TestCase):
             self.assertAlmostEqual(fit_results['coils'][0]['polhemus_gof'], .98)
             self.assertIn('postfit_residual_m', fit_results['coils'][0])
             self.assertIsNone(fit_results['optimizer']['success'])
+            self.assertIsNone(fit_results['optimizer']['delta_deg'])
+            self.assertIsNone(fit_results['optimizer']['delta_mm'])
             core.write_settings_json(path, fit, hpifile='/private/subject/hpi.fif')
             self.assertEqual(json.loads(path.read_text())['inputs']['hpi'], 'hpi.fif')
             self.assertEqual(list(Path(tmp).iterdir()), [path])
@@ -309,10 +312,20 @@ class PipelineTests(unittest.TestCase):
             result = SimpleNamespace(status=0, success=success, x=x, fun=-.98)
             with patch.object(core, 'minimize', return_value=result):
                 if expected:
-                    fit = core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none', optim='rigid')
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = Path(tmp) / 'settings.json'
+                        fit = core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none',
+                                           optim='rigid', settings_json=path)
+                        optimizer = json.loads(path.read_text())['fit_results']['optimizer']
+                    np.testing.assert_allclose(optimizer['delta_deg'], [0, 0, 0])
+                    np.testing.assert_allclose(optimizer['delta_mm'], [0, 0, 0])
+                    np.testing.assert_allclose(fit['opt_delta_deg'], [0, 0, 0])
+                    np.testing.assert_allclose(fit['opt_delta_mm'], [0, 0, 0])
                 else:
                     with self.assertWarns(RuntimeWarning):
                         fit = core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none', optim='rigid')
+                    self.assertTrue(np.all(~np.isfinite(fit['opt_delta_deg'])))
+                    self.assertTrue(np.all(~np.isfinite(fit['opt_delta_mm'])))
             self.assertEqual(bool(fit['opt_success']), expected)
             self.assertEqual(fit['settings']['transform_refinement']['method'], 'rigid_gof')
             if success:
@@ -324,6 +337,12 @@ class PipelineTests(unittest.TestCase):
                 '--data', 'subject_raw.fif', '--hpi', 'hpi_raw.fif', '--pol', 'pol.json',
                 '--output-dir', tmp,
             ])
+            self.assertEqual(args.localization_grid, 'fine')
+            legacy_grid_args = test_hpi_versions._parse_args([
+                '--data', 'subject_raw.fif', '--hpi', 'hpi_raw.fif', '--pol', 'pol.json',
+                '--output-dir', tmp, '--localization-grid', 'legacy',
+            ])
+            self.assertEqual(legacy_grid_args.localization_grid, 'legacy')
             target = Path(tmp) / 'v0.1.0' / 'v0.1.0_alignment.png'
             target.parent.mkdir()
             target.touch()

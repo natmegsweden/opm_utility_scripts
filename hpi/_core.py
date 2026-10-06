@@ -238,6 +238,11 @@ def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=Non
         value = float(value)
         return value if np.isfinite(value) else None
 
+    def json_vector(value):
+        if value is None:
+            return None
+        return [json_float(item) for item in np.asarray(value, dtype=float).ravel()]
+
     hpi_names = list(result.get('hpi_names', []))
     hpi_gofs = np.asarray(result.get('hpi_gofs', []), dtype=float)
     has_inclusion_results = 'include_hpis' in result
@@ -284,6 +289,8 @@ def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=Non
             'method': result.get('optim'),
             'status': int(result['opt_status']) if result.get('opt_status') is not None else None,
             'success': bool(result['opt_success']) if result.get('opt_success') is not None else None,
+            'delta_deg': json_vector(result.get('opt_delta_deg')),
+            'delta_mm': json_vector(result.get('opt_delta_mm')),
         },
     }
 
@@ -1395,6 +1402,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
     # Track state for return dict
     _opt_status = None
     opt_success = None
+    opt_delta_deg = None
+    opt_delta_mm = None
 
     if optim in ('rigid', 'rigid_gof'):
         # Optimize transform.
@@ -1435,6 +1444,10 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         opt_status = result.status
         opt_success = result.success and np.all(np.isfinite(result.x)) and np.isfinite(result.fun)
         _opt_status = opt_status
+        result_delta = np.asarray(result.x, dtype=float)
+        if result_delta.shape == (6,):
+            opt_delta_deg = np.rad2deg(result_delta[:3])
+            opt_delta_mm = result_delta[3:] * 1000.0
 
         if opt_success:
             opt_trans = perturb_transform(
@@ -1510,6 +1523,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'optim':        optim,
         'opt_status':    _opt_status,
         'opt_success':   opt_success,
+        'opt_delta_deg': opt_delta_deg,
+        'opt_delta_mm':  opt_delta_mm,
         'settings': settings,
         'original_coil_indices': original_indices,
     }

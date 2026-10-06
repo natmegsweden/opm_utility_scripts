@@ -12,12 +12,15 @@ Example::
         --data subject_raw.fif resting_raw.fif \
         --hpi HPIBefore_raw.fif --pol digitisation.json \
         --reffile resting_reference_raw.fif \
-        --freq 33 --sfreq 1000 --output-dir version_comparison
+        --freq 33 --sfreq 1000 --localization-grid legacy \
+        --output-dir version_comparison
 
 The reference file is optional. v0.1.0-like settings intentionally disable
 noise detection, so the reference is used only by the v0.2.0/v0.3.0-like runs.
 Each successful run writes transformed FIFs, JSON fit sidecars, one alignment
-plot, and a GOF/residual comparison plot.
+plot, and a GOF/residual comparison plot. ``--localization-grid`` applies the
+same initial-guess grid to all three settings mappings; it defaults to the
+current ``fine`` grid and can be set to ``legacy`` to test the stock-MNE grid.
 """
 
 import argparse
@@ -41,32 +44,25 @@ from opm_utility_scripts.viz import plot_hpi_alignment
 
 VERSION_SETTINGS = {
     'v0.1.0': {
-        'bad_channel_policy': 'none',
+        'bad_channel_policy': 'auto',
         'activation_window_s': 2.0,
-        'gof_limit': 0.9,
+        'gof_limit': 0.95,
         'gof_comparison': 'strict',
-        'matching_strategy': 'coordinate_nearest',
-        'unique_matches': False,
+        'matching_strategy': 'centroid_nearest',
+        'unique_matches': True,
         'optim': 'none',
+        'localization_grid': 'legacy'
     },
     'v0.2.0': {
         'bad_channel_policy': 'auto',
         'activation_window_s': 2.0,
         'gof_limit': 0.95,
-        'gof_comparison': 'inclusive',
-        'matching_strategy': 'centroid_nearest',
-        'unique_matches': False,
-        'optim': 'rigid_gof',
-    },
-    'v0.3.0': {
-        'bad_channel_policy': 'auto',
-        'activation_window_s': 2.0,
-        'gof_limit': 0.95,
-        'gof_comparison': 'inclusive',
+        'gof_comparison': 'strict',
         'matching_strategy': 'centroid_nearest',
         'unique_matches': True,
         'optim': 'rigid_gof',
-    },
+        'localization_grid': 'legacy'
+    }
 }
 
 
@@ -172,7 +168,7 @@ def main(argv=None):
     errors = []
 
     for version, settings in VERSION_SETTINGS.items():
-        run_settings = dict(settings, localization_grid=args.localization_grid)
+        run_settings = dict(settings)
         version_dir = args.output_dir / version
         version_dir.mkdir(parents=True, exist_ok=True)
         print(f'\n=== {version} settings ===')
