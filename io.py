@@ -1,5 +1,6 @@
 """File I/O and dialog utilities for OPM-MEG scripts."""
 
+import hashlib
 import json
 import os
 import warnings
@@ -425,7 +426,7 @@ def _select_best_hpi_pool_initializer():
 
 
 def _select_best_hpi_worker(path, polhemus, hpifreq, gof_limit, reffile,
-                             center_matching):
+                             center_matching, fit_options=None):
     """Module-level worker run in a ``ProcessPoolExecutor`` by
     :func:`select_best_hpi_file`.
 
@@ -444,14 +445,31 @@ def _select_best_hpi_worker(path, polhemus, hpifreq, gof_limit, reffile,
     from .hpi._core import fit_hpi
 
     return fit_hpi(path, polhemus, hpifreq, gof_limit=gof_limit,
-                    reffile=reffile, center_matching=center_matching)
+                    reffile=reffile, center_matching=center_matching, **(fit_options or {}))
+
+
+def _candidate_settings_path(settings_json, path):
+    """Per-input sidecar: requested stem + input stem + full-path digest.
+
+    This distinguishes same-basename inputs from different directories and is
+    stable across candidate ordering and sequential/process-pool execution.
+    """
+    if settings_json is None:
+        return None
+    stem = os.path.splitext(os.fspath(settings_json))[0]
+    input_stem = os.path.splitext(os.path.basename(path))[0]
+    digest = hashlib.sha256(os.path.abspath(path).encode('utf-8')).hexdigest()
+    return f'{stem}.{input_stem}.{digest}.json'
 
 
 def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
                           gof_limit: float = 0.95,
                           reffile: str | None = None,
-                          center_matching: bool = True,
-                          n_jobs: int = -1) -> tuple[str, dict]:
+                          center_matching: bool = None,
+                          n_jobs: int = -1, *, bad_channel_policy='auto',
+                           activation_window_s=2.0,
+                          gof_comparison='inclusive', matching_strategy=None,
+                          unique_matches=True, optim='rigid', settings_json=None) -> tuple[str, dict]:
     """Fit all HPI candidates and return the highest-scoring path and fit.
 
     Parameters
@@ -474,7 +492,7 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         forwarded as ``reffile`` to :func:`~opm_utility_scripts.hpi._core.fit_hpi`
         for every candidate. When ``None`` (default), each ``fit_hpi`` call
         falls back to its own automatic reference-window selection.
-    center_matching : bool (default True)
+    center_matching : bool | None (default None, resolves to centered)
         Whether to centroid-centre the HPI/Polhemus point clouds before
         nearest-neighbour matching. Forwarded unchanged to
         :func:`~opm_utility_scripts.hpi._core.fit_hpi` for every candidate.
@@ -501,8 +519,27 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         with the number of concurrently-running candidates -- reduce
         ``n_jobs`` if that becomes a constraint for very large HPI
         recordings.
+    bad_channel_policy, activation_window_s, gof_comparison,
+    matching_strategy, unique_matches, optim
+        Forwarded to every sequential or process-pool fit; see fit_hpi.
+    settings_json : path-like | None
+        Sidecar base path. Each distinct candidate gets
+        ``<stem>.<input-stem>.<sha256-of-absolute-input-path>.json``.
+        Files are atomically replaced after successful fits; failed fits do
+        not write. Duplicate candidate paths are rejected to avoid collisions.
     """
-    from .hpi._core import fit_hpi
+    from .hpi._core import fit_hpi, _validate_amplitude_options, _gof_mask
+
+    _validate_amplitude_options(hpifreq, bad_channel_policy,
+                                activation_window_s, reffile)
+    _gof_mask([], gof_limit, gof_comparison)
+    if settings_json is not None and len({os.path.abspath(p) for p in hpi_files}) != len(hpi_files):
+        raise ValueError('Duplicate HPI candidate paths would collide in settings sidecars.')
+    options = dict(bad_channel_policy=bad_channel_policy,
+                   activation_window_s=activation_window_s, gof_comparison=gof_comparison,
+                   matching_strategy=matching_strategy, unique_matches=unique_matches, optim=optim)
+    candidate_options = [dict(options, settings_json=_candidate_settings_path(settings_json, p))
+                         for p in hpi_files]
 
     n_files = len(hpi_files)
     if n_jobs is None or n_jobs == -1:
@@ -510,7 +547,10 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
     else:
         max_workers = max(1, min(int(n_jobs), n_files)) if n_files else 1
 
-    ref_raw = _load_noise_reffile_window(reffile) if reffile is not None else None
+    ref_raw = (_load_noise_reffile_window(reffile)
+               if reffile is not None and bad_channel_policy != 'none' else None)
+    if reffile is not None and bad_channel_policy != 'none' and ref_raw is None:
+        raise ValueError(f'Could not load supplied noise reference: {reffile}')
 
     # Results are collected indexed by original hpi_files position (not
     # completion order) so the tie-breaking reduction below sees candidates
@@ -529,7 +569,7 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
                 candidate_reffile = ref_raw.copy() if ref_raw is not None else None
                 results[i] = fit_hpi(path, polhemus, hpifreq, gof_limit=gof_limit,
                                       reffile=candidate_reffile,
-                                      center_matching=center_matching)
+                                      center_matching=center_matching, **candidate_options[i])
             except Exception as exc:
                 errors_by_index[i] = f'{path}: {exc}'
     else:
@@ -544,7 +584,7 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
                 pool.submit(
                     _select_best_hpi_worker, path, polhemus, hpifreq, gof_limit,
                     ref_raw.copy() if ref_raw is not None else None,
-                    center_matching,
+                    center_matching, candidate_options[i],
                 ): i
                 for i, path in enumerate(hpi_files)
             }
@@ -569,7 +609,7 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         fit = results[i]
 
         gofs = np.asarray(fit['hpi_gofs'], dtype=float)
-        high_gofs = gofs[gofs >= gof_limit]
+        high_gofs = gofs[_gof_mask(gofs, gof_limit, gof_comparison)]
         raw_mean = float(np.mean(gofs)) if gofs.size else -np.inf
 
         if high_gofs.size:
