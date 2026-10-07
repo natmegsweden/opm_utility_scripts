@@ -24,12 +24,12 @@ Usage (fully interactive — CLI prompts for everything)::
 import argparse
 import os
 import sys
-
 import matplotlib.pyplot as plt
 import mne
 import numpy as np
 from ..viz import plot_hpi_alignment
-from ._core import fit_hpi, apply_transform, save_raw
+from ._core import fit_hpi, apply_transform, save_raw, write_settings_json
+from ._options import add_fit_options, fit_options
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +129,18 @@ def _output_suffix(datfile: str, new_sfreq: float) -> str:
     return suffix + '_raw.fif'
 
 
+def _settings_sidecar_path(output_file: str, settings_json=None) -> str:
+    """Name a sidecar from its transformed data output path.
+
+    By default, ``name_proc-hpi_raw.fif`` maps to
+    ``hpi_name_proc-hpi_raw.json`` in the same directory. If a sidecar
+    directory is supplied, keep the same basename there.
+    """
+    directory = settings_json or os.path.dirname(output_file)
+    basename = 'hpi_' + os.path.splitext(os.path.basename(output_file))[0] + '.json'
+    return os.path.join(directory, basename)
+
+
 def _parse_args():
     p = argparse.ArgumentParser(
         prog='python -m opm_utility_scripts.hpi.coregister',
@@ -153,7 +165,7 @@ def _parse_args():
         '--reffile', '-r', metavar='FILE', default=None,
         help='Optional reference recording (e.g. resting state) used for '
              'background-power-based noisy channel detection '
-             '(default: skip this step).',
+             '(default: use a clean HPI tail when no reference is supplied).',
     )
     p.add_argument(
         '--freq', '-f', type=float, default=None, metavar='HZ',
@@ -164,22 +176,10 @@ def _parse_args():
         help='Minimum dipole GOF for a coil to be included in the '
              'device-to-head transform fit (default: 0.95).',
     )
-    p.add_argument(
-        '--no-center-matching', dest='center_matching',
-        action='store_false', default=True,
-        help='Match HPI/Polhemus coil positions on raw (uncentred) '
-             'coordinates instead of centroid-centring both point clouds '
-             'first (default: centred). Uncentred matching reproduces the '
-             'legacy pipeline\'s behaviour; intended for regression '
-             'testing / legacy-parity comparisons, not routine use.',
-    )
-    p.add_argument(
-        '--optimization', choices=['none', 'rigid'], default='rigid', metavar='METHOD',
-        help='Optimization method applied after the initial HPI→Polhemus '
-             'coregistration. "none": no refinement. "rigid": '
-             'refine with rigid transform of polhemus locations by '
-             'minimizing the summed dipole RV (default).',
-    )
+    add_fit_options(p)
+    # Coregister always records fit provenance beside each saved output.
+    # An explicit --settings-json DIR only changes the sidecar directory.
+    p.set_defaults(settings_json='')
     p.add_argument(
         '--sfreq', '-s', type=float, default=None, metavar='HZ',
         help='Target sampling frequency in Hz (default: ask).',
@@ -250,10 +250,13 @@ def main():
     print(f"Data file(s): {datafiles}")
     print(f"HPI file:     {hpifile}")
     print(f"Polhemus:     {polfile}")
-    print(f"Reference:    {reffile if reffile else '(none — skipping noisy channel detection)'}")
+    print(f"Reference:    {reffile if reffile else '(none supplied)'}")
     print(f"Frequency:    {hpifreq} Hz")
     print(f"GOF limit:    {args.gof}")
-    print(f"Matching:     {'centred' if args.center_matching else 'uncentred (legacy)'}")
+    selected_options = fit_options(args)
+    settings_json = selected_options.pop('settings_json')
+    print(f"Policies:     {selected_options}")
+    print(f"Settings JSON: {'disabled' if settings_json is None else ('beside each output' if settings_json == '' else settings_json)}")
     print(f"Optimization: {args.optimization}")
     print(f"Target sfreq: {new_sfreq} Hz")
     print(f"Save:         {doSave}{'  (overwrite)' if overwrite else ''}")
@@ -263,7 +266,7 @@ def main():
     # Fit HPI coils (shared across all data files)
     # ----------------------------------------------------------------
     fit = fit_hpi(hpifile, polfile, hpifreq, gof_limit=args.gof, reffile=reffile,
-                  center_matching=args.center_matching, optim=args.optimization)
+                  **selected_options)
 
     hpi_names       = fit['hpi_names']
     hpi_dev         = fit['hpi_dev']
@@ -296,7 +299,7 @@ def main():
     print(f"hpi_dev  (device frame, mm):\n{np.round(hpi_dev * 1000, 1)}\n")
     print(f"mean distance = {np.mean(dist) * 1000:.1f} mm\n")
     for index, value in enumerate(hpi_gofs):
-        status = 'ok' if value > 0.9 else 'not ok'
+        status = 'ok' if fit['include_hpis'][index] else 'not ok'
         print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Status: {status}")
     print('---------------------------------------------')
 
@@ -310,16 +313,26 @@ def main():
     for datfile in datafiles:
         suffix  = _output_suffix(datfile, new_sfreq)
         raw_out = apply_transform(datfile, fit, new_sfreq)
+        stem = os.path.splitext(os.path.basename(datfile))[0].replace('_raw', '')
+        expected_outpath = os.path.join(os.path.dirname(datfile), stem + suffix)
+        sidecar_allowed = True
 
         if doSave:
-            stem    = os.path.splitext(os.path.basename(datfile))[0].replace('_raw', '')
-            outpath = os.path.join(os.path.dirname(datfile), stem + suffix)
+            outpath = expected_outpath
             if not overwrite and os.path.exists(outpath):
                 print(f"Skipped (already exists): {outpath}")
+                sidecar_allowed = False
             else:
                 outpath = save_raw(raw_out, datfile, suffix, overwrite=overwrite)
                 print(f"Saved: {outpath}")
                 last_outpath = outpath
+
+        if doSave and settings_json is not None and sidecar_allowed:
+            sidecar_path = _settings_sidecar_path(expected_outpath, settings_json)
+            write_settings_json(sidecar_path, fit, hpifile=hpifile, polfile=polfile,
+                                reffile=reffile, datafile=datfile,
+                                output_file=expected_outpath)
+            print(f"Settings:     {sidecar_path}")
 
         last_datfile = datfile
         last_raw_out = raw_out
@@ -334,8 +347,8 @@ def main():
         plot_stem = os.path.splitext(ref_path)[0] if ref_path else 'hpi_alignment'
         plot_path = f"{plot_stem}_hpi_alignment.png"
 
-        fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=True, gof_threshold=args.gof)
-        #fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=True)
+        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
         #print(f"Alignment plot saved: {plot_path}")
 
 

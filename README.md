@@ -60,15 +60,15 @@ usage: opmutil [-h] [--version] {check,coregister} ...
 
 ### `opmutil coregister`
 
-Unified replacement for the old `add_hpi_CP.py` / `add_hpi_multi_CP.py` pair.
 Select one or more data files; the transform is fitted once and applied to all
-selected files.  Output suffix: `_proc-hpi+ds_raw.fif`.
+selected files. Output suffix: `_proc-hpi_raw.fif`, or
+`_proc-hpi+ds_raw.fif` when resampling changes the sampling frequency.
 
-Any omitted argument opens a GUI file dialog, so the command works fully
-non-interactively, fully interactively, or anywhere in between.
+Omitted required inputs are requested through command-line prompts, so the
+command works non-interactively, interactively, or anywhere in between.
 
 ```bash
-# Fully interactive (GUI dialogs for all inputs)
+# Fully interactive (command-line prompts)
 opmutil coregister
 
 # Fully non-interactive
@@ -88,7 +88,7 @@ opmutil coregister \
     --freq 33 --sfreq 1000 --gof 0.9 \
     --save
 
-# Legacy-parity matching (regression testing only)
+# Uncentred matching only (not the complete historical legacy engine)
 opmutil coregister \
     --data AudOdd_raw.fif \
     --hpi  HPIBefore_raw.fif \
@@ -110,13 +110,152 @@ opmutil coregister \
 | `--data` | One or more data files to apply the transform to | *(ask)* |
 | `--hpi` | Raw HPI recording | *(ask)* |
 | `--pol` | Polhemus digitisation file (`.json` or `.fif`) | *(ask)* |
-| `--reffile` | Optional reference recording (e.g. resting state) used for background-power-based noisy channel detection | skip this step |
+| `--reffile` | Optional reference recording (e.g. resting state) used for background-power-based noisy channel detection | `auto` tries a clean HPI tail if omitted |
 | `--freq` | HPI drive frequency in Hz | *(ask)* |
 | `--gof` | Minimum dipole GOF for a coil to be included in the device-to-head transform fit | `0.95` |
-| `--no-center-matching` | Match HPI/Polhemus coil positions on raw (uncentred) coordinates instead of centroid-centring both point clouds first. Reproduces legacy matching behaviour; regression-testing only | centred |
-| `--optimization` | Refinement applied after the initial HPI→Polhemus coregistration: `none` or `rigid` (bounded L-BFGS-B refit maximizing signal-fit GOF) | `rigid` |
+| `--no-center-matching` | Compatibility alias for `--matching-strategy coordinate_nearest`; changes matching only, independently of refinement | centred |
+| `--optimization` | Post-registration refinement: `none` or `rigid_gof` (bounded L-BFGS-B maximizing field-fit GOF); `rigid` is an alias for `rigid_gof` | `rigid_gof` |
 | `--sfreq` | Target sampling frequency in Hz | *(ask)* |
-| `--save` / `--overwrite` / `--plot` | Save output, overwrite existing files, show/save alignment plot | off |
+| `--save` / `--overwrite` / `--plot` | Save outputs, overwrite existing FIF files, show alignment plot (not automatically saved) | off |
+
+The following behavior controls are shared by `coregister` and `check`:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--bad-channel-policy {auto,reference,none}` | `auto`: use the reference or a clean final five-second HPI tail, warning and skipping detection if unavailable; `reference`: require `--reffile`; `none`: skip noise detection. Explicit bads and invalid geometry are still excluded | `auto` |
+| `--activation-window-s` | Actual amplitude-fit duration in seconds, centred on the detected activation midpoint; insufficient activation or out-of-bounds windows raise an error | `2.0` |
+| `--localization-grid {coarse, medium,fine}` | Dipole search OPM grid. | medium |
+| `--gof-comparison {inclusive,strict}` | Include coils with GOF `>= --gof` or `> --gof`, respectively | `inclusive` |
+| `--matching-strategy {centroid_nearest,coordinate_nearest}` | Nearest-target matching after centring each point cloud, or on raw coordinates; mutually exclusive with `--no-center-matching` | `centroid_nearest` |
+| `--allow-repeated-matches` | Permit repeated nearest targets; degenerate rigid fits still raise an error | off (unique targets required) |
+| `--settings-json [DIR]` | `coregister` writes one sidecar per saved data output beside that output by default; this option is only needed to choose an optional existing sidecar directory. `check` writes its fit-stage record only when requested | enabled for `coregister`; disabled for `check` |
+
+Centring removes bulk translation offsets, not arbitrary inter-frame rotations.
+Matching and refinement are independent controls. There is no branch-selector
+option: the historical approach names below are comparisons, not CLI presets.
+
+### Settings sidecars
+
+With `coregister --save`, a settings sidecar is written **per
+individual transformed data output** by default, next to that output, not once per HPI
+recording or batch. Its name is
+`hpi_<output-basename-with-.fif-replaced-by-.json>`. For example:
+
+| Transformed output | Settings sidecar in the same directory |
+|--------------------|------------------------------------------------|
+| `subject_proc-hpi_raw.fif` | `hpi_subject_proc-hpi_raw.json` |
+| `subject_proc-hpi+ds_raw.fif` | `hpi_subject_proc-hpi+ds_raw.json` |
+
+```bash
+opmutil coregister \
+    --data subject_raw.fif resting_raw.fif \
+    --hpi HPIBefore_raw.fif --pol digitisation.json \
+    --freq 33 --sfreq 1000 --save
+```
+
+Each output has its own sidecar even though both share the fitted transform.
+An optional `--settings-json /existing/sidecar-directory` changes the sidecar
+directory, not the per-output naming convention. Sidecars record input/output
+basenames, library versions, effective fit settings, a compact results summary,
+and `fit_results`: the device-to-head transform (translation in metres),
+optimizer method/status, and one entry per HPI coil with its dipole GOF and
+inclusion decision. Included coils also record their matched Polhemus point
+(zero-based index), post-fit residual in metres, and Polhemus-position GOF.
+Non-finite diagnostic values are represented as JSON `null`. Sidecars are
+provenance records, not JSON configuration files read by the CLI.
+
+For the API, fit once and write a sidecar after saving **each** output:
+
+```python
+from pathlib import Path
+import mne
+from opm_utility_scripts.hpi import fit_hpi, apply_transform, save_raw
+from opm_utility_scripts.hpi._core import write_settings_json
+
+hpifile, polfile = "HPIBefore_raw.fif", "digitisation.json"
+fit = fit_hpi(hpifile, polfile, 33, optim="rigid_gof")
+target_sfreq = 1000
+for datafile in ("subject_raw.fif", "resting_raw.fif"):
+    source_sfreq = mne.io.read_info(datafile, verbose="error")["sfreq"]
+    suffix = "_proc-hpi"
+    if int(target_sfreq) != int(source_sfreq):
+        suffix += "+ds"
+    raw = apply_transform(datafile, fit, new_sfreq=target_sfreq)
+    output = Path(save_raw(raw, datafile, suffix + "_raw.fif", overwrite=True))
+    sidecar = output.with_name("hpi_" + output.with_suffix(".json").name)
+    write_settings_json(
+        sidecar, fit, hpifile=hpifile, polfile=polfile,
+        datafile=datafile, output_file=output,
+    )
+```
+
+The lower-level `fit_hpi(..., settings_json="fit.json")` and
+`fit_hpi_amplitudes(..., settings_json="amplitudes.json")` instead write an
+explicit fit-stage record: they do not apply or save data outputs. Use the
+per-output loop above for transformed-data provenance. `check` also has no
+transformed data outputs; its settings record describes the check/fit stage.
+
+### Version-specific command examples
+
+The following commands show current CLI settings corresponding as closely as
+possible to each historical release. They are **not version selectors** and do
+not reproduce every historical implementation detail; all use the current
+sequential fitter. Replace paths and frequency with values for your recording.
+
+**v0.3.0**:
+
+```bash
+opmutil coregister \
+    --data subject_raw.fif \
+    --hpi HPIBefore_raw.fif --pol digitisation.json \
+    --freq 33 --bad-channel-policy auto \
+    --activation-window-s 2 --gof 0.95 --gof-comparison inclusive \
+    --matching-strategy centroid_nearest \
+    --optimization rigid_gof --save
+```
+
+This is the closest match to current defaults: consistent OPM magnetometer ordering,
+unique matches, and bounded field-GOF refinement. When saving transformed FIFs,
+coregister writes a provenance sidecar for each output by default; use
+`--settings-json /existing/sidecar-directory` to change the sidecar directory.
+
+**v0.2.0**:
+
+```bash
+opmutil coregister \
+    --data subject_raw.fif \
+    --hpi HPIBefore_raw.fif --pol digitisation.json \
+    --freq 33 --bad-channel-policy auto \
+    --activation-window-s 2 --gof 0.95 --gof-comparison inclusive \
+    --matching-strategy centroid_nearest --allow-repeated-matches \
+    --optimization rigid_gof --save
+```
+
+The historical v0.2.0 implementation used noise exclusions after amplitude
+fitting, a six-second crop whose first two seconds were fitted, and asymmetric
+optimizer bounds. Those details cannot be selected by the current CLI; this
+command is only the closest available mapping.
+
+**v0.1.0**:
+
+```bash
+opmutil coregister \
+    --data subject_raw.fif \
+    --hpi HPIBefore_raw.fif --pol digitisation.json \
+    --freq 33 --bad-channel-policy none \
+    --activation-window-s 2 --gof 0.9 --gof-comparison strict \
+    --matching-strategy coordinate_nearest --allow-repeated-matches \
+    --optimization none --save
+```
+
+This does not select the historical duplicate-frequency amplitude model,
+integer-frequency peak spacing, or legacy input parsing. The current sequential
+fitter and its non-degeneracy checks remain in effect. To test whether the
+localization search grid explains a result difference, add
+`--localization-grid coarse`; this selects the stock-MNE initial-guess grid
+without changing the rest of the current pipeline.
+
+The `--localization-grid` option defaults to `medium` (5 mm grid and 2 mm distance).
 
 ### `opmutil check`
 
@@ -145,7 +284,7 @@ opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
 opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
     --reffile RestingState_raw.fif --optimization rigid
 
-# Legacy-parity matching (regression testing only)
+# Uncentred matching only (not the complete historical legacy engine)
 opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
     --no-center-matching
 ```
@@ -155,11 +294,14 @@ opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
 | `--hpi` | Path to the raw HPI `.fif` file | *(ask)* |
 | `--pol` | Path to Polhemus file (`.fif` or `.json`) | *(ask)* |
 | `--freq` | HPI drive frequency in Hz | `33` |
-| `--reffile` | Optional reference recording used for background-power-based noisy channel detection | skip this step |
+| `--reffile` | Optional reference recording used for background-power-based noisy channel detection | `auto` tries a clean HPI tail if omitted |
 | `--gof` | Minimum dipole GOF for a coil to be included in the device-to-head transform fit | `0.95` |
 | `--detailed` | Show full diagnostics in `--hpi` + `--pol` mode | off |
-| `--optimization` | Refinement applied after the initial HPI→Polhemus coregistration: `none` or `rigid` (bounded L-BFGS-B refit maximizing signal-fit GOF) | `rigid` |
-| `--no-center-matching` | Match HPI/Polhemus coil positions on raw (uncentred) coordinates instead of centroid-centring both point clouds first. Independent of `--optimization` — it changes which points are matched during the initial fit, not whether a post-fit refinement runs. Reproduces legacy matching behaviour; regression-testing only | centred |
+| `--optimization` | `none` or `rigid_gof`; `rigid` is a compatibility alias. Applies in full coregistration mode | `rigid_gof` |
+| `--no-center-matching` | Alias for `--matching-strategy coordinate_nearest`, independent of refinement; applies in full coregistration mode | centred |
+
+See the shared behavior controls above for noise policy, sensor population,
+activation window, GOF comparison, matching and settings output.
 
 ## Submodules (python -m)
 
@@ -234,4 +376,3 @@ from opm_utility_scripts.hpi import (
 | Core | `mne>=1.12`, `numpy>=1.26`, `scipy>=1.12`, `matplotlib>=3.8` | *(default)* |
 | Tools | `pandas>=2.2` | `[tools]` |
 | VTK visualiser | `pandas>=2.2`, `PyQt5>=5.15`, `vtk>=9.3` | `[vtk]` |
-
