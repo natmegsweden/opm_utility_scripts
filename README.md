@@ -60,7 +60,6 @@ usage: opmutil [-h] [--version] {check,coregister} ...
 
 ### `opmutil coregister`
 
-Unified replacement for the old `add_hpi_CP.py` / `add_hpi_multi_CP.py` pair.
 Select one or more data files; the transform is fitted once and applied to all
 selected files. Output suffix: `_proc-hpi_raw.fif`, or
 `_proc-hpi+ds_raw.fif` when resampling changes the sampling frequency.
@@ -125,6 +124,7 @@ The following behavior controls are shared by `coregister` and `check`:
 |------|-------------|---------|
 | `--bad-channel-policy {auto,reference,none}` | `auto`: use the reference or a clean final five-second HPI tail, warning and skipping detection if unavailable; `reference`: require `--reffile`; `none`: skip noise detection. Explicit bads and invalid geometry are still excluded | `auto` |
 | `--activation-window-s` | Actual amplitude-fit duration in seconds, centred on the detected activation midpoint; insufficient activation or out-of-bounds windows raise an error | `2.0` |
+| `--localization-grid {coarse, medium,fine}` | Dipole search OPM grid. | medium |
 | `--gof-comparison {inclusive,strict}` | Include coils with GOF `>= --gof` or `> --gof`, respectively | `inclusive` |
 | `--matching-strategy {centroid_nearest,coordinate_nearest}` | Nearest-target matching after centring each point cloud, or on raw coordinates; mutually exclusive with `--no-center-matching` | `centroid_nearest` |
 | `--allow-repeated-matches` | Permit repeated nearest targets; degenerate rigid fits still raise an error | off (unique targets required) |
@@ -252,106 +252,10 @@ This does not select the historical duplicate-frequency amplitude model,
 integer-frequency peak spacing, or legacy input parsing. The current sequential
 fitter and its non-degeneracy checks remain in effect. To test whether the
 localization search grid explains a result difference, add
-`--localization-grid legacy`; this selects the stock-MNE initial-guess grid
+`--localization-grid coarse`; this selects the stock-MNE initial-guess grid
 without changing the rest of the current pipeline.
 
-The `--localization-grid` option defaults to `fine` (2 mm spacing). Its
-`legacy` value uses the stock MNE search grid: 10 mm spacing, 5 mm inset, and a
-sphere radius based on the minimum MEG coil integration-point radius. This is
-an isolated grid comparison, not full legacy parity; the local optimizer,
-amplitude fitting, and other current checks remain unchanged. The exact stock
-grid is also MNE-version-dependent. `tests/test_hpi_versions.py` accepts the
-same option to apply either grid consistently across its v0.1.0/v0.2.0/v0.3.0
-settings runs.
-
-The comparison matrix summarizes the historical behavior versus current
-controls. All approaches in the historical comparison used sequential coil
-fitting.
-
-| Feature | `v0.3.0` | `v0.2.0` | `v0.1.0` |
-|---------|---------|---------|---------|
-| Noise handling | Reference/clean-tail exclusions before amplitude estimation | Reference/clean-tail detection after amplitude estimation | No reference-noise detection |
-| Amplitude window | Actual centred two-second fit | Six-second crop around midpoint, but fit uses its first two seconds | Approximately centred two-second crop |
-| Sensor handling | OPM magnetometers kept in consistent channel order across processing stages | Magnetometer-sized slope matrix without consistently enforced downstream ordering | Device-frame magnetometers only |
-| Default inclusion | GOF `>= 0.95` | GOF `>= 0.95` | GOF `> 0.9`; explicitly supplied threshold uses `>=` |
-| Matching | Centroid-nearest; duplicate targets rejected | Centroid-nearest; no duplicate-target rejection | Uncentred nearest targets |
-| Refinement | Field-GOF rigid refinement, rotation bounds ±5° | Field-GOF rigid refinement, rotation bounds −5° to +10° | Closed-form rigid registration only |
-| Refined diagnostics | Residuals and Polhemus GOFs recomputed after successful refinement; failed optimization retains initial transform | Returned residuals can remain initial-fit values | Fixed-position Polhemus GOF unavailable |
-
-**v0.2.0 versus v0.3.0 nuance:** the current default controls are closest to
-`v0.3.0`, not a byte-for-byte reproduction of `v0.2.0`. Merely changing
-the GOF threshold or matching strategy cannot restore v0.2.0's noise-detection
-timing, offset fit window, asymmetric optimizer bounds or stale residuals.
-The geometric residual may increase after field-GOF refinement because that
-objective does not minimize point-to-point distance. Different displayed
-residuals can therefore reflect initial versus refined transforms, while
-window/channel changes can also alter GOFs.
-
-This pipeline is for OPM recordings, whose sensors are magnetometers, so there
-is no sensor-type option. The pipeline selects magnetometer channels and keeps
-them in the same order throughout amplitude fitting, localization, and
-transform fitting. The SQUID device sometimes used to acquire digitisation
-points does not affect OPM sensor selection; only its digitisation points are
-used by coregistration.
-
-The following distinct JSON snippets are **partial `settings` fragments** in
-the current sidecar vocabulary. They omit data-dependent channel lists and
-resolved noise policy. They are not complete sidecars or loadable presets.
-
-**`v0.3.0`-like mapping** (closest to current defaults):
-
-```json
-{
-  "sensor_selection": "opm_magnetometers",
-  "bad_channel_policy": {"requested": "auto"},
-  "activation_window": {"duration_s": 2.0},
-  "coil_inclusion": {"gof_limit": 0.95, "comparison": "inclusive"},
-  "matching": {"strategy": "centroid_nearest", "unique_matches": true},
-  "transform_refinement": {
-    "method": "rigid_gof",
-    "rotation_bound_deg": 5.0,
-    "translation_bound_mm": 5.0
-  }
-}
-```
-
-**`v0.2.0`-like mapping** (two-second duration only approximates its historical
-offset fit; current noise exclusions still occur before fitting and current
-refinement bounds remain ±5°):
-
-```json
-{
-  "sensor_selection": "opm_magnetometers",
-  "bad_channel_policy": {"requested": "auto"},
-  "activation_window": {"duration_s": 2.0},
-  "coil_inclusion": {"gof_limit": 0.95, "comparison": "inclusive"},
-  "matching": {"strategy": "centroid_nearest", "unique_matches": false},
-  "transform_refinement": {"method": "rigid_gof"}
-}
-```
-
-**`v0.1.0`-like mapping** (default strict threshold and no refinement):
-
-```json
-{
-  "sensor_selection": "opm_magnetometers",
-  "bad_channel_policy": {"requested": "none"},
-  "activation_window": {"duration_s": 2.0},
-  "coil_inclusion": {"gof_limit": 0.9, "comparison": "strict"},
-  "matching": {"strategy": "coordinate_nearest", "unique_matches": false},
-  "transform_refinement": {"method": "none"}
-}
-```
-
-This does not select the historical duplicate-frequency amplitude model or
-integer-frequency peak spacing. The stock MNE localizer can be selected
-separately with `--localization-grid legacy`; it does not suppress the current
-fixed-position Polhemus GOF diagnostic. The historical v0.1.0 implementation
-accepted verified head-frame FIF/DigMontage digitisation, not JSON. Its
-configurable fitting sample rate is also not reproduced: the current HPI fit
-uses 1000 Hz internally; `coregister --sfreq` controls transformed-data
-resampling, not HPI fitting. Allowing repeated matches does not disable current
-non-degeneracy checks.
+The `--localization-grid` option defaults to `medium` (5 mm grid and 2 mm distance).
 
 ### `opmutil check`
 

@@ -24,7 +24,6 @@ Usage (fully interactive — CLI prompts for everything)::
 import argparse
 import os
 import sys
-
 import matplotlib.pyplot as plt
 import mne
 import numpy as np
@@ -349,7 +348,7 @@ def main():
         plot_path = f"{plot_stem}_hpi_alignment.png"
 
         fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=True)
-        #fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
         #print(f"Alignment plot saved: {plot_path}")
 
 

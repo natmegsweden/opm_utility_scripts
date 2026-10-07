@@ -324,20 +324,17 @@ def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=Non
         if temp_path is not None and os.path.exists(temp_path):
             os.unlink(temp_path)
 
-def _make_opm_guesses(meg_coils, localization_grid='fine'):
-    """Build dipole-location guesses using the fine or stock MNE grid."""
-    _check_option('localization_grid', localization_grid, ('fine', 'legacy'))
+def _make_opm_guesses(meg_coils, localization_grid='medium'):
+    """Build dipole-location guesses using a grid search."""
+    _check_option('localization_grid', localization_grid, ('coarse', 'medium', 'fine'))
     coil_radii = np.linalg.norm(meg_coils[0], axis=1)
-    if localization_grid == 'legacy':
-        # Match MNE's stock compute_chpi_locs search domain: a 10 mm
-        # Cartesian grid, 5 mm inside a sphere whose radius is the nearest
-        # MEG coil integration point. The origin is not excluded.
-        R = coil_radii.min()
+    R = coil_radii.max()
+    
+    if localization_grid == 'coarse':
         grid, mindist = 0.01, 0.005
+    elif localization_grid == 'medium':
+        grid, mindist = 0.005, 0.002
     else:
-        # The current OPM-specific search uses a denser grid and its existing
-        # maximum-radius sphere/minimum-radius clipping behavior.
-        R = coil_radii.max()
         grid, mindist = 0.002, 0.001
 
     sphere = ConductorModel(
@@ -348,8 +345,7 @@ def _make_opm_guesses(meg_coils, localization_grid='fine'):
 
     guesses = _make_guesses(sphere, grid, 0.0, mindist)[0]["rr"]
 
-    if localization_grid == 'fine':
-        guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii.min()]
+    guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii.min()]
 
     return guesses
 
@@ -553,7 +549,7 @@ def compute_chpi_opm_locs(
     too_close="raise",
     adjust_dig=False,
     *,
-    localization_grid='fine',
+    localization_grid='medium',
     verbose=None,
 ):
     """Compute locations of each cHPI coils over time.
@@ -1071,7 +1067,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
              reffile: str = None, center_matching: bool = None, *,
              bad_channel_policy='auto', activation_window_s=2.0,
              gof_comparison='inclusive', matching_strategy=None, unique_matches=True,
-             localization_grid='fine',
+             localization_grid='medium',
              settings_json=None) -> dict:
     """
     Load HPI and Polhemus recordings, fit dipoles per coil, and compute
@@ -1139,11 +1135,10 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         Default centroid_nearest. Raw coordinates are used for coordinate_nearest.
         Both feed the same rigid fit. center_matching is a compatibility alias;
         contradictory explicitly supplied values raise.
-    localization_grid : {'fine', 'legacy'}
-        Dipole-search initial guesses. ``fine`` uses the current 2 mm OPM grid;
-        ``legacy`` uses the stock-MNE 10 mm grid, 5 mm sphere inset, and
-        minimum sensor-coil radius. This isolates grid effects but does not
-        select the complete historical localization/amplitude engine.
+    localization_grid : {'coarse', 'medium', 'fine'}
+        Dipole-search initial guesses. ``fine`` uses the current 2 mm OPM grid and 1 mm distance;
+        ``coarse`` a 10 mm grid, 5 mm distance; 
+        ``fine`` uses 5 mm grid and 2 mm distance.
     unique_matches : bool, default True
         Reject repeated nearest targets. False permits repeats only when the
         resulting correspondences still determine a non-degenerate rigid fit.
@@ -1220,7 +1215,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
                                 activation_window_s, reffile)
     _gof_mask([], gof_limit, gof_comparison)
     _check_option('optim', optim, ('none', 'rigid', 'rigid_gof'))
-    _check_option('localization_grid', localization_grid, ('fine', 'legacy'))
+    _check_option('localization_grid', localization_grid, ('coarse', 'medium', 'fine'))
     # Keep the compatibility alias accepted at the API boundary, but store and
     # report one canonical optimizer name throughout the fit result.
     if optim == 'rigid':
