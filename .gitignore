@@ -23,3 +23,6 @@ env/
 
 # Editor / tooling
 .kilo/
+
+# Temporary diagnostics
+tmp
