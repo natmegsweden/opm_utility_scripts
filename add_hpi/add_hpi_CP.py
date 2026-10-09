@@ -868,8 +868,8 @@ print(f"hpi_dev: {hpi_dev}\n")
 print(f"order: {indices}\n")
 print(f"mean distance = {np.mean(dist)*1000:.1f} mm\n")
 for index, value in enumerate(hpi_gofs):
-        status = 'ok' if hpi_gofs[index]>0.9 else 'not ok'
-        if status == 'ok':
+        status = 'OK' if hpi_gofs[index]>0.9 else 'NOT OK'
+        if status == 'OK':
             print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Dist(mm): {dist[index]*1e3:.1f}, Status: {status}, fixed-GOF: {pol_gofs1[index]:.3f}, opt-GOF: {pol_gofs2[index]:.3f}, opt-Dist(mm): {dist2[index]*1e3:.1f}")
         else:
             print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Status: {status}")
