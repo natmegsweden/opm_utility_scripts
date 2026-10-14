@@ -3,6 +3,7 @@
 import argparse
 from concurrent.futures import Future
 from contextlib import ExitStack
+from copy import deepcopy
 import io as stdio
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import warnings
 
 import matplotlib
 matplotlib.use('Agg')
@@ -39,8 +41,40 @@ def synthetic_raw():
 def amplitude_mock(raw, **kwargs):
     picks = mne.pick_types(raw.info, meg=True, ref_meg=False)
     names = [raw.ch_names[p] for p in picks]
+    proj = mne.Projection(
+        data=dict(col_names=names, row_names=None, data=np.zeros((1, len(names))),
+                  nrow=1, ncol=len(names)), desc='no-op amplitude projector',
+        kind=1, active=False)
     return {'times': np.array([1.]), 'slopes': np.ones((1, 1, len(names))),
-            'proj': {'data': {'col_names': names}}}
+            'proj': proj}
+
+
+def fieldline_info():
+    """Real radial FieldLine geometry, with deterministic nonuniform coverage."""
+    info = mne.create_info([f'OPM{i:02}' for i in range(20)], 1000, 'mag')
+    directions = np.random.default_rng(7).normal(size=(20, 3))
+    directions /= np.linalg.norm(directions, axis=1)[:, None]
+    for ch, z in zip(info['chs'], directions):
+        x = np.cross(z, [0., 0., 1.])
+        x /= np.linalg.norm(x)
+        y = np.cross(z, x)
+        ch['loc'] = np.r_[.12 * z, x, y, z]
+        ch['coil_type'] = mne.io.constants.FIFF.FIFFV_COIL_FIELDLINE_OPM_MAG_GEN1
+    return info
+
+
+def assert_projectors_equal(test, actual, expected):
+    test.assertEqual(len(actual), len(expected))
+    for got, want in zip(actual, expected):
+        test.assertEqual(got['desc'], want['desc'])
+        test.assertEqual(got['active'], want['active'])
+        test.assertEqual(got['kind'], want['kind'])
+        test.assertEqual(got['data']['col_names'], want['data']['col_names'])
+        test.assertEqual(got['data'].keys(), want['data'].keys())
+        test.assertEqual(got['data'].get('row_names'), want['data'].get('row_names'))
+        test.assertEqual(got['data']['nrow'], want['data']['nrow'])
+        test.assertEqual(got['data']['ncol'], want['data']['ncol'])
+        np.testing.assert_array_equal(got['data']['data'], want['data']['data'])
 
 
 POINTS = np.array([[0, 0, 0.04], [0.03, 0, 0.04], [0, 0.03, 0.04], [0.03, 0.03, 0.04]])
@@ -57,11 +91,15 @@ class PolicyTests(unittest.TestCase):
         with patch('sys.argv', ['coregister']):
             args = coregister._parse_args()
             self.assertEqual(args.settings_json, '')
-            self.assertEqual(fit_options(args)['localization_grid'], 'fine')
-        with patch('sys.argv', ['coregister', '--localization-grid', 'legacy']):
-            self.assertEqual(fit_options(coregister._parse_args())['localization_grid'], 'legacy')
+            self.assertEqual(fit_options(args)['localization_grid'], 'medium')
+            self.assertEqual(args.optimization, 'rigid_gof')
+        with patch('sys.argv', ['coregister', '--localization-grid', 'mne_stock']):
+            self.assertEqual(fit_options(coregister._parse_args())['localization_grid'], 'mne_stock')
         with patch('sys.argv', ['check']):
-            self.assertIsNone(check._parse_args().settings_json)
+            args = check._parse_args()
+            self.assertIsNone(args.settings_json)
+            self.assertEqual(args.localization_grid, 'medium')
+            self.assertEqual(args.optimization, 'rigid_gof')
 
     def test_invalid_options_fail_before_loading(self):
         for kwargs in ({'bad_channel_policy': 'other'},
@@ -76,6 +114,10 @@ class PolicyTests(unittest.TestCase):
         for freq in (0, -1, 500, float('nan')):
             with self.assertRaises(ValueError):
                 core.fit_hpi_amplitudes('not-a-file', freq)
+        with patch.object(core, 'fit_hpi_amplitudes') as amplitudes:
+            with self.assertRaisesRegex(ValueError, 'localization_grid'):
+                core.fit_hpi('not-a-file', POL, 33, localization_grid='unknown')
+            amplitudes.assert_not_called()
 
     def test_gof_comparison(self):
         values = [.94, .95, .96, np.nan, np.inf]
@@ -86,6 +128,52 @@ class PolicyTests(unittest.TestCase):
         verdict = check._recommendation([.95, .95, .96], gof_comparison='strict')
         self.assertEqual(verdict[0], 'POOR')
         self.assertEqual(check._gof_color(.95, comparison='strict'), 'darkorange')
+
+    def test_registration_recommendation_good_and_field_only_concerns(self):
+        for fields, distances, expected in (
+                ([.99] * 3, [1.] * 3, 'OK'),
+                ([.972, 1., .560], [3.38, .43, 3.69], 'CHECK REGISTRATION'),
+                ([.99, .99, .4], [1.] * 3, 'CHECK REGISTRATION')):
+            with self.subTest(fields=fields):
+                verdict = check._recommendation([.99] * 3, distances,
+                                                [True] * 3, fields)
+                self.assertEqual(verdict[0], 'OK')
+                self.assertEqual(verdict[3], expected)
+                if expected != 'OK':
+                    self.assertIn('fail polhemus-position GOF', ' '.join(verdict[5]))
+                    self.assertIn('field-model/registration consistency', ' '.join(verdict[5]))
+                    self.assertIn('corroborating', ' '.join(verdict[5]))
+
+    def test_registration_unavailable_fields_and_invalid_residuals(self):
+        for fields in (None, [], [.99], .99, np.array([[.99] * 3]), [np.nan] * 3):
+            with self.subTest(fields=fields):
+                verdict = check._recommendation([.99] * 3, [1.] * 3,
+                                                [True] * 3, fields)
+                self.assertEqual(verdict[3], 'CHECK REGISTRATION')
+                self.assertIn('Field GOF assessment unavailable', ' '.join(verdict[5]))
+                self.assertNotIn('fail polhemus-position GOF', ' '.join(verdict[5]))
+        for invalid in (np.nan, np.inf, -1.):
+            with self.subTest(residual=invalid):
+                verdict = check._recommendation([.99] * 3, [1., 1., invalid],
+                                                [True] * 3, [.99] * 3)
+                self.assertEqual(verdict[3], 'CHECK REGISTRATION')
+                self.assertIn('Residual assessment unavailable', ' '.join(verdict[5]))
+
+    def test_registration_requires_joint_passes_and_preserves_thresholds(self):
+        verdict = check._recommendation([.99] * 4, [1., 1., 1., 6.],
+                                        [True] * 4, [.4, .99, .99, .99])
+        self.assertEqual(verdict[3], 'CHECK REGISTRATION')
+        for comparison, expected in (('inclusive', 'OK'), ('strict', 'CHECK REGISTRATION')):
+            with self.subTest(comparison=comparison):
+                verdict = check._recommendation([.99] * 3, [4.999] * 3,
+                                                [True] * 3, [.95] * 3,
+                                                gof_comparison=comparison)
+                self.assertEqual(verdict[3], expected)
+        self.assertNotEqual(check._recommendation([.99] * 3, [5.] * 3,
+                                                  [True] * 3, [.99] * 3)[3], 'OK')
+        # Three jointly passing coils still suffice when a fourth is unavailable.
+        self.assertEqual(check._recommendation([.99] * 4, [1., 1., 1., np.nan],
+                                               [True] * 4, [.99, .99, .99, np.nan])[3], 'OK')
 
     def test_activation_bounds(self):
         self.assertEqual(core._activation_bounds(1, 5, 10, 1000, 2, 'coil'), (2, 4))
@@ -123,21 +211,108 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn('grad1', raw.ch_names)
 
     def test_localization_grid_profiles(self):
-        coils = [np.array([[0.0, 0.0, 0.08], [0.0, 0.0, 0.10]])]
-        guesses = np.array([[0.0, 0.0, 0.075], [0.0, 0.0, 0.09]])
+        coils = [np.array([[0.0, 0.0, 0.08], [0.0, 0.0, -0.10]])]
+        guesses = np.array([[0.0, 0.0, 0.075], [0.0, 0.0, -0.09],
+                            [0.0, 0.0, 0.09], [0.0, 0.0, -0.11]])
         for mode, expected_radius, expected_grid, expected_mindist in (
+                ('coarse', 0.10, 0.01, 0.005),
+                ('medium', 0.10, 0.005, 0.002),
                 ('fine', 0.10, 0.002, 0.001),
-                ('legacy', 0.08, 0.01, 0.005)):
+                ('mne_stock', 0.08, 0.01, 0.005)):
             with self.subTest(mode=mode), patch.object(
                     core, '_make_guesses', return_value=[{'rr': guesses}]) as make:
                 result = core._make_opm_guesses(coils, mode)
             sphere = make.call_args.args[0]
             self.assertAlmostEqual(sphere['layers'][0]['rad'], expected_radius)
             self.assertEqual(make.call_args.args[1:], (expected_grid, 0.0, expected_mindist))
-            if mode == 'fine':
-                np.testing.assert_array_equal(result, guesses[:1])
+            if mode != 'mne_stock':
+                np.testing.assert_array_equal(result, guesses[:2])
             else:
                 np.testing.assert_array_equal(result, guesses)
+
+    def test_localization_grid_uses_nearest_coil_radius(self):
+        coils = [np.array([[.08, 0, 0], [0, .10, 0]])]
+        guesses = np.array([[.075, 0, 0], [0, .09, 0], [.09, 0, 0],
+                            [0, .11, 0], [.08, 0, 0], [0, 0, 0]])
+        for mode in ('coarse', 'medium', 'fine'):
+            with self.subTest(mode=mode), patch.object(
+                    core, '_make_guesses', return_value=[{'rr': guesses}]):
+                result = core._make_opm_guesses(coils, mode)
+            # Retain the outer-sensor guess beyond the global minimum radius,
+            # but reject a same-radius guess whose nearest sensor is inward.
+            # Equality at the local radius and the origin remain included.
+            np.testing.assert_array_equal(result, guesses[[0, 1, 4, 5]])
+
+    def test_localization_grid_empty_results(self):
+        coils = [np.array([[.08, 0, 0], [0, .10, 0]])]
+        for mode in ('coarse', 'medium', 'fine'):
+            for guesses in (np.empty((0, 3)), np.array([[.09, 0, 0]])):
+                with self.subTest(mode=mode, guesses=guesses), patch.object(
+                        core, '_make_guesses', return_value=[{'rr': guesses}]):
+                    result = core._make_opm_guesses(coils, mode)
+                self.assertEqual(result.shape, (0, 3))
+
+    def test_grids_and_default_match_nearest_coil_construction(self):
+        coils = [np.array([[0, 0, .08], [.061, 0, .08]])]
+        radii = np.linalg.norm(coils[0], axis=1)
+        sphere = mne.bem.ConductorModel(
+            layers=[dict(rad=radii.max())], r0=np.zeros(3), is_sphere=True)
+        for mode, spacing, clearance in (
+                ('coarse', .01, .005), ('medium', .005, .002), ('fine', .002, .001)):
+            with self.subTest(mode=mode):
+                expected = mne.dipole._make_guesses(
+                    sphere, spacing, 0., clearance, verbose=False)[0]['rr']
+                # Independent brute-force oracle for the nearest integration point.
+                distances = np.linalg.norm(expected[:, np.newaxis] - coils[0], axis=2)
+                nearest = distances.argmin(axis=1)
+                expected = expected[np.linalg.norm(expected, axis=1) <= radii[nearest]]
+                np.testing.assert_array_equal(core._make_opm_guesses(coils, mode), expected)
+                if mode == 'medium':
+                    np.testing.assert_array_equal(core._make_opm_guesses(coils), expected)
+        # Unequal radii distinguish stock's clearance from coarse's clipping.
+        self.assertGreater(len(core._make_opm_guesses(coils, 'coarse')),
+                           len(core._make_opm_guesses(coils, 'mne_stock')))
+        with self.assertRaisesRegex(ValueError, 'localization_grid'):
+            core._make_opm_guesses(coils, 'unknown')
+
+    def test_mne_stock_exactly_matches_installed_stock_guess_construction(self):
+        # Stop stock MNE immediately after guess construction: exercise its real
+        # construction without running a different localizer or fitting data.
+        class GuessesCaptured(Exception):
+            pass
+
+        info = mne.create_info(['mag1', 'mag2'], 1000, ['mag', 'mag'])
+        info['dev_head_t'] = mne.transforms.Transform('meg', 'head')
+        proj = mne.Projection(data=dict(col_names=info.ch_names, row_names=None,
+                                       data=np.ones((1, 2)), nrow=1, ncol=2),
+                              desc='test', kind=1, active=False)
+        amplitudes = dict(proj=proj)
+        geometries = (
+            np.array([[0, 0, .08], [0, 0, .10]]),
+            np.array([[.08, 0, 0], [0, -.08, 0], [0, 0, -.08]]),
+            np.array([[.031, -.042, .057], [-.09, .015, .034], [.01, .11, -.02]]),
+            # Multiple integration points per sensor; the inward point, not
+            # a sensor centre or the outermost point, controls the sphere.
+            np.array([[.079, 0, .002], [.081, 0, -.002],
+                      [0, -.099, .001], [0, -.101, -.001]]),
+        )
+        for positions in geometries:
+            with self.subTest(positions=positions), ExitStack() as stack:
+                stack.enter_context(patch.object(mne.chpi, '_check_chpi_param'))
+                stack.enter_context(patch.object(mne.chpi, '_create_meg_coils'))
+                stack.enter_context(patch.object(mne.chpi, '_concatenate_coils',
+                                                 return_value=[positions]))
+                stack.enter_context(patch.object(mne.chpi, 'make_ad_hoc_cov'))
+                stack.enter_context(patch.object(mne.chpi, 'compute_whitener',
+                                                 return_value=(np.eye(2), None)))
+                field = stack.enter_context(patch.object(
+                    mne.chpi, '_magnetic_dipole_field_vec', side_effect=GuessesCaptured))
+                with self.assertRaises(GuessesCaptured):
+                    mne.chpi.compute_chpi_locs(info, amplitudes, verbose=False)
+                expected = field.call_args.args[0]
+                actual = core._make_opm_guesses([positions], 'mne_stock')
+                self.assertGreater(len(actual), 0)
+                np.testing.assert_array_equal(actual, expected)
 
     def test_reference_statistics_population_and_no_mutation(self):
         raw = synthetic_raw()
@@ -233,7 +408,7 @@ class PipelineTests(unittest.TestCase):
             payload = json.loads(path.read_text())
             self.assertEqual(payload['schema_version'], 1)
             self.assertEqual(payload['settings']['matching']['strategy'], 'centroid_nearest')
-            self.assertEqual(payload['settings']['localization_grid'], 'fine')
+            self.assertEqual(payload['settings']['localization_grid'], 'medium')
             self.assertEqual(payload['results_summary']['included_coils'], 4)
             self.assertIsNone(payload['results_summary']['optimizer_success'])
             fit_results = payload['fit_results']
@@ -265,9 +440,25 @@ class PipelineTests(unittest.TestCase):
         np.testing.assert_array_equal(fit['original_coil_indices'], [0, 2, 3])
         np.testing.assert_array_equal(fit['tree_indices'], [0, 2, 3])
         info = core.compute_chpi_opm_locs.call_args.args[0]
-        self.assertEqual(core.compute_chpi_opm_locs.call_args.kwargs['localization_grid'], 'fine')
+        self.assertEqual(core.compute_chpi_opm_locs.call_args.kwargs['localization_grid'], 'medium')
         dig_hpi = [d['r'] for d in info['dig'] if d['kind'] == mne.io.constants.FIFF.FIFFV_POINT_HPI]
         np.testing.assert_allclose(dig_hpi, POINTS[[0, 2, 3]])
+
+    def test_fit_hpi_accepts_mne_stock_and_preserves_refinement_default(self):
+        self.mock_localization(gofs=[.95, .99, .99, .99])
+        success = SimpleNamespace(status=0, success=True, x=np.zeros(6), fun=-.98)
+        with patch.object(core, 'minimize', return_value=success) as optimizer, \
+                patch.object(mne.chpi, 'compute_chpi_locs',
+                             side_effect=AssertionError('Must use the OPM localizer')):
+            fit = core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none',
+                               localization_grid='mne_stock')
+        self.assertEqual(core.compute_chpi_opm_locs.call_args.kwargs['localization_grid'],
+                         'mne_stock')
+        self.assertEqual(fit['settings']['localization_grid'], 'mne_stock')
+        self.assertEqual(fit['optim'], 'rigid_gof')
+        self.assertEqual(fit['settings']['transform_refinement']['method'], 'rigid_gof')
+        np.testing.assert_array_equal(fit['include_hpis'], [True] * 4)
+        optimizer.assert_called_once()
 
     def test_prepare_polhemus_for_localization_frame_conversion_and_validation(self):
         original_indices = np.array([0, 2, 3])
@@ -296,15 +487,102 @@ class PipelineTests(unittest.TestCase):
             core._prepare_polhemus_for_localization(
                 too_few, synthetic_raw(), hpi_names, original_indices)
 
-    def test_strict_threshold_and_failed_optimizer(self):
+    def test_strict_threshold_skips_optimizer_with_three_accepted(self):
         self.mock_localization(gofs=[.95, .99, .99, .99])
-        failure = SimpleNamespace(status=2, success=False, x=np.zeros(6), fun=-.98)
-        with patch.object(core, 'minimize', return_value=failure), self.assertWarnsRegex(RuntimeWarning, 'Retaining'):
+        with patch.object(core, 'minimize') as optimizer, \
+                self.assertWarnsRegex(RuntimeWarning, 'at least 4 are required'):
             fit = core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none',
                                optim='rigid_gof', gof_comparison='strict')
+        optimizer.assert_not_called()
         np.testing.assert_array_equal(fit['include_hpis'], [False, True, True, True])
+        self.assertEqual(fit['optim'], 'none')
+        self.assertIsNone(fit['opt_success'])
+        np.testing.assert_allclose(fit['dev_to_head_trans']['trans'], np.eye(4), atol=1e-12)
+
+    def test_failed_optimizer_with_four_accepted_retains_initial_transform(self):
+        self.mock_localization(gofs=[.96, .99, .99, .99])
+        failure = SimpleNamespace(status=2, success=False, x=np.zeros(6), fun=-.98)
+        with patch.object(core, 'minimize', return_value=failure) as optimizer, self.assertWarnsRegex(RuntimeWarning, 'Retaining'):
+            fit = core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none',
+                               optim='rigid_gof', gof_comparison='strict')
+        optimizer.assert_called_once()
+        np.testing.assert_array_equal(fit['include_hpis'], [True] * 4)
         self.assertFalse(fit['opt_success'])
         np.testing.assert_allclose(fit['dev_to_head_trans']['trans'], np.eye(4), atol=1e-12)
+
+    def test_three_accepted_gate_preserves_geometry_diagnostics_and_sidecar(self):
+        # Test detected count separately from accepted count; alias metadata is normalized.
+        for detected in (3, 4):
+            for requested in ('rigid', 'rigid_gof'):
+                with self.subTest(detected=detected, requested=requested), ExitStack() as stack:
+                    raw = synthetic_raw()
+                    if detected == 3:
+                        raw._data[6] *= 1e-3
+                    points = POINTS[:detected] + [.002, -.003, .001]
+                    self.mock_localization(points, [.99] * 3 + ([.4] if detected == 4 else []))
+                    optimizer = stack.enter_context(patch.object(core, 'minimize'))
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = Path(tmp) / 'settings.json'
+                        with self.assertWarnsRegex(RuntimeWarning, 'only 3 HPI coils'):
+                            fit = core.fit_hpi(raw, POL, 33, bad_channel_policy='none',
+                                               optim=requested, settings_json=path)
+                        payload = json.loads(path.read_text())
+                    optimizer.assert_not_called()
+                    expected = np.eye(4)
+                    expected[:3, 3] = [-.002, .003, -.001]
+                    np.testing.assert_allclose(fit['dev_to_head_trans']['trans'], expected, atol=1e-12)
+                    np.testing.assert_allclose(fit['dist'], 0., atol=1e-12)
+                    np.testing.assert_allclose(fit['pol_gofs'], .98)
+                    self.assertTrue(np.isfinite(fit['hpi_gofs']).all())
+                    self.assertEqual(fit['optim'], 'none')
+                    refinement = dict(requested_method='rigid_gof', method='none',
+                                      skip_reason='fewer_than_four_accepted_coils',
+                                      rotation_bound_deg=None, translation_bound_mm=None)
+                    self.assertEqual(fit['settings']['transform_refinement'], refinement)
+                    self.assertEqual(payload['settings']['transform_refinement'], refinement)
+                    self.assertEqual(payload['results_summary']['included_coils'], 3)
+                    self.assertIsNone(payload['results_summary']['optimizer_success'])
+                    for key in ('opt_status', 'opt_success', 'opt_delta_deg', 'opt_delta_mm'):
+                        self.assertIsNone(fit[key])
+                    self.assertEqual(payload['fit_results']['optimizer'], dict(
+                        method='none', status=None, success=None, delta_deg=None, delta_mm=None))
+
+    def test_explicit_none_with_three_accepted_does_not_warn_about_refinement(self):
+        raw = synthetic_raw()
+        raw._data[6] *= 1e-3
+        self.mock_localization(POINTS[:3])
+        with patch.object(core, 'minimize') as optimizer, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            fit = core.fit_hpi(raw, POL, 33, bad_channel_policy='none', optim='none')
+        optimizer.assert_not_called()
+        self.assertFalse(any('refinement disabled' in str(w.message) for w in caught))
+        self.assertEqual(fit['settings']['transform_refinement'], dict(
+            requested_method='none', method='none', skip_reason=None,
+            rotation_bound_deg=None, translation_bound_mm=None))
+
+    def test_fewer_than_three_accepted_still_rejected(self):
+        self.mock_localization(gofs=[.99, .99, .4, np.nan])
+        with patch.object(core, 'minimize') as optimizer, \
+                self.assertRaisesRegex(ValueError, 'Only 2 HPI coil.*At least 3'):
+            core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none')
+        optimizer.assert_not_called()
+
+    def test_malformed_field_gofs_have_consistent_figure_and_cli_verdicts(self):
+        self.mock_localization()
+        fit = core.fit_hpi(synthetic_raw(), POL, 33, bad_channel_policy='none', optim='none')
+        for fields in (None, [], [.99], .99, np.array([[.99] * 4]), [np.nan] * 4):
+            with self.subTest(fields=fields):
+                malformed = dict(fit, pol_gofs=fields)
+                output = stdio.StringIO()
+                with patch('sys.stdout', new=output):
+                    check._print_diagnostics_full(malformed, detailed=True)
+                fig = check._build_figure_full(malformed, detailed=True)
+                text = ' '.join(t.get_text() for ax in fig.axes for t in ax.texts)
+                self.assertIn('Polhemus registration: CHECK REGISTRATION', output.getvalue())
+                self.assertIn('CHECK REGISTRATION', text)
+                self.assertIn('unavailable', output.getvalue())
+                self.assertIn('unavailable', text)
+                plt.close(fig)
 
     def test_nonfinite_optimizer_and_success(self):
         self.mock_localization()
@@ -370,6 +648,34 @@ class PipelineTests(unittest.TestCase):
 
 
 class CallerTests(unittest.TestCase):
+    def test_hpi_only_forwards_grid_and_preserves_medium_default(self):
+        for kwargs, expected in (({}, 'medium'), ({'localization_grid': 'mne_stock'}, 'mne_stock')):
+            raw = synthetic_raw()
+            amp = dict(raw_orig=raw, coil_amplitudes=object(), hpi_indices=np.arange(4))
+            with self.subTest(grid=expected), patch.object(
+                    check, 'compute_chpi_opm_locs',
+                    return_value=dict(rrs=[POINTS], gofs=[[.99] * 4])) as localize:
+                result = check._resolve_hpi_only(amp, **kwargs)
+            self.assertEqual(localize.call_args.kwargs['localization_grid'], expected)
+            self.assertIs(localize.call_args.args[1], amp['coil_amplitudes'])
+            self.assertEqual(len(raw.info['dig']), 4)
+            np.testing.assert_array_equal(result['hpi_dev'], POINTS)
+
+    def test_hpi_only_cli_forwards_grid_and_records_setting(self):
+        for flags, expected in (([], 'medium'), (['--localization-grid', 'mne_stock'], 'mne_stock')):
+            amp = dict(hpi_gofs=np.array([.99] * 4), settings={})
+            with self.subTest(grid=expected), ExitStack() as stack:
+                stack.enter_context(patch('sys.argv', ['check', '--hpi', 'hpi.fif'] + flags))
+                stack.enter_context(patch('sys.stdout', new=stdio.StringIO()))
+                stack.enter_context(patch.object(check, 'fit_hpi_amplitudes', return_value=amp))
+                resolve = stack.enter_context(patch.object(check, '_resolve_hpi_only', return_value=amp))
+                stack.enter_context(patch.object(check, '_print_diagnostics_hpi_only'))
+                stack.enter_context(patch.object(check, '_build_figure_hpi_only'))
+                stack.enter_context(patch.object(check.plt, 'show'))
+                check.main()
+            resolve.assert_called_once_with(amp, localization_grid=expected)
+            self.assertEqual(amp['settings']['localization_grid'], expected)
+
     def test_output_sidecar_name(self):
         output = '/data/subject_proc-hpi+ds_raw.fif'
         self.assertEqual(coregister._settings_sidecar_path(output),
@@ -381,18 +687,30 @@ class CallerTests(unittest.TestCase):
         flags = ['--bad-channel-policy', 'none', '--activation-window-s', '3',
                  '--gof-comparison', 'strict', '--matching-strategy', 'coordinate_nearest',
                  '--allow-repeated-matches', '--optimization', 'none', '--settings-json', 'fit.json',
-                 '--localization-grid', 'legacy']
+                 '--localization-grid', 'mne_stock']
         for module in (check, coregister):
             with patch('sys.argv', ['program'] + flags):
                 options = fit_options(module._parse_args())
             self.assertEqual(options, dict(bad_channel_policy='none',
                                           activation_window_s=3., gof_comparison='strict',
                                           matching_strategy='coordinate_nearest', unique_matches=False,
-                                          localization_grid='legacy',
+                                          localization_grid='mne_stock',
                                           optim='none', settings_json='fit.json'))
         parser = argparse.ArgumentParser()
         add_fit_options(parser)
         self.assertEqual(parser.parse_args(['--no-center-matching']).matching_strategy, 'coordinate_nearest')
+
+    def test_cli_accepts_all_grids_and_rejects_unknown(self):
+        for module in (check, coregister):
+            for grid in ('coarse', 'medium', 'fine', 'mne_stock'):
+                with self.subTest(module=module.__name__, grid=grid), \
+                        patch('sys.argv', ['program', '--localization-grid', grid]):
+                    self.assertEqual(fit_options(module._parse_args())['localization_grid'], grid)
+            with self.subTest(module=module.__name__), \
+                    patch('sys.argv', ['program', '--localization-grid', 'unknown']), \
+                    patch('sys.stderr', new=stdio.StringIO()), self.assertRaises(SystemExit) as exc:
+                module._parse_args()
+            self.assertEqual(exc.exception.code, 2)
 
     def test_candidate_forwarding_and_naming(self):
         files = ['/one/hpi.fif', '/two/hpi.fif']
@@ -444,6 +762,144 @@ class CallerTests(unittest.TestCase):
 
 
 class MNEIntegrationTests(unittest.TestCase):
+    def tearDown(self):
+        plt.close('all')
+
+    def test_real_projected_dipole_metric_and_ordered_copy(self):
+        info = fieldline_info()
+        proj, proj_op, picks = mne.chpi._setup_ext_proj(info, 1)
+        proj_before = deepcopy(proj)
+        np.testing.assert_array_equal(picks, np.arange(20))
+        original = info.copy()
+        metric_info, whitener, coils = core._prepare_dipole_fit(info, proj)
+        pos = np.array([.01, .02, .03])
+        fwd = core._magnetic_dipole_field_vec(pos[None], coils, 'info')
+        self.assertEqual(fwd.shape, (3, 20))
+        field = np.array([1., 2., 3.]) @ fwd
+        slope = proj_op @ field
+        exact = core._gof_at_fixed_pos(slope, pos, whitener, coils)
+        displaced = core._gof_at_fixed_pos(slope, pos + [.02, 0., 0.], whitener, coils)
+        displaced_far = core._gof_at_fixed_pos(slope, pos + [.04, 0., 0.], whitener, coils)
+        raw_cov = core.make_ad_hoc_cov(info, verbose=False)
+        raw_whitener, _ = core.compute_whitener(raw_cov, info, verbose=False)
+        unmatched = core._gof_at_fixed_pos(slope, pos, raw_whitener, coils)
+        self.assertAlmostEqual(exact, 1., places=12)
+        self.assertLess(displaced, exact - .01)
+        # Sensitivity is geometry-dependent; a larger known displacement must
+        # also cross the unchanged field-GOF acceptance threshold in this fixture.
+        self.assertLess(displaced_far, check._GOF_ACCEPT)
+        self.assertGreater(exact - unmatched, .1)
+        self.assertAlmostEqual(core._gof_at_fixed_pos(field, pos, raw_whitener, coils), 1., places=12)
+        self.assertEqual(np.linalg.matrix_rank(whitener), 17)
+        self.assertEqual(np.linalg.matrix_rank(raw_whitener), 20)
+        assert_projectors_equal(self, info['projs'], original['projs'])
+        assert_projectors_equal(self, metric_info['projs'], [proj])
+        assert_projectors_equal(self, [proj], [proj_before])
+
+        # Existing SSP must be replaced, not accumulated. Ordered picks may be
+        # neither all channels nor in the original Info order.
+        info_with_proj = info.copy()
+        with info_with_proj._unlock():
+            info_with_proj['projs'] = [mne.Projection(
+                data=dict(col_names=info.ch_names, row_names=None,
+                          data=np.eye(1, 20), nrow=1, ncol=20),
+                desc='original SSP', kind=1, active=False)]
+        projected_before = info_with_proj.copy()
+        order = np.array([9, 2, 18, 1, 12, 5, 7, 3, 16, 0])
+        ordered_proj = deepcopy(proj)
+        ordered_proj['data']['col_names'] = [info.ch_names[i] for i in order]
+        ordered_proj['data']['data'] = proj['data']['data'][:, order].copy()
+        # These synthetic channels are all good; normalize the intentionally
+        # truncated SSP vectors so MNE need not warn about their magnitudes.
+        ordered_proj['data']['data'] /= np.linalg.norm(
+            ordered_proj['data']['data'], axis=1)[:, None]
+        ordered_proj['data']['ncol'] = len(order)
+        ordered_before = deepcopy(ordered_proj)
+        prepared, _, prepared_coils = core._prepare_dipole_fit(info_with_proj, ordered_proj)
+        self.assertEqual(prepared.ch_names, ordered_proj['data']['col_names'])
+        np.testing.assert_allclose(np.array([c['loc'] for c in prepared['chs']]),
+                                   np.array([info['chs'][i]['loc'] for i in order]))
+        self.assertEqual(prepared_coils[0].shape[1], 3)
+        assert_projectors_equal(self, prepared['projs'], [ordered_proj])
+        assert_projectors_equal(self, info_with_proj['projs'], projected_before['projs'])
+        assert_projectors_equal(self, [ordered_proj], [ordered_before])
+
+    def test_fit_localization_and_refinement_reuse_real_projected_metric(self):
+        sensor_info = fieldline_info()
+        sensor_raw = mne.io.RawArray(np.zeros((20, 12001)), sensor_info, verbose=False)
+        hpi_raw = synthetic_raw().pick(['hpiout1', 'hpiout2', 'hpiout3', 'hpiout4'])
+        sensor_raw.add_channels([hpi_raw], force_update_info=True)
+        original_proj = mne.Projection(
+            data=dict(col_names=sensor_info.ch_names, row_names=None,
+                      data=np.eye(1, 20), nrow=1, ncol=20),
+            desc='original SSP', kind=1, active=False)
+        sensor_raw.add_proj(original_proj, verbose=False)
+        before = sensor_raw.info.copy()
+        proj, proj_op, _ = mne.chpi._setup_ext_proj(sensor_info, 1)
+        _, _, coils = core._prepare_dipole_fit(sensor_info, proj)
+        fields = np.array([np.array([1., 2., 3.]) @
+                           core._magnetic_dipole_field_vec(p[None], coils, 'info')
+                           for p in POINTS])
+        slopes = fields @ proj_op.T
+        counter = iter(range(4))
+
+        def amplitudes(raw, **kwargs):
+            i = next(counter)
+            return dict(times=np.array([1.]), slopes=slopes[i][None, None], proj=proj)
+
+        prepared_metrics = []
+        real_prepare = core._prepare_dipole_fit
+
+        def prepare(info, projector):
+            result = real_prepare(info, projector)
+            prepared_metrics.append(result)
+            return result
+
+        def localize(field, x0, too_close, whitener, geometry, guesses):
+            i = len(localizer.call_args_list) - 1
+            gof = core._gof_at_fixed_pos(field, POINTS[i], whitener, geometry)
+            return POINTS[i], gof, np.ones(3)
+
+        objectives = []
+
+        def optimize(objective, x0, **kwargs):
+            objectives.extend([objective(x0), objective(np.array([0., 0., 0., .001, 0., 0.]))])
+            return SimpleNamespace(status=0, success=True, x=np.zeros(6), fun=objectives[0])
+
+        with patch.object(core, 'compute_chpi_amplitudes', side_effect=amplitudes), \
+                patch.object(core, '_prepare_dipole_fit', side_effect=prepare), \
+                patch.object(core, '_make_opm_guesses', return_value=POINTS), \
+                patch.object(core, '_fit_magnetic_dipole', side_effect=localize) as localizer, \
+                patch.object(core, '_gof_at_fixed_pos', wraps=core._gof_at_fixed_pos) as fixed, \
+                patch.object(core, 'minimize', side_effect=optimize) as optimizer, \
+                patch('sys.stdout', new=stdio.StringIO()):
+            fit = core.fit_hpi(sensor_raw, POL, 33, bad_channel_policy='none')
+        optimizer.assert_called_once()
+        self.assertTrue(fit['opt_success'])
+        self.assertEqual(fit['optim'], 'rigid_gof')
+        # One real metric for localization, one for the fixed evaluations;
+        # success must not build a third metric from unprojected plotting Info.
+        self.assertEqual(len(prepared_metrics), 2)
+        np.testing.assert_allclose(prepared_metrics[0][1], prepared_metrics[1][1])
+        for a, b in zip(prepared_metrics[0][2], prepared_metrics[1][2]):
+            np.testing.assert_array_equal(a, b)
+        self.assertEqual(len(fixed.call_args_list), 20)  # 4 local + 4 initial + 8 objective + 4 final
+        for call in fixed.call_args_list[:4]:
+            self.assertIs(call.args[2], prepared_metrics[0][1])
+            self.assertIs(call.args[3], prepared_metrics[0][2])
+        for call in fixed.call_args_list[4:]:
+            self.assertIs(call.args[2], prepared_metrics[1][1])
+            self.assertIs(call.args[3], prepared_metrics[1][2])
+        self.assertAlmostEqual(objectives[0], -1., places=12)
+        self.assertGreater(objectives[1], objectives[0])
+        np.testing.assert_allclose(fit['hpi_gofs'], 1., atol=1e-12)
+        np.testing.assert_allclose(fit['pol_gofs'], 1., atol=1e-12)
+        np.testing.assert_allclose(fit['dist'], 0., atol=1e-12)
+        assert_projectors_equal(self, sensor_raw.info['projs'], before['projs'])
+        assert_projectors_equal(self, fit['raw_for_topomap'].info['projs'], before['projs'])
+        for prepared in prepared_metrics:
+            assert_projectors_equal(self, prepared[0]['projs'], [proj])
+
     def test_actual_sequential_amplitude_estimation(self):
         # Exercise MNE's real projector and slope ordering, not its mock.
         n = 24

@@ -326,8 +326,15 @@ def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=Non
 
 def _make_opm_guesses(meg_coils, localization_grid='medium'):
     """Build dipole-location guesses using a grid search."""
-    _check_option('localization_grid', localization_grid, ('coarse', 'medium', 'fine'))
+    _check_option('localization_grid', localization_grid, ('coarse', 'medium', 'fine', 'mne_stock'))
     coil_radii = np.linalg.norm(meg_coils[0], axis=1)
+    if localization_grid == 'mne_stock':
+        # Match MNE 1.12.1 compute_chpi_locs: clearance is applied to the
+        # minimum integration-point radius, not the maximum followed by clipping.
+        sphere = ConductorModel(
+            layers=[dict(rad=coil_radii.min())], r0=np.zeros(3), is_sphere=True)
+        return _make_guesses(sphere, 0.01, 0.0, 0.005,
+                             verbose=_verbose_safe_false())[0]['rr']
     R = coil_radii.max()
     
     if localization_grid == 'coarse':
@@ -345,7 +352,10 @@ def _make_opm_guesses(meg_coils, localization_grid='medium'):
 
     guesses = _make_guesses(sphere, grid, 0.0, mindist)[0]["rr"]
 
-    guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii.min()]
+    # Use each guess's nearest sensor integration point, not the global
+    # minimum sensor radius, to define its origin-based radial limit.
+    _, nearest_coil = cKDTree(meg_coils[0]).query(guesses)
+    guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii[nearest_coil]]
 
     return guesses
 
@@ -357,6 +367,25 @@ def _magnetic_dipole_delta(fwd, whitener, B, B2):
     one = v @ B
     Bm2 = one @ one
     return B2 - Bm2, u, s, one
+
+
+def _prepare_dipole_fit(info, proj):
+    """Use the amplitude projector and channel order for every dipole metric.
+
+    Work on a picked Info copy: the original Raw and plotting metadata must
+    retain their original projectors. Replace, rather than append to, SSP
+    projectors to match the metric used during amplitude localization.
+    """
+    meg_picks = pick_channels(info['ch_names'], proj['data']['col_names'], ordered=True)
+    info = pick_info(info, meg_picks)
+    with info._unlock():
+        info['projs'] = [proj]
+    safe_false = _verbose_safe_false()
+    cov = make_ad_hoc_cov(info, verbose=safe_false)
+    whitener, _ = compute_whitener(cov, info, verbose=safe_false)
+    meg_coils = _concatenate_coils(_create_meg_coils(info['chs'], 'accurate'))
+    return info, whitener, meg_coils
+
 
 def _gof_at_fixed_pos(slope_row, pos_dev, whitener, meg_coils):
     """Evaluate dipole GOF at a *fixed* device-space position.
@@ -565,6 +594,9 @@ def compute_chpi_opm_locs(
         How to handle HPI positions too close to the sensors,
         can be ``'raise'`` (default), ``'warning'``, or ``'info'``.
     %(adjust_dig_chpi)s
+    localization_grid : {'coarse', 'medium', 'fine', 'mne_stock'}, default 'medium'
+        Initial-guess grid, as described in :func:`fit_hpi`. ``mne_stock``
+        reproduces MNE 1.12.1's guess construction, not a different localizer.
     %(verbose)s
 
     Returns
@@ -603,18 +635,7 @@ def compute_chpi_opm_locs(
     _validate_type(info["dev_head_t"], Transform, "info['dev_head_t']")
     sin_fits = chpi_amplitudes  # use the old name below
     del chpi_amplitudes
-    proj = sin_fits["proj"]
-    meg_picks = pick_channels(info["ch_names"], proj["data"]["col_names"], ordered=True)
-    info = pick_info(info, meg_picks)  # makes a copy
-    with info._unlock():
-        info["projs"] = [proj]
-    del meg_picks, proj
-    meg_coils = _concatenate_coils(_create_meg_coils(info["chs"], "accurate"))
-
-    # Set up external model for interference suppression
-    safe_false = _verbose_safe_false()
-    cov = make_ad_hoc_cov(info, verbose=safe_false)
-    whitener, _ = compute_whitener(cov, info, verbose=safe_false)
+    info, whitener, meg_coils = _prepare_dipole_fit(info, sin_fits['proj'])
 
     # Make location guesses
     guesses = _make_opm_guesses(meg_coils, localization_grid)
@@ -780,15 +801,13 @@ def fit_hpi_amplitudes(hpifile, hpifreq: float, *, reffile=None,
     hpi_names, hpi_indices = get_hpi_output_channels(raw)
     hpi_freqs = np.full(len(hpi_indices), hpifreq)
 
-    # Some acquisition systems (e.g. FieldLine OPM) write line_freq=0 to mean
-    # "no notch filter configured" instead of leaving it unset. MNE's
-    # compute_chpi_amplitudes only guards against `None` and divides by
-    # info['line_freq'] otherwise, so a literal 0 raises ZeroDivisionError
-    # in _setup_hpi_amplitude_fitting. Normalise 0 -> None here; real line
-    # frequencies (50/60 Hz) are left untouched.
-    if raw.info.get('line_freq') == 0:
-        with raw.info._unlock():
-            raw.info['line_freq'] = 50.0 # Or None, can't be 0.
+    # Disable mains-frequency terms in the amplitude model. This also avoids
+    # MNE dividing by zero when acquisition metadata stores line_freq=0.
+    # This working configuration intentionally overrides 50/60 Hz metadata too.
+    raw.info['line_freq'] = None
+    # if raw.info.get('line_freq') == 0:
+    #     with raw.info._unlock():
+    #         raw.info['line_freq'] = 50.0 # Or None, can't be 0.
 
     # Seed dev_head_t with identity so compute_chpi_opm_locs searches in
     # device coordinates (correct — we have not computed the transform yet).
@@ -1103,7 +1122,9 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         (default): refine the device-to-head transform with a bounded
         L-BFGS-B search over a small rigid perturbation (±5° rotation,
         ±5 mm translation) that maximises the mean dipole-fit GOF at the
-        digitised polhemus positions (Stage 6).
+        digitised polhemus positions (Stage 6). Refinement is skipped when
+        fewer than four coils pass the GOF inclusion threshold; the initial
+        geometric rigid transform still uses at least three accepted coils.
     reffile : str | None
         Path to a reference recording (e.g. resting state) used for
         background-power-based noisy-channel detection during the HPI
@@ -1135,10 +1156,16 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         Default centroid_nearest. Raw coordinates are used for coordinate_nearest.
         Both feed the same rigid fit. center_matching is a compatibility alias;
         contradictory explicitly supplied values raise.
-    localization_grid : {'coarse', 'medium', 'fine'}
-        Dipole-search initial guesses. ``fine`` uses the current 2 mm OPM grid and 1 mm distance;
-        ``coarse`` a 10 mm grid, 5 mm distance; 
-        ``fine`` uses 5 mm grid and 2 mm distance.
+    localization_grid : {'coarse', 'medium', 'fine', 'mne_stock'}, default 'medium'
+        Dipole-search initial guesses. ``coarse`` uses 10 mm spacing and
+        5 mm clearance; ``medium`` uses 5 mm spacing and 2 mm clearance;
+        ``fine`` uses 2 mm spacing and 1 mm clearance. These three grids use
+        the maximum sensor integration-point radius for the sphere, then
+        clip each guess to the origin-based radius of its nearest sensor
+        integration point (by Euclidean distance). ``mne_stock``
+        instead reproduces MNE 1.12.1's guess construction: a sphere at the
+        minimum integration-point radius, 10 mm spacing, 5 mm clearance,
+        and zero exclusion. All choices use the same OPM localizer.
     unique_matches : bool, default True
         Reject repeated nearest targets. False permits repeats only when the
         resulting correspondences still determine a non-degenerate rigid fit.
@@ -1183,7 +1210,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         ``bads_fig`` : matplotlib.figure.Figure | None
             Noise diagnostic figure, when noise detection ran.
         ``optim`` : str
-            Requested refinement method.
+            Effective refinement method, or ``none`` when skipped. The
+            normalized request and skip reason are recorded in ``settings``.
         ``opt_status`` : int | None
             Optimizer status, or None when refinement was not run.
         ``opt_success`` : bool | None
@@ -1198,9 +1226,11 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             GOF of the Polhemus-digitised position against the measured MEG
             field for each *included* coil.  Computed by evaluating the
             magnetic dipole forward model at the polhemus position (in device
-            frame) without any optimisation.  A low ``pol_gof`` means the
-            digitised position does not explain the sensor data — indicating
-            a polhemus digitisation error rather than an HPI recording error.
+            frame), fitting the moment but not the position, using the same
+            amplitude projector and whitened metric as free localization.
+            Low GOF indicates a field/registered-position mismatch, not proof
+            of a digitisation error; assignment and field-model errors are
+            also possible. This is distinct from geometric residual distance.
         ``settings`` : dict
             JSON-serializable effective settings, including resolved noise
             policy and normalized refinement name (rigid -> rigid_gof).
@@ -1215,7 +1245,7 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
                                 activation_window_s, reffile)
     _gof_mask([], gof_limit, gof_comparison)
     _check_option('optim', optim, ('none', 'rigid', 'rigid_gof'))
-    _check_option('localization_grid', localization_grid, ('coarse', 'medium', 'fine'))
+    _check_option('localization_grid', localization_grid, ('coarse', 'medium', 'fine', 'mne_stock'))
     # Keep the compatibility alias accepted at the API boundary, but store and
     # report one canonical optimizer name throughout the fit result.
     if optim == 'rigid':
@@ -1261,14 +1291,16 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         'coil_inclusion': {'gof_limit': float(gof_limit), 'comparison': gof_comparison},
         'localization_grid': localization_grid,
         'matching': {'strategy': matching_strategy, 'unique_matches': bool(unique_matches)},
-        'transform_refinement': {'method': 'rigid_gof' if optim != 'none' else 'none',
+        'transform_refinement': {'requested_method': optim,
+                                 'method': optim,
+                                 'skip_reason': None,
                                  'rotation_bound_deg': 5.0 if optim != 'none' else None,
                                  'translation_bound_mm': 5.0 if optim != 'none' else None},
     })
     print(f"HPI settings: noise={settings['bad_channel_policy']['effective']}, "
           f'sensors=OPM magnetometers, window={activation_window_s:g}s, '
           f'GOF={gof_comparison} {gof_limit:g}, matching={matching_strategy}, '
-          f'unique={unique_matches}, optim={settings["transform_refinement"]["method"]}')
+          f'unique={unique_matches}, optim_requested={settings["transform_refinement"]["requested_method"]}')
     hpi_names       = amp['hpi_names']
     hpi_indices     = amp['hpi_indices']
     hpi_freqs       = amp['hpi_freqs']
@@ -1318,6 +1350,18 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             f"Only {n_inc} HPI coil(s) passed the GOF threshold "
             f"({gof_limit:.2f}). At least 3 are required for a well-determined "
             f"rigid transform. Redo the HPI recording."
+        )
+    if n_inc < 4 and optim != 'none':
+        optim = 'none'
+        settings['transform_refinement'].update({
+            'method': 'none', 'skip_reason': 'fewer_than_four_accepted_coils',
+            'rotation_bound_deg': None, 'translation_bound_mm': None,
+        })
+        warnings.warn(
+            f'Rigid-GOF refinement disabled: only {n_inc} HPI coils passed the '
+            'GOF threshold; at least 4 are required for refinement. '
+            'Retaining the initial geometric rigid transform.',
+            RuntimeWarning, stacklevel=2,
         )
     
     # Find matching coils in fits and polhemus by finding closest points 
@@ -1377,11 +1421,10 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
         f"topomap has {len(slope_ch_names)}: {slope_ch_names}"
     )
 
-    cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
-    whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
-    meg_coils   = _concatenate_coils(
-        _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
-    )
+    metric_info, whitener, meg_coils = _prepare_dipole_fit(
+        raw_for_topomap.info, coil_amplitudes['proj'])
+    if metric_info.ch_names != slope_ch_names:
+        raise ValueError('Dipole metric channel order does not match slope columns.')
     head2dev    = invert_transform(dev_to_head_trans)
     incl_idx    = np.where(include_hpis)[0]
     pol_gofs    = np.array([
@@ -1451,18 +1494,8 @@ def fit_hpi(hpifile, polfile, hpifreq: float,
             )
             dev_to_head_trans = opt_trans
 
-            raw_for_topomap = raw_orig.copy()
-            topo_picks = pick_types(raw_for_topomap.info, meg=True, eeg=False, exclude='bads')
-            raw_for_topomap.pick(picks=topo_picks)
-            assert slope_ch_names == raw_for_topomap.ch_names and slope.shape[1] == len(slope_ch_names), (
-                f"Mismatch between slope column channels and topomap channels "
-                f"in refinement rebuild."
-            )
-            cov      = make_ad_hoc_cov(raw_for_topomap.info, verbose=False)
-            whitener, _ = compute_whitener(cov, raw_for_topomap.info, verbose=False)
-            meg_coils   = _concatenate_coils(
-                _create_meg_coils(raw_for_topomap.info['chs'], 'accurate')
-            )
+            # Sensor geometry and the projected metric are device-space fixed;
+            # reuse them so post-refinement GOFs cannot revert to another metric.
             head2dev    = invert_transform(dev_to_head_trans)
             incl_idx    = np.where(include_hpis)[0]
 
@@ -1554,8 +1587,8 @@ def compute_fit_diagnostics(fit):
     ``mean_gof`` : float
         Mean per-coil dipole-fit GOF over *all* coils (0-1).
     ``optim`` : str
-        Optimization method used by :func:`fit_hpi` for this result
-        (``"none"`` or ``"rigid"``).
+        Effective refinement method for this result (``"none"`` or
+        ``"rigid_gof"``), including any three-coil skip.
     ``intercoil_rows`` : list[tuple]
         One entry per coil pair among *included* coils.  Each tuple is
         ``(name_i, name_j, dev_dist_mm, pol_dist_mm, diff_mm)``
