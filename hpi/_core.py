@@ -345,7 +345,12 @@ def _make_opm_guesses(meg_coils, localization_grid='medium'):
 
     guesses = _make_guesses(sphere, grid, 0.0, mindist)[0]["rr"]
 
-    guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii.min()]
+    # Use each guess's nearest sensor integration point, not the global
+    # minimum sensor radius, to define its origin-based radial limit.
+    _, nearest_coil = cKDTree(meg_coils[0]).query(guesses)
+    guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii[nearest_coil]]
+    
+    # TODO: If sensor is pulled out, rerun one step up. @chrisNatMEG will figure it out. 
 
     return guesses
 
@@ -406,6 +411,7 @@ def perturb_transform(T0, params):
         trans=T,
     )
 
+# TODO: Add manual bad list to override reffile
 def find_bads(reffile=None, hpifreq=None, match_channels=None):
     """Detect noisy MEG channels from a reference recording (e.g. resting state).
 
