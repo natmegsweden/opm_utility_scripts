@@ -124,15 +124,40 @@ The following behavior controls are shared by `coregister` and `check`:
 |------|-------------|---------|
 | `--bad-channel-policy {auto,reference,none}` | `auto`: use the reference or a clean final five-second HPI tail, warning and skipping detection if unavailable; `reference`: require `--reffile`; `none`: skip noise detection. Explicit bads and invalid geometry are still excluded | `auto` |
 | `--activation-window-s` | Actual amplitude-fit duration in seconds, centred on the detected activation midpoint; insufficient activation or out-of-bounds windows raise an error | `2.0` |
-| `--localization-grid {coarse, medium,fine}` | Dipole search OPM grid. | medium |
+| `--localization-grid {coarse,medium,fine,mne_stock}` | OPM initial-guess grid: `coarse` 10 mm spacing / 5 mm clearance, `medium` 5 / 2 mm, `fine` 2 / 1 mm. `mne_stock` reproduces MNE 1.12.1 guess construction, not a different localizer (see below) | `medium` |
 | `--gof-comparison {inclusive,strict}` | Include coils with GOF `>= --gof` or `> --gof`, respectively | `inclusive` |
 | `--matching-strategy {centroid_nearest,coordinate_nearest}` | Nearest-target matching after centring each point cloud, or on raw coordinates; mutually exclusive with `--no-center-matching` | `centroid_nearest` |
 | `--allow-repeated-matches` | Permit repeated nearest targets; degenerate rigid fits still raise an error | off (unique targets required) |
 | `--settings-json [DIR]` | `coregister` writes one sidecar per saved data output beside that output by default; this option is only needed to choose an optional existing sidecar directory. `check` writes its fit-stage record only when requested | enabled for `coregister`; disabled for `check` |
 
+The `coarse`, `medium`, and `fine` grids build a sphere at the maximum sensor
+integration-point radius, then clip each guess to the origin-based radius of
+its nearest sensor integration point (by Euclidean distance). `mne_stock`
+instead builds its sphere at the **minimum** integration-point
+radius, with **10 mm spacing**, **5 mm clearance**, and **zero exclusion**, exactly
+as in MNE 1.12.1 `compute_chpi_locs`. Thus `coarse` and `mne_stock` are not generally
+equivalent. Only the guesses change; the OPM localizer and refinement defaults
+remain unchanged.
+
 Centring removes bulk translation offsets, not arbitrary inter-frame rotations.
 Matching and refinement are independent controls. There is no branch-selector
 option: the historical approach names below are comparisons, not CLI presets.
+
+Rigid-GOF refinement requires **at least four coils passing the GOF inclusion
+threshold**. With three accepted coils, the geometric rigid registration is
+retained without additional refinement. The effective method and any skip
+reason are recorded in the fit settings and sidecar.
+
+Polhemus-position GOFs use the same amplitude projector, sensor order and
+whitening as free-position coil localization. Field GOF and geometric residuals
+measure different agreement: a small residual does not guarantee a high field
+GOF, and low field GOF alone does not prove faulty Polhemus digitisation.
+Field-only disagreement is reported as **CHECK REGISTRATION**, with checks of
+sensor geometry/calibration, correspondence, noise and movement rather than an
+automatic redigitisation recommendation. Registration acceptance requires at
+least three of the same coils to pass both residual and field-GOF thresholds;
+missing or non-finite assessments are not counted as passes.
+This three-coil acceptance rule is separate from the four-coil refinement rule.
 
 ### Settings sidecars
 
