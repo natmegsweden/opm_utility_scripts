@@ -7,8 +7,10 @@ def add_fit_options(parser):
                         'required reference, or none. Explicit bads are always excluded.')
     parser.add_argument('--activation-window-s', type=float, default=2.0,
                         help='Actual fit duration in seconds, centered on activation midpoint (default: 2).')
-    parser.add_argument('--localization-grid', choices=['coarse', 'medium', 'fine'], default='medium',
-                        help='Dipole OPM search grid.')
+    parser.add_argument('--localization-grid', choices=['coarse', 'medium', 'fine', 'mne_stock'],
+                        default='medium', help='Dipole OPM search grid (default: medium). '
+                        'mne_stock matches MNE 1.12.1 guesses: minimum integration-point '
+                        'radius, 10 mm spacing, 5 mm clearance, zero exclusion; same localizer.')
     parser.add_argument('--gof-comparison', choices=['inclusive', 'strict'], default='inclusive',
                         help='Coil inclusion uses >= (inclusive) or > (strict) the GOF limit.')
     matching = parser.add_mutually_exclusive_group()
@@ -20,7 +22,8 @@ def add_fit_options(parser):
     parser.add_argument('--allow-repeated-matches', dest='unique_matches', action='store_false',
                         default=True, help='Allow repeated nearest targets; degenerate fits still raise.')
     parser.add_argument('--optimization', choices=['none', 'rigid_gof', 'rigid'], default='rigid_gof',
-                        help='Bounded field-GOF rigid refinement (default), or none; rigid is a compatibility alias.')
+                        help='Bounded field-GOF rigid refinement (default), or none; rigid is a compatibility alias. '
+                        'Refinement requires at least four accepted coils; three retain geometric registration only.')
     parser.add_argument('--settings-json', nargs='?', const='', default=None, metavar='DIR',
                         help='Write one JSON sidecar per data output (default beside output, named hpi_<output-stem>.json); optionally choose a sidecar directory.')
 
