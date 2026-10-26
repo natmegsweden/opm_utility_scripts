@@ -324,16 +324,33 @@ def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=Non
         if temp_path is not None and os.path.exists(temp_path):
             os.unlink(temp_path)
 
-def _make_opm_guesses(meg_coils, localization_grid='medium'):
-    """Build dipole-location guesses using a grid search."""
+def _make_opm_guesses(meg_coils, localization_grid='medium', *, standoff=0.0):
+    """Build dipole-location guesses using a grid search.
+
+    Parameters
+    ----------
+    meg_coils : list of ndarray
+        Sensor integration-point locations in device coordinates.
+    localization_grid : {'coarse', 'medium', 'fine', 'mne_stock'}
+        Grid spacing profile.
+    standoff : float
+        Minimum radial clearance from the nearest sensor integration point,
+        in metres. Defaults to zero.
+    """
     _check_option('localization_grid', localization_grid, ('coarse', 'medium', 'fine', 'mne_stock'))
+    try:
+        standoff = float(standoff)
+    except (TypeError, ValueError):
+        standoff = np.nan
+    if not np.isfinite(standoff) or standoff < 0:
+        raise ValueError('standoff must be a finite, non-negative distance in metres')
     coil_radii = np.linalg.norm(meg_coils[0], axis=1)
     if localization_grid == 'mne_stock':
         # Match MNE 1.12.1 compute_chpi_locs: clearance is applied to the
         # minimum integration-point radius, not the maximum followed by clipping.
         sphere = ConductorModel(
             layers=[dict(rad=coil_radii.min())], r0=np.zeros(3), is_sphere=True)
-        return _make_guesses(sphere, 0.01, 0.0, 0.005,
+        return _make_guesses(sphere, 0.01, 0.0, 0.005 + standoff,
                              verbose=_verbose_safe_false())[0]['rr']
     R = coil_radii.max()
     
@@ -355,10 +372,8 @@ def _make_opm_guesses(meg_coils, localization_grid='medium'):
     # Use each guess's nearest sensor integration point, not the global
     # minimum sensor radius, to define its origin-based radial limit.
     _, nearest_coil = cKDTree(meg_coils[0]).query(guesses)
-    guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii[nearest_coil]]
+    guesses = guesses[np.linalg.norm(guesses, axis=1) <= coil_radii[nearest_coil] - standoff]
     
-    # TODO: If sensor is pulled out, rerun one step up. @chrisNatMEG will figure it out. 
-
     return guesses
 
 # New location in mne 1.13 (_chpi_numba.py) 
@@ -642,6 +657,8 @@ def compute_chpi_opm_locs(
 
     # Make location guesses
     guesses = _make_opm_guesses(meg_coils, localization_grid)
+    coil_radii = np.linalg.norm(meg_coils[0], axis=1)
+    coil_tree = cKDTree(meg_coils[0])
     R = np.linalg.norm(meg_coils[0], axis=1).max()
     fwd = _magnetic_dipole_field_vec(guesses, meg_coils, too_close)
     fwd = np.dot(fwd, whitener.T)
@@ -649,6 +666,7 @@ def compute_chpi_opm_locs(
     fwd = np.linalg.svd(fwd, full_matrices=False)[2]
     guesses = dict(rr=guesses, whitened_fwd_svd=fwd)
     del fwd, R
+    retry_guesses = None
 
     iter_ = list(zip(sin_fits["times"], sin_fits["slopes"]))
     chpi_locs = dict(times=[], rrs=[], gofs=[], moments=[])
@@ -694,6 +712,40 @@ def compute_chpi_opm_locs(
             _fit_magnetic_dipole(f, x0, too_close, whitener, meg_coils, guesses)
             for f, x0 in zip(sin_fit, last["coil_dev_rrs"])
         ]
+        for coil_idx, (field, initial_pos, fit) in enumerate(
+                zip(sin_fit, last['coil_dev_rrs'], coil_fits)):
+            fit_pos = fit[0]
+            nearest = coil_tree.query(fit_pos)[1]
+            if np.linalg.norm(fit_pos) <= coil_radii[nearest]:
+                continue
+            warn(
+                f'Fitted HPI coil {coil_idx} is outside the nearest sensor '
+                'radius; retrying with 5 mm standoff.'
+            )
+            if retry_guesses is None:
+                retry_rr = _make_opm_guesses(
+                    meg_coils, localization_grid, standoff=0.005)
+                if len(retry_rr):
+                    retry_fwd = _magnetic_dipole_field_vec(
+                        retry_rr, meg_coils, too_close)
+                    retry_fwd = np.dot(retry_fwd, whitener.T)
+                    retry_fwd.shape = (retry_rr.shape[0], 3, -1)
+                    retry_svd = np.linalg.svd(retry_fwd, full_matrices=False)[2]
+                    retry_guesses = dict(rr=retry_rr, whitened_fwd_svd=retry_svd)
+                else:
+                    retry_guesses = False
+            if retry_guesses is False:
+                warn('No guesses available with 5 mm standoff; keeping original fit.')
+                continue
+            retried_fit = _fit_magnetic_dipole(
+                field, initial_pos, too_close, whitener, meg_coils, retry_guesses)
+            coil_fits[coil_idx] = retried_fit
+            retry_nearest = coil_tree.query(retried_fit[0])[1]
+            if np.linalg.norm(retried_fit[0]) > coil_radii[retry_nearest]:
+                warn(
+                    f'Retried HPI coil {coil_idx} fit remains outside the nearest '
+                    'sensor radius.'
+                )
         rrs, gofs, moments = zip(*coil_fits)
         chpi_locs["times"].append(fit_time)
         chpi_locs["rrs"].append(rrs)

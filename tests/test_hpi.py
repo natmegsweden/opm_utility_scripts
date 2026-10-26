@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import warnings
 
 import matplotlib
@@ -242,6 +242,14 @@ class PolicyTests(unittest.TestCase):
             # but reject a same-radius guess whose nearest sensor is inward.
             # Equality at the local radius and the origin remain included.
             np.testing.assert_array_equal(result, guesses[[0, 1, 4, 5]])
+        with patch.object(core, '_make_guesses', return_value=[{'rr': guesses}]):
+            result = core._make_opm_guesses(coils, 'medium', standoff=.005)
+        # Each candidate must be at least 5 mm inside its nearest integration
+        # point's radial distance; equality remains included.
+        np.testing.assert_array_equal(result, guesses[[0, 1, 5]])
+        for invalid in (-.001, np.inf, np.nan):
+            with self.subTest(standoff=invalid), self.assertRaisesRegex(ValueError, 'standoff'):
+                core._make_opm_guesses(coils, standoff=invalid)
 
     def test_localization_grid_empty_results(self):
         coils = [np.array([[.08, 0, 0], [0, .10, 0]])]
@@ -899,6 +907,41 @@ class MNEIntegrationTests(unittest.TestCase):
         assert_projectors_equal(self, fit['raw_for_topomap'].info['projs'], before['projs'])
         for prepared in prepared_metrics:
             assert_projectors_equal(self, prepared[0]['projs'], [proj])
+
+    def test_outside_fit_retries_with_standoff_only_for_affected_coil(self):
+        info = mne.create_info(['mag1'], 1000, ['mag'])
+        info['dev_head_t'] = mne.transforms.Transform('meg', 'head')
+        proj = object()
+        coils = [np.array([[0., 0., .10], [.10, 0., 0.]])]
+        amplitudes = dict(proj=proj, times=np.array([1.]),
+                          slopes=np.array([[[1.], [2.]]]))
+        base_guesses = np.array([[0., 0., .05]])
+        retry_rr = np.array([[0., 0., .04]])
+        make_guesses = Mock(side_effect=lambda geometry, grid, **kwargs:
+                            retry_rr if kwargs.get('standoff') else base_guesses)
+        fits = [
+            (np.array([0., 0., .12]), .8, np.ones(3)),
+            (np.array([0., 0., .06]), .9, np.ones(3)),
+            (np.array([0., 0., .04]), .95, np.ones(3)),
+        ]
+        localizer = Mock(side_effect=fits)
+
+        with patch.object(core, '_validate_type'), \
+                patch.object(core, '_check_chpi_param'), \
+                patch.object(core, '_prepare_dipole_fit', return_value=(info, np.eye(1), coils)), \
+                patch.object(core, '_get_hpi_initial_fit', return_value=np.zeros((2, 3))), \
+                patch.object(core, '_make_opm_guesses', side_effect=make_guesses), \
+                patch.object(core, '_magnetic_dipole_field_vec',
+                             side_effect=lambda rr, *args: np.ones((len(rr), 3, 1))), \
+                patch.object(core, '_fit_magnetic_dipole', side_effect=localizer):
+            with self.assertWarnsRegex(RuntimeWarning, 'outside the nearest sensor radius'):
+                result = core.compute_chpi_opm_locs(info, amplitudes)
+
+        self.assertEqual(localizer.call_count, 3)
+        self.assertEqual(make_guesses.call_count, 2)
+        self.assertEqual(make_guesses.call_args.kwargs, {'standoff': .005})
+        np.testing.assert_array_equal(result['rrs'][0, 0], fits[2][0])
+        np.testing.assert_array_equal(result['rrs'][0, 1], fits[1][0])
 
     def test_actual_sequential_amplitude_estimation(self):
         # Exercise MNE's real projector and slope ordering, not its mock.
