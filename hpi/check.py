@@ -355,7 +355,7 @@ def _prompt_for_file(label, extensions=(), allow_blank=None):
         return path
 
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog='python -m opm_utility_scripts.hpi.check',
         description=(
@@ -408,7 +408,7 @@ def _parse_args():
                             'intended for regression testing / legacy-parity '
                             'comparisons, not routine use.'
                         ))
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -901,8 +901,8 @@ def _print_diagnostics_full(fit, detailed=False, diag=None):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args = _parse_args()
+def main(argv=None):
+    args = _parse_args(argv)
 
     detailed = args.detailed
 

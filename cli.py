@@ -17,6 +17,10 @@ _COMMANDS = {
         'module': 'opm_utility_scripts.hpi.check',
         'help': 'Run HPI quality checks.',
     },
+    'plot-hpi': {
+        'module': 'opm_utility_scripts.hpi.plot_hpi',
+        'help': 'Plot HPI checks using the newest files matching globs.',
+    },
 }
 
 

@@ -161,6 +161,20 @@ opmutil check --hpi HPIbefore_raw.fif --pol digitisation.json \
 | `--optimization` | Refinement applied after the initial HPI→Polhemus coregistration: `none` or `rigid` (bounded L-BFGS-B refit maximizing signal-fit GOF) | `rigid` |
 | `--no-center-matching` | Match HPI/Polhemus coil positions on raw (uncentred) coordinates instead of centroid-centring both point clouds first. Independent of `--optimization` — it changes which points are matched during the initial fit, not whether a post-fit refinement runs. Reproduces legacy matching behaviour; regression-testing only | centred |
 
+### `opmutil plot-hpi`
+
+Selects the newest file matching each supplied glob and passes the selected
+paths to `check`. File creation time is used where available, with modification
+time as a fallback. Omit `--pol-glob` for HPI-only plotting. Options supported
+by `check` (such as `--freq` and `--detailed`) can be appended.
+
+```bash
+opmutil plot-hpi \
+    --hpi-glob '/data/sub-01/**/HPI*raw.fif' \
+    --pol-glob '/data/sub-01/**/digitisation*.json' \
+    --freq 33 --detailed
+```
+
 ## Submodules (python -m)
 
 All submodules remain runnable with `python -m` directly:
@@ -234,4 +248,3 @@ from opm_utility_scripts.hpi import (
 | Core | `mne>=1.12`, `numpy>=1.26`, `scipy>=1.12`, `matplotlib>=3.8` | *(default)* |
 | Tools | `pandas>=2.2` | `[tools]` |
 | VTK visualiser | `pandas>=2.2`, `PyQt5>=5.15`, `vtk>=9.3` | `[vtk]` |
-
