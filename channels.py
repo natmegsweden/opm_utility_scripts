@@ -6,7 +6,7 @@ import scipy.signal as sig
 from mne._fiff.pick import pick_types
 
 
-def find_zero_location_channels(info, tolerance=0.02):
+def find_zero_location_channels(info, tolerance=None):
     """
     Identify MEG channels with zero or invalid locations.
 
@@ -16,22 +16,39 @@ def find_zero_location_channels(info, tolerance=0.02):
 
     Args:
         info (mne.Info): MNE info object containing channel information
-        tolerance (float): Distance tolerance in metres (default: 0.02 m = 2 cm)
+        tolerance (float | None): Distance tolerance in metres.
+            **Deprecated** — this parameter is accepted for backward
+            compatibility but has no effect. The current implementation
+            uses a component-wise threshold of 1 mm on each axis (i.e.
+            the position must be within a 1 mm axis-aligned box around
+            the origin), not a spherical tolerance. Passing a non-default
+            value emits a warning.
 
     Returns:
         numpy.ndarray: Array of channel names with zero/invalid locations
 
     Note:
-        Default tolerance of 2 cm removes channels within a sphere of the origin.
+        The threshold is component-wise ``isclose(0.0, atol=1e-3)`` (1 mm
+        per axis), not a Euclidean-distance threshold. Earlier documentation
+        incorrectly described the unused parameter as a 2 cm sphere.
     """
+    if tolerance is not None:
+        import warnings
+        warnings.warn(
+            "The 'tolerance' parameter of find_zero_location_channels is "
+            "deprecated and has no effect. The current implementation uses a "
+            "fixed per-component threshold of 1 mm on each axis.",
+            DeprecationWarning, stacklevel=2,
+        )
     picks = pick_types(info, meg='mag')
     lst = []
     for j in picks:
         ch = info['chs'][j]
-        loc = ch['loc'][0:3]
-        if not np.all(np.isfinite(loc)):          # NaN or Inf position
-            lst.append(ch['ch_name'])
-        elif np.isclose(sum(loc), 0.0, atol=1e-3).all():  # zero position
+        loc = ch['loc'][:3]
+        if (
+            not np.all(np.isfinite(loc))
+            or np.all(np.isclose(loc, 0.0, atol=1e-3))
+        ):
             lst.append(ch['ch_name'])
     return np.asarray(lst)
 
@@ -65,15 +82,10 @@ def get_hpi_output_channels(raw):
             if raw.get_data(picks=[name]).var() > 1e-25:
                 hpi_names += [name]
 
-    hpi_indices = np.zeros(len(hpi_names), dtype=np.int64)
-    i = 0
-    j = 0
-    for ch in raw.info['ch_names']:
-        for hpi in hpi_names:
-            if hpi in ch:
-                hpi_indices[j] = i
-                j = j + 1
-        i = i + 1
+    # Exact lookup preserves one index per discovered name even when names
+    # overlap (e.g. hpiout1 and hpiout11).
+    name_to_index = {name: index for index, name in enumerate(raw.ch_names)}
+    hpi_indices = np.asarray([name_to_index[name] for name in hpi_names], dtype=np.int64)
 
     return hpi_names, hpi_indices
 

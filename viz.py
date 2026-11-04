@@ -122,7 +122,7 @@ def plot_3d(plot_params: dict, filename: str):
     fig.savefig(filename, dpi=300, bbox_inches='tight')
 
 
-def plot_hpi_alignment(fit: dict, raw=None, show: bool = True):
+def plot_hpi_alignment(fit: dict, raw=None, show: bool = True, gof_threshold: float = 0.9):
     """
     Plot the alignment between fitted HPI coil positions and Polhemus positions.
 
@@ -151,6 +151,10 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True):
             head space and plotted as a grey reference cloud.
         show (bool):
             Call ``plt.show()`` after building the figure (default True).
+        gof_threshold (float):
+            GOF value used to colour-code fitted coil positions and label
+            the summary title.  Coils above this threshold are shown in
+            red; those at or below in orange (default 0.9).
 
     Returns:
         matplotlib.figure.Figure
@@ -228,7 +232,7 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True):
 
         # Fitted coil positions — circles, colour-coded by GOF
         for i, (pos, gof) in enumerate(zip(hpi_fitted_head, hpi_gofs)):
-            color = 'red' if gof > 0.9 else 'orange'
+            color = 'red' if gof > gof_threshold else 'orange'
             ax.scatter(*pos, c=color, s=80, marker='o', zorder=7,
                        depthshade=False)
             short = hpi_names[i][-3:] if len(hpi_names[i]) >= 3 else hpi_names[i]
@@ -266,9 +270,9 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True):
         Line2D([0], [0], marker='*', color='w', markerfacecolor='royalblue',
                markersize=10, label='Polhemus target'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
-               markersize=8, label='Fitted (GOF > 0.9)'),
+               markersize=8, label=f'Fitted (GOF > {gof_threshold})'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor='orange',
-               markersize=8, label='Fitted (GOF ≤ 0.9)'),
+               markersize=8, label=f'Fitted (GOF ≤ {gof_threshold})'),
         Line2D([0], [0], linestyle='--', color='green',
                label='Match < 5 mm'),
         Line2D([0], [0], linestyle='--', color='orange',
@@ -290,7 +294,7 @@ def plot_hpi_alignment(fit: dict, raw=None, show: bool = True):
     n_good = int(include_hpis.sum())
     n_total = len(hpi_gofs)
     fig.suptitle(
-        f'HPI alignment — {n_good}/{n_total} coils included (GOF > 0.9)  '
+        f'HPI alignment — {n_good}/{n_total} coils included (GOF > {gof_threshold})  '
         f'|  mean residual = {mean_dist:.1f} mm',
         fontsize=11,
     )
