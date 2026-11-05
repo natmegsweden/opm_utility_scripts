@@ -5,7 +5,8 @@ Example::
 
     python -m opm_utility_scripts.hpi.plot_hpi \
         --hpi-glob '/data/sub-01/**/HPI*raw.fif' \
-        --pol-glob '/data/sub-01/**/digitisation*.json' --freq 33
+        --pol-glob '/data/sub-01/**/digitisation*.json' \
+        --localization-grid medium
 
 Additional options are passed through to :mod:`opm_utility_scripts.hpi.check`.
 """
@@ -40,7 +41,17 @@ def main(argv=None):
                         help='Glob for HPI FIF files (supports ** recursive matching).')
     parser.add_argument('--pol-glob', default=None,
                         help='Optional glob for Polhemus files; omit for HPI-only mode.')
+    parser.add_argument('--localization-grid',
+                        choices=['coarse', 'medium', 'fine', 'mne_stock'],
+                    default='medium',
+                        help=('Dipole OPM search grid to use for localization. '
+                        'Default: medium.'))
     args, check_args = parser.parse_known_args(argv)
+
+    # This wrapper intentionally fixes frequency handling to check defaults.
+    # Reject legacy --freq passthrough explicitly for clarity.
+    if '--freq' in check_args or any(arg.startswith('--freq=') for arg in check_args):
+        parser.error('--freq is not supported by plot-hpi; use opmutil check/coregister if you need custom frequency.')
 
     try:
         hpi_file = _newest_match(args.hpi_glob)
@@ -48,6 +59,7 @@ def main(argv=None):
         if args.pol_glob:
             pol_file = _newest_match(args.pol_glob)
             forwarded.extend(['--pol', pol_file])
+        forwarded.extend(['--localization-grid', args.localization_grid])
 
         # Suppress the bad-channel diagnostic figure in this convenience
         # wrapper unless the user explicitly selects a policy.

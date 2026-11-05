@@ -964,7 +964,11 @@ def main(argv=None):
                           reffile=args.reffile, **fit_options(args))
             diag = compute_fit_diagnostics(fit)
             _print_diagnostics_full(fit, detailed=detailed, diag=diag, gof_limit=args.gof)
-            _build_figure_full(fit, detailed=detailed, diag=diag, gof_limit=args.gof)
+            fig = _build_figure_full(fit, detailed=detailed, diag=diag, gof_limit=args.gof)
+            fig.suptitle(
+                f'HPI: {os.path.basename(hpi_file)}\nPolhemus: {os.path.basename(pol_file)}',
+                fontsize=10,
+            )
         except ValueError as exc:
             print(
                 f'\n[ERROR] HPI fitting failed: {exc}\n'
@@ -993,7 +997,8 @@ def main(argv=None):
             if args.settings_json is not None:
                 write_settings_json(args.settings_json, amp, hpifile=hpi_file, reffile=args.reffile)
             _print_diagnostics_hpi_only(amp, gof_limit=args.gof)
-            _build_figure_hpi_only(amp, gof_limit=args.gof)
+            fig = _build_figure_hpi_only(amp, gof_limit=args.gof)
+            fig.suptitle(f'HPI: {os.path.basename(hpi_file)}', fontsize=10)
         except ValueError as exc:
             print(
                 f'\n[ERROR] HPI fitting failed: {exc}\n'
