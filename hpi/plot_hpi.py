@@ -38,7 +38,7 @@ def main(argv=None):
     )
     parser.add_argument('--hpi-glob', required=True,
                         help='Glob for HPI FIF files (supports ** recursive matching).')
-    parser.add_argument('--pol-glob',
+    parser.add_argument('--pol-glob', default=None,
                         help='Optional glob for Polhemus files; omit for HPI-only mode.')
     args, check_args = parser.parse_known_args(argv)
 
