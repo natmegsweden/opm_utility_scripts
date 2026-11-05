@@ -26,3 +26,6 @@ env/
 
 # Temporary diagnostics
 tmp
+
+# Build info
+_build_info.py
