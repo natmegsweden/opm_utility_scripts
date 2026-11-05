@@ -227,7 +227,7 @@ def _prepare_polhemus_for_localization(polfile, raw_orig, hpi_names,
 
 
 def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=None,
-                        datafile=None, output_file=None):
+                        datafile=None, output_file=None, git_metadata=None):
     """Atomically replace a sidecar after success; parent directory must exist.
 
     One sidecar describes one HPI fit, even when its transform is applied to
@@ -309,6 +309,14 @@ def write_settings_json(path, result, *, hpifile=None, polfile=None, reffile=Non
         },
         'fit_results': fit_results,
     }
+    if isinstance(git_metadata, dict):
+        clean_git = {}
+        for key in ('commit', 'tag', 'describe', 'branch', 'is_dirty', 'repo_root'):
+            if key in git_metadata and git_metadata[key] is not None:
+                clean_git[key] = git_metadata[key]
+        if clean_git:
+            payload['source_control'] = {'git': clean_git}
+
     path = os.path.abspath(os.fspath(path))
     temp_path = None
     try:
