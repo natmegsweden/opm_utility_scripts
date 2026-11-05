@@ -48,6 +48,15 @@ def main(argv=None):
         if args.pol_glob:
             pol_file = _newest_match(args.pol_glob)
             forwarded.extend(['--pol', pol_file])
+
+        # Suppress the bad-channel diagnostic figure in this convenience
+        # wrapper unless the user explicitly selects a policy.
+        has_bad_channel_policy = any(
+            arg == '--bad-channel-policy' or arg.startswith('--bad-channel-policy=')
+            for arg in check_args
+        )
+        if not has_bad_channel_policy:
+            forwarded.extend(['--bad-channel-policy', 'none'])
     except FileNotFoundError as exc:
         parser.error(str(exc))
 
