@@ -17,6 +17,7 @@ Both modes use the same calculation engine in ``_core.py``.
 """
 
 import argparse
+import datetime
 import os
 import sys
 import warnings
@@ -258,6 +259,37 @@ def _sep(title=''):
         print(f'\n{"─" * (pad // 2)} {title} {"─" * (pad - pad // 2)}\n')
     else:
         print(f'\n{SEP}\n')
+
+
+def _human_timestamp(meas_date=None, path=None):
+    """Return a human-readable timestamp for a figure title.
+
+    Prefers the recording's own ``info['meas_date']`` — the actual
+    acquisition time embedded in the FIF header (timezone-aware, UTC, per
+    MNE's convention) — since that is what "file time stamp" means for a
+    MEG/OPM recording. Falls back to the file's filesystem modification
+    time when no ``meas_date`` is available (e.g. a JSON polhemus sidecar,
+    which has no acquisition timestamp field of its own).
+    """
+    if meas_date is not None:
+        try:
+            return meas_date.strftime('%Y-%m-%d %H:%M:%S %Z')
+        except (AttributeError, ValueError):
+            pass
+    if path:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        return datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+    return None
+
+
+def _file_title(label, path, meas_date=None):
+    """Build one ``'<label>: <filename> (<timestamp>)'`` figure-title line."""
+    name = os.path.basename(path) if path else '?'
+    ts = _human_timestamp(meas_date, path)
+    return f'{label}: {name} ({ts})' if ts else f'{label}: {name}'
 
 
 def _render_text(ax, lines):
@@ -630,7 +662,8 @@ def _build_figure_pol_only(pol):
     ax.yaxis.pane.set_edgecolor('white')
     ax.zaxis.pane.set_edgecolor('white')
     path = pol.get('path', '')
-    ax.set_title(f'Polhemus digitisation — head frame\n{path}', fontsize=9)
+    ax.set_title(f'Polhemus digitisation — head frame\n{_file_title("Polhemus", path)}',
+                fontsize=9)
     return fig
 
 
@@ -915,7 +948,20 @@ def _print_diagnostics_full(fit, detailed=False, diag=None, gof_limit=_GOF_ACCEP
 # Main
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def main(argv=None, *, raise_on_fit_error=False):
+    """Run the HPI/Polhemus check CLI.
+
+    Parameters
+    ----------
+    raise_on_fit_error : bool, default False
+        By default, a ``ValueError`` from the HPI/full-coregistration fit is
+        reported on stderr and this function falls back to a raw-channel
+        diagnostic plot (standalone CLI behaviour). When ``True``, a
+        ``"No HPI coils had detectable peaks"`` failure is re-raised instead
+        of being swallowed, so a caller (e.g. ``plot_hpi.py`` retrying across
+        several candidate files) can detect that specific failure and act on
+        it. Any other fit error still falls back exactly as before.
+    """
     args = _parse_args(argv)
 
     detailed = args.detailed
@@ -956,11 +1002,15 @@ def main(argv=None):
             diag = compute_fit_diagnostics(fit)
             _print_diagnostics_full(fit, detailed=detailed, diag=diag, gof_limit=args.gof)
             fig = _build_figure_full(fit, detailed=detailed, diag=diag, gof_limit=args.gof)
+            hpi_meas_date = fit['raw_for_topomap'].info.get('meas_date')
             fig.suptitle(
-                f'HPI: {os.path.basename(hpi_file)}\nPolhemus: {os.path.basename(pol_file)}',
+                _file_title('HPI', hpi_file, hpi_meas_date) + '\n' +
+                _file_title('Polhemus', pol_file),
                 fontsize=10,
             )
         except ValueError as exc:
+            if raise_on_fit_error and 'No HPI coils had detectable peaks' in str(exc):
+                raise
             print(
                 f'\n[ERROR] HPI fitting failed: {exc}\n'
                 '  → Falling back to raw channel plot.\n',
@@ -989,8 +1039,13 @@ def main(argv=None):
                 write_settings_json(args.settings_json, amp, hpifile=hpi_file, reffile=args.reffile)
             _print_diagnostics_hpi_only(amp, gof_limit=args.gof)
             fig = _build_figure_hpi_only(amp, gof_limit=args.gof)
-            fig.suptitle(f'HPI: {os.path.basename(hpi_file)}', fontsize=10)
+            fig.suptitle(
+                _file_title('HPI', hpi_file, amp['raw_orig'].info.get('meas_date')),
+                fontsize=10,
+            )
         except ValueError as exc:
+            if raise_on_fit_error and 'No HPI coils had detectable peaks' in str(exc):
+                raise
             print(
                 f'\n[ERROR] HPI fitting failed: {exc}\n'
                 '  → Falling back to raw channel plot.\n',
