@@ -27,7 +27,7 @@ from mne.io.constants import FIFF
 from mne.transforms import apply_trans, Transform
 from ._core import fit_hpi_amplitudes, fit_hpi, compute_fit_diagnostics, compute_chpi_opm_locs
 from ._core import _gof_mask, write_settings_json
-from ._options import add_fit_options, fit_options
+from ._options import add_fit_options, add_input_options, fit_options
 from ..viz import plot_hpi_raw_channels
 
 # ---------------------------------------------------------------------------
@@ -388,22 +388,13 @@ def _parse_args(argv=None):
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('--hpi', '-f', metavar='PATH',
-                        help='Path to the raw HPI .fif file.')
-    parser.add_argument('--pol', '-p', metavar='PATH',
-                        help='Path to Polhemus file (.fif or .json). '
-                             'Without --hpi: polhemus-only mode.')
-    parser.add_argument('--freq', type=float, default=33.0, metavar='HZ',
-                        help='HPI drive frequency in Hz (default: 33).')
-    parser.add_argument('--reffile', '-r', metavar='PATH', default=None,
-                        help='Optional reference recording (e.g. resting '
-                             'state) used for background-power-based noisy '
-                             'channel detection (auto otherwise uses a clean HPI tail).')
-    parser.add_argument('--gof', type=float, default=0.95, metavar='THRESH',
-                        help=(
-                            'Minimum dipole GOF for a coil to be included in the '
-                            'device-to-head transform fit (default: 0.95).'
-                        ))
+    add_input_options(
+        parser, hpi_short='-f',
+        hpi_help='Path to the raw HPI .fif file.',
+        pol_help='Path to Polhemus file (.fif or .json). '
+                 'Without --hpi: polhemus-only mode.',
+        freq_default=33.0,
+    )
     parser.add_argument('--detailed', action='store_true',
                         help='Show full diagnostics in --hpi + --pol mode '
                              '(sensor count, inter-coil distance table, pol-GOFs).')

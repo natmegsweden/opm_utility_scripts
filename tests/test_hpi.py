@@ -91,15 +91,29 @@ class PolicyTests(unittest.TestCase):
         with patch('sys.argv', ['coregister']):
             args = coregister._parse_args()
             self.assertEqual(args.settings_json, '')
-            self.assertEqual(fit_options(args)['localization_grid'], 'medium')
-            self.assertEqual(args.optimization, 'rigid_gof')
+            self.assertEqual(args.sfreq, 1000)
+            self.assertEqual(fit_options(args)['localization_grid'], 'fine')
+            self.assertEqual(args.optimization, 'none')
+        with patch('sys.argv', ['coregister', '--sfreq', '500']):
+            self.assertEqual(coregister._parse_args().sfreq, 500)
+        with patch('sys.argv', ['coregister', '-H', 'hpi.fif', '-p', 'pol.json',
+                                '-f', '34', '--reffile', 'ref.fif', '--gof', '0.9']):
+            args = coregister._parse_args()
+            self.assertEqual((args.hpi, args.pol, args.freq, args.reffile, args.gof),
+                             ('hpi.fif', 'pol.json', 34, 'ref.fif', 0.9))
         with patch('sys.argv', ['coregister', '--localization-grid', 'mne_stock']):
             self.assertEqual(fit_options(coregister._parse_args())['localization_grid'], 'mne_stock')
         with patch('sys.argv', ['check']):
             args = check._parse_args()
             self.assertIsNone(args.settings_json)
-            self.assertEqual(args.localization_grid, 'medium')
-            self.assertEqual(args.optimization, 'rigid_gof')
+            self.assertEqual(args.freq, 33.0)
+            self.assertEqual(args.localization_grid, 'fine')
+            self.assertEqual(args.optimization, 'none')
+        with patch('sys.argv', ['check', '-f', 'hpi.fif', '-p', 'pol.json',
+                                '--freq', '34', '--reffile', 'ref.fif', '--gof', '0.9']):
+            args = check._parse_args()
+            self.assertEqual((args.hpi, args.pol, args.freq, args.reffile, args.gof),
+                             ('hpi.fif', 'pol.json', 34, 'ref.fif', 0.9))
 
     def test_invalid_options_fail_before_loading(self):
         for kwargs in ({'bad_channel_policy': 'other'},

@@ -1,6 +1,23 @@
 """Shared behavior options for the HPI command-line entry points."""
 
 
+def add_input_options(parser, *, hpi_short, hpi_help, pol_help,
+                      freq_default, freq_short=None):
+    """Add HPI, digitisation, and fit-input arguments shared by both commands."""
+    parser.add_argument('--hpi', hpi_short, metavar='PATH', help=hpi_help)
+    parser.add_argument('--pol', '-p', metavar='PATH', help=pol_help)
+    freq_default_text = 'ask' if freq_default is None else f'{freq_default:g}'
+    freq_flags = ('--freq', freq_short) if freq_short else ('--freq',)
+    parser.add_argument(*freq_flags, type=float, default=freq_default, metavar='HZ',
+                        help=f'HPI drive frequency in Hz (default: {freq_default_text}).')
+    parser.add_argument('--reffile', '-r', metavar='PATH', default=None,
+                        help='Optional reference recording for noisy-channel detection; '
+                        'otherwise a clean HPI tail is used when available.')
+    parser.add_argument('--gof', type=float, default=0.95, metavar='THRESH',
+                        help='Minimum dipole GOF for including a coil in the '
+                        'device-to-head transform fit (default: 0.95).')
+
+
 def add_fit_options(parser):
     parser.add_argument('--bad-channel-policy', choices=['auto', 'reference', 'none'],
                         default='auto', help='Noise detection: reference or clean tail (auto), '
@@ -8,7 +25,7 @@ def add_fit_options(parser):
     parser.add_argument('--activation-window-s', type=float, default=2.0,
                         help='Actual fit duration in seconds, centered on activation midpoint (default: 2).')
     parser.add_argument('--localization-grid', choices=['coarse', 'medium', 'fine', 'mne_stock'],
-                        default='medium', help='Dipole OPM search grid (default: medium). '
+                        default='fine', help='Dipole OPM search grid (default: fine). '
                         'mne_stock matches MNE 1.12.1 guesses: minimum integration-point '
                         'radius, 10 mm spacing, 5 mm clearance, zero exclusion; same localizer.')
     parser.add_argument('--gof-comparison', choices=['inclusive', 'strict'], default='inclusive',
@@ -21,9 +38,9 @@ def add_fit_options(parser):
                           help='Compatibility alias for --matching-strategy coordinate_nearest.')
     parser.add_argument('--allow-repeated-matches', dest='unique_matches', action='store_false',
                         default=True, help='Allow repeated nearest targets; degenerate fits still raise.')
-    parser.add_argument('--optimization', choices=['none', 'rigid_gof', 'rigid'], default='rigid_gof',
-                        help='Bounded field-GOF rigid refinement (default), or none; rigid is a compatibility alias. '
-                        'Refinement requires at least four accepted coils; three retain geometric registration only.')
+    parser.add_argument('--optimization', choices=['none', 'rigid_gof', 'rigid'], default='none',
+                        help='Use no refinement or bounded field-GOF rigid refinement; '
+                        'rigid is an alias for rigid_gof, which requires at least four accepted coils.')
     parser.add_argument('--settings-json', nargs='?', const='', default=None, metavar='DIR',
                         help='Write one JSON sidecar per data output (default beside output, named hpi_<output-stem>.json); optionally choose a sidecar directory.')
 
