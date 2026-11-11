@@ -24,6 +24,9 @@ vtk = [
     "PyQt5>=5.15",
     "vtk>=9.3",
 ]
+docs = [
+    "zensical",
+]
 
 [project.scripts]
 opmutil = "opm_utility_scripts.cli:main"

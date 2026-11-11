@@ -1,0 +1,19 @@
+[project]
+site_name = "OPM Utility Scripts"
+site_description = "Utilities for FieldLine OPM-MEG data processing."
+docs_dir = "docs"
+site_dir = "site"
+nav = [
+  { "Utilities" = "index.md"},
+  {"HPI" = [
+  "hpi/hpi.md",
+  "hpi/hpi-recommendations.md"
+  ]}
+]
+
+[project.theme]
+features = [
+  "navigation.sections",
+  "navigation.path",
+  "toc.follow",
+]
