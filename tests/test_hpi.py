@@ -91,6 +91,7 @@ class PolicyTests(unittest.TestCase):
         with patch('sys.argv', ['coregister']):
             args = coregister._parse_args()
             self.assertEqual(args.settings_json, '')
+            self.assertEqual(args.freq, 33.0)
             self.assertEqual(args.sfreq, 1000)
             self.assertEqual(fit_options(args)['localization_grid'], 'fine')
             self.assertEqual(args.optimization, 'none')

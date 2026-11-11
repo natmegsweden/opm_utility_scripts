@@ -157,7 +157,7 @@ def _parse_args():
         p, hpi_short='-H',
         hpi_help='Raw HPI recording (e.g. HPIBefore_raw.fif).',
         pol_help='Polhemus digitisation file (.json or .fif).',
-        freq_default=None,
+        freq_default=33.0,
         freq_short='-f',
     )
     add_fit_options(p)
@@ -190,8 +190,7 @@ def main():
     # Resolve inputs — CLI args take priority; fall back to interactive
     # command-line prompts for anything not supplied.
     # ----------------------------------------------------------------
-    need_prompts = not all([args.data, args.hpi, args.pol,
-                            args.freq is not None])
+    need_prompts = not all([args.data, args.hpi, args.pol])
 
     datafiles = args.data or _prompt_paths("Select data file(s)", extensions=('.fif',))
     hpifile   = args.hpi  or _prompt_path("Select HPI file", extensions=('.fif',))
@@ -206,13 +205,12 @@ def main():
             extensions=('.fif',), allow_blank=True,
         )
 
-    hpifreq   = args.freq  if args.freq  is not None \
-                else float(_prompt_value("HPI frequency (Hz)", "33"))
+    hpifreq   = args.freq
     new_sfreq = args.sfreq
 
     # Save / overwrite / plot: if any of the three flags were given on the CLI,
     # use all CLI values directly.  Only ask interactively when prompts were
-    # needed above (i.e. at least one file/freq arg was missing) and no flags
+    # needed above (i.e. at least one required file input was missing) and no flags
     # were provided.
     any_flags = args.save or args.overwrite or args.plot
     if any_flags:
