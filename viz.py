@@ -9,6 +9,72 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.spatial import Delaunay
 
 
+def plot_bad_channel_detection(background_power, channel_names, bad_indices,
+                               threshold, *, hpifreq=None, show=False):
+    """Plot reference background power and already-detected bad channels.
+
+    Parameters
+    ----------
+    background_power : array-like, shape (n_channels,)
+        Mean reference PSD for each channel, in the order of ``channel_names``.
+    channel_names : sequence of str
+        Sensor names corresponding to the background-power values.
+    bad_indices : array-like of int
+        Indices of detected outliers. Detection is the caller's responsibility.
+    threshold : float
+        Background-power threshold used by the detector.
+    hpifreq : float | None
+        HPI drive frequency in Hz, used only to label the diagnostic plot.
+    show : bool
+        Display the figure after constructing it (default False).
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Diagnostic figure. Saving is the caller's responsibility.
+    """
+    background_power = np.asarray(background_power)
+    bad_indices = np.asarray(bad_indices, dtype=int)
+    x = np.arange(len(background_power))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(x, background_power, 'ko', label='Background power')
+    ax.axhline(
+        threshold,
+        color='r',
+        linestyle='--',
+        linewidth=2,
+        label=f'Threshold ({threshold:.2e})',
+    )
+    ax.plot(
+        bad_indices,
+        background_power[bad_indices],
+        'r+',
+        markersize=10,
+        label='Bad channels',
+    )
+
+    for idx in bad_indices:
+        ax.text(
+            idx,
+            background_power[idx],
+            channel_names[idx],
+            rotation=45,
+            fontsize=8,
+            color='red',
+        )
+
+    ax.set_xlabel('Channel')
+    ax.set_ylabel('Background PSD')
+    freq_label = f'{hpifreq} Hz' if hpifreq is not None else 'unknown Hz'
+    ax.set_title(f'Bad Channel Detection Around HPI Frequency ({freq_label})')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig
+
+
 def plot_psd(raw):
     """
     Generate power spectral density plots for MEG data quality assessment.

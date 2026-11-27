@@ -549,44 +549,10 @@ def find_bads(reffile=None, hpifreq=None, match_channels=None):
     bad_idx = np.setdiff1d(np.arange(len(background_power)), good_idx)
     bad_chs = [slope_ch_names[idx] for idx in bad_idx]
 
-    x = np.arange(len(background_power))
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(x, background_power, 'ko', label='Background power')
-    ax.axhline( # Threshold
-        threshold,
-        color='r',
-        linestyle='--',
-        linewidth=2,
-        label=f'Threshold ({threshold:.2e})'
-    )
-    ax.plot( # Outliers
-        bad_idx,
-        background_power[bad_idx],
-        'r+',
-        markersize=10,
-        label='Bad channels'
-    )
+    from ..viz import plot_bad_channel_detection
 
-    for idx in bad_idx:
-        ax.text(
-            idx,
-            background_power[idx],
-            bad_chs,
-            rotation=45,
-            fontsize=8,
-            color='red'
-        )
-
-    ax.set_xlabel('Channel')
-    ax.set_ylabel('Background PSD')
-    freq_label = f'{hpifreq} Hz' if hpifreq is not None else 'unknown Hz'
-    ax.set_title(f'Bad Channel Detection Around HPI Frequency ({freq_label})')
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    fig.tight_layout()
-    #plt.show()
-    
+    fig = plot_bad_channel_detection(
+        background_power, slope_ch_names, bad_idx, threshold, hpifreq=hpifreq)
     return bad_chs, fig, slope_ch_names
 
 def compute_chpi_opm_locs(

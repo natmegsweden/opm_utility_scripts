@@ -83,6 +83,91 @@ POL = dict(source='fif', hpi_orig=POINTS, nasion=np.array([0, .1, 0]),
            extra_pts=np.empty((0, 3)), eeg_pts=np.empty((0, 3)))
 
 
+class BadChannelPlotTests(unittest.TestCase):
+    def tearDown(self):
+        plt.close('all')
+
+    def test_plot_labels_each_outlier_and_preserves_data(self):
+        power = np.array([1., 5., 2., 8.])
+        names = ['mag1', 'mag2', 'mag3', 'mag4']
+        bad_indices = np.array([1, 3])
+        original_power = power.copy()
+        original_indices = bad_indices.copy()
+        with patch.object(viz.plt, 'show') as show:
+            fig = viz.plot_bad_channel_detection(power, names, bad_indices, 4., hpifreq=33)
+        show.assert_not_called()
+        ax = fig.axes[0]
+        background, threshold, outliers = ax.lines
+        np.testing.assert_array_equal(background.get_xdata(), np.arange(4))
+        np.testing.assert_array_equal(background.get_ydata(), power)
+        np.testing.assert_array_equal(threshold.get_ydata(), [4., 4.])
+        self.assertEqual(threshold.get_linestyle(), '--')
+        np.testing.assert_array_equal(outliers.get_xdata(), bad_indices)
+        np.testing.assert_array_equal(outliers.get_ydata(), [5., 8.])
+        self.assertEqual(outliers.get_marker(), '+')
+        self.assertEqual(outliers.get_color(), 'r')
+        self.assertEqual([text.get_text() for text in ax.texts], ['mag2', 'mag4'])
+        self.assertEqual([text.get_position() for text in ax.texts], [(1, 5.), (3, 8.)])
+        self.assertEqual(ax.get_xlabel(), 'Channel')
+        self.assertEqual(ax.get_ylabel(), 'Background PSD')
+        self.assertIn('33 Hz', ax.get_title())
+        self.assertEqual([text.get_text() for text in ax.get_legend().get_texts()],
+                         ['Background power', 'Threshold (4.00e+00)', 'Bad channels'])
+        np.testing.assert_array_equal(power, original_power)
+        np.testing.assert_array_equal(bad_indices, original_indices)
+        self.assertEqual(names, ['mag1', 'mag2', 'mag3', 'mag4'])
+        fig.canvas.draw()
+
+    def test_plot_without_outliers_and_explicit_show(self):
+        for display in (False, True):
+            with self.subTest(show=display), patch.object(viz.plt, 'show') as show:
+                fig = viz.plot_bad_channel_detection([1., 2.], ['mag1', 'mag2'], [],
+                                                     3., show=display)
+            self.assertEqual(show.call_count, int(display))
+            ax = fig.axes[0]
+            self.assertEqual(len(ax.texts), 0)
+            self.assertEqual(len(ax.lines[2].get_xdata()), 0)
+            self.assertEqual(len(ax.lines[2].get_ydata()), 0)
+            self.assertIn('unknown Hz', ax.get_title())
+            fig.canvas.draw()
+
+    def test_find_bads_delegates_detection_results_to_viz(self):
+        names = [f'mag{i}' for i in range(24)]
+        info = mne.create_info(names, 1000, 'mag')
+        for ch in info['chs']:
+            ch['loc'] = np.r_[.01, .02, .1, np.eye(3).ravel()]
+        raw = mne.io.RawArray(np.zeros((24, 10)), info, verbose=False)
+        power = np.ones(24)
+        power[[4, 20]] = [100., 200.]
+        spectrum = Mock()
+        spectrum.get_data.return_value = np.repeat(power[:, None], 2, axis=1)
+        with patch.object(mne.io.BaseRaw, 'compute_psd', return_value=spectrum), \
+                patch.object(viz, 'plot_bad_channel_detection',
+                             wraps=viz.plot_bad_channel_detection) as plot, \
+                patch.object(viz.plt, 'show') as show:
+            bads, fig, returned_names = core.find_bads(raw, 33)
+        plot.assert_called_once()
+        plotted_power, plotted_names, plotted_bad_indices, threshold = plot.call_args.args
+        np.testing.assert_array_equal(plotted_power, power)
+        self.assertEqual(plotted_names, names)
+        np.testing.assert_array_equal(plotted_bad_indices, [4, 20])
+        self.assertEqual(threshold, 1.)
+        self.assertEqual(plot.call_args.kwargs, {'hpifreq': 33})
+        self.assertEqual(bads, ['mag4', 'mag20'])
+        self.assertEqual(returned_names, names)
+        self.assertIsNotNone(fig)
+        self.assertEqual([text.get_text() for text in fig.axes[0].texts], bads)
+        show.assert_not_called()
+
+    def test_manual_and_skipped_detection_do_not_plot(self):
+        with patch.object(viz, 'plot_bad_channel_detection') as plot:
+            self.assertEqual(core.find_bads(), ([], None, []))
+            self.assertEqual(core.find_bads('missing.fif', manual_bads=[]), ([], None, []))
+            self.assertEqual(core.find_bads('missing.fif', manual_bads=['mag2', 'mag2']),
+                             (['mag2'], None, []))
+        plot.assert_not_called()
+
+
 class PolicyTests(unittest.TestCase):
     def tearDown(self):
         plt.close('all')
