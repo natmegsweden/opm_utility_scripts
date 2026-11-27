@@ -22,7 +22,7 @@ import numpy as np
 from opm_utility_scripts.hpi import _core as core
 from opm_utility_scripts.hpi import check, coregister
 from opm_utility_scripts.hpi._options import add_fit_options, fit_options
-from opm_utility_scripts import io
+from opm_utility_scripts import io, viz
 from opm_utility_scripts.tests import test_hpi_versions
 
 
@@ -418,6 +418,45 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(raw.ch_names, original_names)
         with self.assertRaisesRegex(ValueError, 'no usable sensors'):
             core.find_bads(raw, 33, match_channels=['missing'])
+
+    def test_manual_bads_override_reference_and_matching_without_loading(self):
+        manual = ['mag2', 'mag1', 'mag2']
+        with patch.object(mne.io, 'read_raw_fif') as reader, \
+                patch.object(mne.io.BaseRaw, 'compute_psd') as psd:
+            bads, fig, names = core.find_bads(
+                'missing-reference.fif', 33, match_channels=['other'], manual_bads=manual)
+        reader.assert_not_called()
+        psd.assert_not_called()
+        self.assertEqual(bads, ['mag2', 'mag1'])
+        self.assertIsNone(fig)
+        self.assertEqual(names, [])
+        bads.append('mag3')
+        self.assertEqual(manual, ['mag2', 'mag1', 'mag2'])
+
+    def test_manual_bads_empty_no_reference_and_raw_reference(self):
+        raw = synthetic_raw()
+        for reference in (None, 'missing-reference.fif', raw):
+            with self.subTest(reference=type(reference).__name__), \
+                    patch.object(mne.io, 'read_raw_fif') as reader, \
+                    patch.object(mne.io.BaseRaw, 'copy') as copy, \
+                    patch.object(mne.io.BaseRaw, 'compute_psd') as psd:
+                self.assertEqual(core.find_bads(reference, manual_bads=[]), ([], None, []))
+                self.assertEqual(core.find_bads(reference, manual_bads=('mag1',)),
+                                 (['mag1'], None, []))
+            reader.assert_not_called()
+            copy.assert_not_called()
+            psd.assert_not_called()
+        self.assertEqual(core.find_bads(), ([], None, []))
+
+    def test_manual_bads_invalid_names_fail_before_loading(self):
+        with patch.object(mne.io, 'read_raw_fif') as reader:
+            for invalid in ('mag1', 1, {'mag1': True}, [1], [['mag1']]):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(TypeError, 'manual_bads'):
+                    core.find_bads('missing-reference.fif', manual_bads=invalid)
+            for invalid in ([''], ['   ']):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'must not be empty'):
+                    core.find_bads('missing-reference.fif', manual_bads=invalid)
+        reader.assert_not_called()
 
     def test_matching_strategies_and_safety(self):
         np.testing.assert_array_equal(core._match_points(POINTS + .1, POINTS,

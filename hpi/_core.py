@@ -24,7 +24,6 @@ import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import matplotlib.pyplot as plt
 import mne
 import numpy as np
 from scipy.signal import find_peaks
@@ -452,17 +451,16 @@ def perturb_transform(T0, params):
         trans=T,
     )
 
-# TODO: Add manual bad list to override reffile
-def find_bads(reffile=None, hpifreq=None, match_channels=None):
+def find_bads(reffile=None, hpifreq=None, match_channels=None, *, manual_bads=None):
     """Detect noisy MEG channels from a reference recording (e.g. resting state).
 
     Parameters
     ----------
-    reffile : str | None
+    reffile : str | mne.io.Raw | None
         Path to a reference FIF recording used for background-power-based
         outlier detection. When ``None`` (default), no reference file is
         available and bad-channel detection is skipped entirely — an empty
-        list is returned.
+        list is returned unless ``manual_bads`` is supplied.
     hpifreq : float | None
         HPI drive frequency in Hz, used only to label the diagnostic plot.
     match_channels : list[str] | None
@@ -482,13 +480,31 @@ def find_bads(reffile=None, hpifreq=None, match_channels=None):
         statistics behind it, reflect exactly the channel set that will
         actually be used downstream. When ``None`` (default), no
         restriction is applied — matches the previous behaviour.
+    manual_bads : list[str] | tuple[str, ...] | None
+        Authoritative bad-channel names, overriding reference-based detection.
+        When supplied, neither ``reffile`` nor ``match_channels`` is used and
+        no reference is loaded or analysed. An empty list explicitly disables
+        automatic detection; ``None`` preserves the reference-based behavior.
+        Duplicate names are removed while preserving their order.
 
     Returns
     -------
-    list[str]
-        Names of channels flagged as noisy. Empty when ``reffile`` is
-        ``None``.
+    bads : list[str]
+        Manually specified or automatically detected bad-channel names.
+    fig : matplotlib.figure.Figure | None
+        Automatic detection plot, or ``None`` for manual/skipped detection.
+    channel_names : list[str]
+        Sensor names used for automatic detection. Empty for manual/skipped
+        detection because no reference sensor population is analysed.
     """
+    if manual_bads is not None:
+        if not isinstance(manual_bads, (list, tuple)) or any(
+                not isinstance(name, str) for name in manual_bads):
+            raise TypeError('manual_bads must be a list or tuple of channel-name strings.')
+        if any(not name.strip() for name in manual_bads):
+            raise ValueError('manual_bads channel names must not be empty.')
+        return list(dict.fromkeys(manual_bads)), None, []
+
     if reffile is None:
         return [], None, []
 
