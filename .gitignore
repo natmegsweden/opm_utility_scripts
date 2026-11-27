@@ -6,6 +6,7 @@ __pycache__/
 # Distribution / packaging
 dist/
 build
+site/
 *.egg-info
 *.egg
 MANIFEST
@@ -26,3 +27,6 @@ env/
 
 # Temporary diagnostics
 tmp
+
+# Build info
+_build_info.py

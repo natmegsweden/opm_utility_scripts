@@ -469,7 +469,8 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
                           n_jobs: int = -1, *, bad_channel_policy='auto',
                            activation_window_s=2.0,
                           gof_comparison='inclusive', matching_strategy=None,
-                          unique_matches=True, optim='rigid', settings_json=None) -> tuple[str, dict]:
+                          unique_matches=True, optim='none', localization_grid='fine',
+                          settings_json=None) -> tuple[str, dict]:
     """Fit all HPI candidates and return the highest-scoring path and fit.
 
     Parameters
@@ -520,7 +521,7 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         ``n_jobs`` if that becomes a constraint for very large HPI
         recordings.
     bad_channel_policy, activation_window_s, gof_comparison,
-    matching_strategy, unique_matches, optim
+    matching_strategy, unique_matches, optim, localization_grid
         Forwarded to every sequential or process-pool fit; see fit_hpi.
     settings_json : path-like | None
         Sidecar base path. Each distinct candidate gets
@@ -537,7 +538,8 @@ def select_best_hpi_file(hpi_files: list[str], polhemus: dict, hpifreq: float,
         raise ValueError('Duplicate HPI candidate paths would collide in settings sidecars.')
     options = dict(bad_channel_policy=bad_channel_policy,
                    activation_window_s=activation_window_s, gof_comparison=gof_comparison,
-                   matching_strategy=matching_strategy, unique_matches=unique_matches, optim=optim)
+                   matching_strategy=matching_strategy, unique_matches=unique_matches,
+                   optim=optim, localization_grid=localization_grid)
     candidate_options = [dict(options, settings_json=_candidate_settings_path(settings_json, p))
                          for p in hpi_files]
 

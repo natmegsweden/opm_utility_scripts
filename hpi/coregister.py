@@ -2,9 +2,9 @@
 Unified HPI coregistration entry point.
 
 Handles both single-file and multi-file cases through one script.
-Any argument not supplied on the command line falls back to an interactive
-CLI prompt, so the script works fully non-interactively, fully
-interactively, or anywhere in between.
+Missing required inputs and output choices fall back to interactive CLI
+prompts. Options with defaults, including the target sampling frequency, use
+those defaults when omitted.
 
 Usage (fully non-interactive)::
 
@@ -16,7 +16,7 @@ Usage (fully non-interactive)::
         --sfreq 1000 \\
         --save --overwrite --plot
 
-Usage (fully interactive — CLI prompts for everything)::
+Usage (interactive — CLI prompts for required inputs and output choices)::
 
     python -m opm_utility_scripts.hpi.coregister
 """
@@ -29,7 +29,7 @@ import mne
 import numpy as np
 from ..viz import plot_hpi_alignment
 from ._core import fit_hpi, apply_transform, save_raw, write_settings_json
-from ._options import add_fit_options, fit_options
+from ._options import add_fit_options, add_input_options, fit_options
 
 
 # ---------------------------------------------------------------------------
@@ -145,44 +145,28 @@ def _parse_args():
     p = argparse.ArgumentParser(
         prog='python -m opm_utility_scripts.hpi.coregister',
         description=(
-            'HPI coregistration.  Any omitted argument prompts interactively '
-            'on the command line.'
+            'HPI coregistration. Missing required inputs prompt interactively; '
+            'options with defaults use those defaults.'
         ),
     )
     p.add_argument(
         '--data', '-d', nargs='+', metavar='FILE',
         help='One or more data files to apply the transform to.',
     )
-    p.add_argument(
-        '--hpi', '-H', metavar='FILE',
-        help='Raw HPI recording (e.g. HPIBefore_raw.fif).',
-    )
-    p.add_argument(
-        '--pol', '-p', metavar='FILE',
-        help='Polhemus digitisation file (.json or .fif).',
-    )
-    p.add_argument(
-        '--reffile', '-r', metavar='FILE', default=None,
-        help='Optional reference recording (e.g. resting state) used for '
-             'background-power-based noisy channel detection '
-             '(default: use a clean HPI tail when no reference is supplied).',
-    )
-    p.add_argument(
-        '--freq', '-f', type=float, default=None, metavar='HZ',
-        help='HPI drive frequency in Hz (default: ask).',
-    )
-    p.add_argument(
-        '--gof', type=float, default=0.95, metavar='THRESH',
-        help='Minimum dipole GOF for a coil to be included in the '
-             'device-to-head transform fit (default: 0.95).',
+    add_input_options(
+        p, hpi_short='-H',
+        hpi_help='Raw HPI recording (e.g. HPIBefore_raw.fif).',
+        pol_help='Polhemus digitisation file (.json or .fif).',
+        freq_default=33.0,
+        freq_short='-f',
     )
     add_fit_options(p)
     # Coregister always records fit provenance beside each saved output.
     # An explicit --settings-json DIR only changes the sidecar directory.
     p.set_defaults(settings_json='')
     p.add_argument(
-        '--sfreq', '-s', type=float, default=None, metavar='HZ',
-        help='Target sampling frequency in Hz (default: ask).',
+        '--sfreq', '-s', type=float, default=1000, metavar='HZ',
+        help='Target sampling frequency in Hz (default: 1000).',
     )
     p.add_argument(
         '--save', action='store_true', default=False,
@@ -206,8 +190,7 @@ def main():
     # Resolve inputs — CLI args take priority; fall back to interactive
     # command-line prompts for anything not supplied.
     # ----------------------------------------------------------------
-    need_prompts = not all([args.data, args.hpi, args.pol,
-                            args.freq is not None, args.sfreq is not None])
+    need_prompts = not all([args.data, args.hpi, args.pol])
 
     datafiles = args.data or _prompt_paths("Select data file(s)", extensions=('.fif',))
     hpifile   = args.hpi  or _prompt_path("Select HPI file", extensions=('.fif',))
@@ -222,14 +205,12 @@ def main():
             extensions=('.fif',), allow_blank=True,
         )
 
-    hpifreq   = args.freq  if args.freq  is not None \
-                else float(_prompt_value("HPI frequency (Hz)", "33"))
-    new_sfreq = args.sfreq if args.sfreq is not None \
-                else float(_prompt_value("Downsampling frequency (Hz)", "1000"))
+    hpifreq   = args.freq
+    new_sfreq = args.sfreq
 
     # Save / overwrite / plot: if any of the three flags were given on the CLI,
     # use all CLI values directly.  Only ask interactively when prompts were
-    # needed above (i.e. at least one file/freq arg was missing) and no flags
+    # needed above (i.e. at least one required file input was missing) and no flags
     # were provided.
     any_flags = args.save or args.overwrite or args.plot
     if any_flags:
@@ -347,7 +328,7 @@ def main():
         plot_stem = os.path.splitext(ref_path)[0] if ref_path else 'hpi_alignment'
         plot_path = f"{plot_stem}_hpi_alignment.png"
 
-        fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=True)
+        fig = plot_hpi_alignment(fit, raw=raw_hpi_for_plot, show=True, gof_threshold=args.gof)
         fig.savefig(plot_path, dpi=150, bbox_inches='tight')
         #print(f"Alignment plot saved: {plot_path}")
 
