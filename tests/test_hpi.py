@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import warnings
 
 import matplotlib
@@ -22,7 +22,7 @@ import numpy as np
 from opm_utility_scripts.hpi import _core as core
 from opm_utility_scripts.hpi import check, coregister
 from opm_utility_scripts.hpi._options import add_fit_options, fit_options
-from opm_utility_scripts import io
+from opm_utility_scripts import io, viz
 from opm_utility_scripts.tests import test_hpi_versions
 
 
@@ -81,6 +81,91 @@ POINTS = np.array([[0, 0, 0.04], [0.03, 0, 0.04], [0, 0.03, 0.04], [0.03, 0.03, 
 POL = dict(source='fif', hpi_orig=POINTS, nasion=np.array([0, .1, 0]),
            lpa=np.array([-.07, 0, 0]), rpa=np.array([.07, 0, 0]),
            extra_pts=np.empty((0, 3)), eeg_pts=np.empty((0, 3)))
+
+
+class BadChannelPlotTests(unittest.TestCase):
+    def tearDown(self):
+        plt.close('all')
+
+    def test_plot_labels_each_outlier_and_preserves_data(self):
+        power = np.array([1., 5., 2., 8.])
+        names = ['mag1', 'mag2', 'mag3', 'mag4']
+        bad_indices = np.array([1, 3])
+        original_power = power.copy()
+        original_indices = bad_indices.copy()
+        with patch.object(viz.plt, 'show') as show:
+            fig = viz.plot_bad_channel_detection(power, names, bad_indices, 4., hpifreq=33)
+        show.assert_not_called()
+        ax = fig.axes[0]
+        background, threshold, outliers = ax.lines
+        np.testing.assert_array_equal(background.get_xdata(), np.arange(4))
+        np.testing.assert_array_equal(background.get_ydata(), power)
+        np.testing.assert_array_equal(threshold.get_ydata(), [4., 4.])
+        self.assertEqual(threshold.get_linestyle(), '--')
+        np.testing.assert_array_equal(outliers.get_xdata(), bad_indices)
+        np.testing.assert_array_equal(outliers.get_ydata(), [5., 8.])
+        self.assertEqual(outliers.get_marker(), '+')
+        self.assertEqual(outliers.get_color(), 'r')
+        self.assertEqual([text.get_text() for text in ax.texts], ['mag2', 'mag4'])
+        self.assertEqual([text.get_position() for text in ax.texts], [(1, 5.), (3, 8.)])
+        self.assertEqual(ax.get_xlabel(), 'Channel')
+        self.assertEqual(ax.get_ylabel(), 'Background PSD')
+        self.assertIn('33 Hz', ax.get_title())
+        self.assertEqual([text.get_text() for text in ax.get_legend().get_texts()],
+                         ['Background power', 'Threshold (4.00e+00)', 'Bad channels'])
+        np.testing.assert_array_equal(power, original_power)
+        np.testing.assert_array_equal(bad_indices, original_indices)
+        self.assertEqual(names, ['mag1', 'mag2', 'mag3', 'mag4'])
+        fig.canvas.draw()
+
+    def test_plot_without_outliers_and_explicit_show(self):
+        for display in (False, True):
+            with self.subTest(show=display), patch.object(viz.plt, 'show') as show:
+                fig = viz.plot_bad_channel_detection([1., 2.], ['mag1', 'mag2'], [],
+                                                     3., show=display)
+            self.assertEqual(show.call_count, int(display))
+            ax = fig.axes[0]
+            self.assertEqual(len(ax.texts), 0)
+            self.assertEqual(len(ax.lines[2].get_xdata()), 0)
+            self.assertEqual(len(ax.lines[2].get_ydata()), 0)
+            self.assertIn('unknown Hz', ax.get_title())
+            fig.canvas.draw()
+
+    def test_find_bads_delegates_detection_results_to_viz(self):
+        names = [f'mag{i}' for i in range(24)]
+        info = mne.create_info(names, 1000, 'mag')
+        for ch in info['chs']:
+            ch['loc'] = np.r_[.01, .02, .1, np.eye(3).ravel()]
+        raw = mne.io.RawArray(np.zeros((24, 10)), info, verbose=False)
+        power = np.ones(24)
+        power[[4, 20]] = [100., 200.]
+        spectrum = Mock()
+        spectrum.get_data.return_value = np.repeat(power[:, None], 2, axis=1)
+        with patch.object(mne.io.BaseRaw, 'compute_psd', return_value=spectrum), \
+                patch.object(viz, 'plot_bad_channel_detection',
+                             wraps=viz.plot_bad_channel_detection) as plot, \
+                patch.object(viz.plt, 'show') as show:
+            bads, fig, returned_names = core.find_bads(raw, 33)
+        plot.assert_called_once()
+        plotted_power, plotted_names, plotted_bad_indices, threshold = plot.call_args.args
+        np.testing.assert_array_equal(plotted_power, power)
+        self.assertEqual(plotted_names, names)
+        np.testing.assert_array_equal(plotted_bad_indices, [4, 20])
+        self.assertEqual(threshold, 1.)
+        self.assertEqual(plot.call_args.kwargs, {'hpifreq': 33})
+        self.assertEqual(bads, ['mag4', 'mag20'])
+        self.assertEqual(returned_names, names)
+        self.assertIsNotNone(fig)
+        self.assertEqual([text.get_text() for text in fig.axes[0].texts], bads)
+        show.assert_not_called()
+
+    def test_manual_and_skipped_detection_do_not_plot(self):
+        with patch.object(viz, 'plot_bad_channel_detection') as plot:
+            self.assertEqual(core.find_bads(), ([], None, []))
+            self.assertEqual(core.find_bads('missing.fif', manual_bads=[]), ([], None, []))
+            self.assertEqual(core.find_bads('missing.fif', manual_bads=['mag2', 'mag2']),
+                             (['mag2'], None, []))
+        plot.assert_not_called()
 
 
 class PolicyTests(unittest.TestCase):
@@ -257,6 +342,14 @@ class PolicyTests(unittest.TestCase):
             # but reject a same-radius guess whose nearest sensor is inward.
             # Equality at the local radius and the origin remain included.
             np.testing.assert_array_equal(result, guesses[[0, 1, 4, 5]])
+        with patch.object(core, '_make_guesses', return_value=[{'rr': guesses}]):
+            result = core._make_opm_guesses(coils, 'medium', standoff=.005)
+        # Each candidate must be at least 5 mm inside its nearest integration
+        # point's radial distance; equality remains included.
+        np.testing.assert_array_equal(result, guesses[[0, 1, 5]])
+        for invalid in (-.001, np.inf, np.nan):
+            with self.subTest(standoff=invalid), self.assertRaisesRegex(ValueError, 'standoff'):
+                core._make_opm_guesses(coils, standoff=invalid)
 
     def test_localization_grid_empty_results(self):
         coils = [np.array([[.08, 0, 0], [0, .10, 0]])]
@@ -340,6 +433,45 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(raw.ch_names, original_names)
         with self.assertRaisesRegex(ValueError, 'no usable sensors'):
             core.find_bads(raw, 33, match_channels=['missing'])
+
+    def test_manual_bads_override_reference_and_matching_without_loading(self):
+        manual = ['mag2', 'mag1', 'mag2']
+        with patch.object(mne.io, 'read_raw_fif') as reader, \
+                patch.object(mne.io.BaseRaw, 'compute_psd') as psd:
+            bads, fig, names = core.find_bads(
+                'missing-reference.fif', 33, match_channels=['other'], manual_bads=manual)
+        reader.assert_not_called()
+        psd.assert_not_called()
+        self.assertEqual(bads, ['mag2', 'mag1'])
+        self.assertIsNone(fig)
+        self.assertEqual(names, [])
+        bads.append('mag3')
+        self.assertEqual(manual, ['mag2', 'mag1', 'mag2'])
+
+    def test_manual_bads_empty_no_reference_and_raw_reference(self):
+        raw = synthetic_raw()
+        for reference in (None, 'missing-reference.fif', raw):
+            with self.subTest(reference=type(reference).__name__), \
+                    patch.object(mne.io, 'read_raw_fif') as reader, \
+                    patch.object(mne.io.BaseRaw, 'copy') as copy, \
+                    patch.object(mne.io.BaseRaw, 'compute_psd') as psd:
+                self.assertEqual(core.find_bads(reference, manual_bads=[]), ([], None, []))
+                self.assertEqual(core.find_bads(reference, manual_bads=('mag1',)),
+                                 (['mag1'], None, []))
+            reader.assert_not_called()
+            copy.assert_not_called()
+            psd.assert_not_called()
+        self.assertEqual(core.find_bads(), ([], None, []))
+
+    def test_manual_bads_invalid_names_fail_before_loading(self):
+        with patch.object(mne.io, 'read_raw_fif') as reader:
+            for invalid in ('mag1', 1, {'mag1': True}, [1], [['mag1']]):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(TypeError, 'manual_bads'):
+                    core.find_bads('missing-reference.fif', manual_bads=invalid)
+            for invalid in ([''], ['   ']):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'must not be empty'):
+                    core.find_bads('missing-reference.fif', manual_bads=invalid)
+        reader.assert_not_called()
 
     def test_matching_strategies_and_safety(self):
         np.testing.assert_array_equal(core._match_points(POINTS + .1, POINTS,
@@ -914,6 +1046,41 @@ class MNEIntegrationTests(unittest.TestCase):
         assert_projectors_equal(self, fit['raw_for_topomap'].info['projs'], before['projs'])
         for prepared in prepared_metrics:
             assert_projectors_equal(self, prepared[0]['projs'], [proj])
+
+    def test_outside_fit_retries_with_standoff_only_for_affected_coil(self):
+        info = mne.create_info(['mag1'], 1000, ['mag'])
+        info['dev_head_t'] = mne.transforms.Transform('meg', 'head')
+        proj = object()
+        coils = [np.array([[0., 0., .10], [.10, 0., 0.]])]
+        amplitudes = dict(proj=proj, times=np.array([1.]),
+                          slopes=np.array([[[1.], [2.]]]))
+        base_guesses = np.array([[0., 0., .05]])
+        retry_rr = np.array([[0., 0., .04]])
+        make_guesses = Mock(side_effect=lambda geometry, grid, **kwargs:
+                            retry_rr if kwargs.get('standoff') else base_guesses)
+        fits = [
+            (np.array([0., 0., .12]), .8, np.ones(3)),
+            (np.array([0., 0., .06]), .9, np.ones(3)),
+            (np.array([0., 0., .04]), .95, np.ones(3)),
+        ]
+        localizer = Mock(side_effect=fits)
+
+        with patch.object(core, '_validate_type'), \
+                patch.object(core, '_check_chpi_param'), \
+                patch.object(core, '_prepare_dipole_fit', return_value=(info, np.eye(1), coils)), \
+                patch.object(core, '_get_hpi_initial_fit', return_value=np.zeros((2, 3))), \
+                patch.object(core, '_make_opm_guesses', side_effect=make_guesses), \
+                patch.object(core, '_magnetic_dipole_field_vec',
+                             side_effect=lambda rr, *args: np.ones((len(rr), 3, 1))), \
+                patch.object(core, '_fit_magnetic_dipole', side_effect=localizer):
+            with self.assertWarnsRegex(RuntimeWarning, 'outside the nearest sensor radius'):
+                result = core.compute_chpi_opm_locs(info, amplitudes)
+
+        self.assertEqual(localizer.call_count, 3)
+        self.assertEqual(make_guesses.call_count, 2)
+        self.assertEqual(make_guesses.call_args.kwargs, {'standoff': .005})
+        np.testing.assert_array_equal(result['rrs'][0, 0], fits[2][0])
+        np.testing.assert_array_equal(result['rrs'][0, 1], fits[1][0])
 
     def test_actual_sequential_amplitude_estimation(self):
         # Exercise MNE's real projector and slope ordering, not its mock.
